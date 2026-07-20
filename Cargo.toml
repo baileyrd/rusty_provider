@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/providers",
+    "crates/router",
+    "crates/server",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+futures-util = "0.3"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+eventsource-stream = "0.2"
+toml = "0.8"
+axum = { version = "0.7", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+rp-core = { path = "crates/core" }
+rp-providers = { path = "crates/providers" }
+rp-router = { path = "crates/router" }
+
+[profile.release]
+lto = true
+codegen-units = 1

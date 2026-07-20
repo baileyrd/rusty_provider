@@ -1,0 +1,67 @@
+# Copy this to config.toml (gitignored) and adjust as needed.
+# Every provider's API key comes from an env var, never from this file.
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# Uncomment to require clients to send `Authorization: Bearer <token>`
+# where <token> is the value of the named env var.
+# api_key_env = "RUSTY_PROVIDER_API_KEY"
+
+# --- Providers -------------------------------------------------------------
+# `kind` is one of: "openai" (any OpenAI-compatible /chat/completions API),
+# "anthropic", or "gemini". A provider is skipped at startup (with a warning)
+# if its api_key_env isn't set, so it's fine to leave providers you don't
+# use in this file.
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.gemini]
+kind = "gemini"
+base_url = "https://generativelanguage.googleapis.com"
+api_key_env = "GEMINI_API_KEY"
+
+[providers.groq]
+kind = "openai"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+
+[providers.together]
+kind = "openai"
+base_url = "https://api.together.xyz/v1"
+api_key_env = "TOGETHER_API_KEY"
+
+[providers.fireworks]
+kind = "openai"
+base_url = "https://api.fireworks.ai/inference/v1"
+api_key_env = "FIREWORKS_API_KEY"
+
+# --- Route aliases -----------------------------------------------------------
+# A named fallback chain of "provider/model" entries. Clients pass the alias
+# as `model` and the router tries each entry in order, falling back on
+# rate limits / timeouts / 5xx errors. Clients can also bypass aliases
+# entirely and address a provider/model directly, e.g. "openai/gpt-4o".
+
+[[routes]]
+alias = "smart"
+chain = [
+    "anthropic/claude-sonnet-5",
+    "openai/gpt-4o",
+    "gemini/gemini-2.0-flash",
+]
+
+[[routes]]
+alias = "fast"
+chain = [
+    "groq/llama-3.3-70b-versatile",
+    "together/meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "fireworks/accounts/fireworks/models/llama-v3p3-70b-instruct",
+]

@@ -1,0 +1,21 @@
+[package]
+name = "rp-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rp-core.workspace = true
+rp-providers.workspace = true
+rp-router.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
