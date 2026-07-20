@@ -1,0 +1,18 @@
+[package]
+name = "rp-providers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rp-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+eventsource-stream.workspace = true
