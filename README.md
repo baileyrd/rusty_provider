@@ -361,6 +361,7 @@ A request can also constrain and order the resolved fallback chain with a
     "ignore": ["openai"],              // and then drop these too
     "zdr": true,                       // then drop any provider not marked zdr in config
     "max_price": 5.0,                  // then drop anything pricier than $5/M prompt tokens
+    "require_parameters": true,        // then drop anything that can't honor every field set below
     "sort": "price"                    // or "latency" / "throughput" — sort what's left
   },
   "messages": [{"role": "user", "content": "..."}]
@@ -382,6 +383,16 @@ A request can also constrain and order the resolved fallback chain with a
   candidate with no configured price is dropped along with everything
   above the ceiling — with a cap in effect, an unpriced entry can't be
   trusted to be under it.
+- `require_parameters: true` drops any candidate whose provider adapter
+  can't actually honor every field *this specific request* sets —
+  `tools`, `response_format`, `top_k`, a message's `cache_control`, and
+  so on (see `GET /v1/models`'s `supported_params` for the exact
+  per-provider list). `temperature`/`top_p`/`max_tokens`/`stop` never
+  disqualify a candidate, since every provider kind supports all four.
+  Without this, an unsupported field is either silently dropped (most
+  sampling params) or rejected only after a wasted round trip
+  (`response_format`'s `"json_object"` on Anthropic); this filters those
+  candidates out before dispatch instead of finding out the hard way.
 - `sort: "price"` stable-sorts the remaining candidates ascending by the
   prompt-token price configured in `[[pricing]]` (see `config.example.toml`)
   — entries with no configured price sort last, keeping their relative
