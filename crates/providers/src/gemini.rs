@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
     ChunkChoice, ContentPart, FunctionCallDelta, InputAudio, MessageContent, Provider,
-    ProviderError, Role, Tool, ToolCall, ToolCallDelta, Usage,
+    ProviderError, ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -61,6 +61,10 @@ struct GenerationConfig<'a> {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "stopSequences")]
     stop_sequences: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseMimeType")]
+    response_mime_type: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseSchema")]
+    response_schema: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -251,8 +255,29 @@ fn to_wire_tool_choice(choice: &Value) -> Value {
     }
 }
 
+/// Gemini has native support for constrained JSON output, unlike
+/// Anthropic -- both `ResponseFormat::JsonObject` (mime type only) and
+/// `ResponseFormat::JsonSchema` (mime type plus an OpenAPI-flavored schema,
+/// close enough to plain JSON Schema for typical use) map directly onto
+/// `generationConfig` fields, so this never needs to reject a request the
+/// way the Anthropic adapter sometimes does.
+fn response_format_config(fmt: &ResponseFormat) -> (Option<&'static str>, Option<Value>) {
+    match fmt {
+        ResponseFormat::Text => (None, None),
+        ResponseFormat::JsonObject => (Some("application/json"), None),
+        ResponseFormat::JsonSchema { json_schema } => {
+            (Some("application/json"), Some(json_schema.schema.clone()))
+        }
+    }
+}
+
 fn build_request(req: &ChatRequest) -> WireRequest<'_> {
     let (system, contents) = build_contents(&req.messages);
+    let (response_mime_type, response_schema) = req
+        .response_format
+        .as_ref()
+        .map(response_format_config)
+        .unwrap_or((None, None));
 
     WireRequest {
         contents,
@@ -264,6 +289,8 @@ fn build_request(req: &ChatRequest) -> WireRequest<'_> {
             top_p: req.top_p,
             max_output_tokens: req.max_tokens,
             stop_sequences: req.stop.as_deref(),
+            response_mime_type,
+            response_schema,
         },
         tools: req.tools.as_deref().map(to_wire_tools),
         tool_config: req.tool_choice.as_ref().map(to_wire_tool_choice),
@@ -621,6 +648,38 @@ mod tests {
         assert_eq!(
             to_wire_tool_choice(&json!(null)),
             json!({"functionCallingConfig": {"mode": "AUTO"}})
+        );
+    }
+
+    // --- response_format_config ---------------------------------------------
+
+    #[test]
+    fn response_format_config_text_sets_no_mime_type_or_schema() {
+        assert_eq!(response_format_config(&ResponseFormat::Text), (None, None));
+    }
+
+    #[test]
+    fn response_format_config_json_object_sets_mime_type_with_no_schema() {
+        assert_eq!(
+            response_format_config(&ResponseFormat::JsonObject),
+            (Some("application/json"), None)
+        );
+    }
+
+    #[test]
+    fn response_format_config_json_schema_sets_mime_type_and_schema() {
+        let schema = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let fmt = ResponseFormat::JsonSchema {
+            json_schema: rp_core::JsonSchemaFormat {
+                name: "weather_report".to_string(),
+                description: None,
+                schema: schema.clone(),
+                strict: None,
+            },
+        };
+        assert_eq!(
+            response_format_config(&fmt),
+            (Some("application/json"), Some(schema))
         );
     }
 

@@ -122,6 +122,74 @@ async fn chat_sends_tools_and_tool_choice_translated_to_function_declarations() 
 }
 
 #[tokio::test]
+async fn chat_sends_json_schema_response_format_as_response_schema() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "temperature_f": {"type": "number"},
+                    },
+                    "required": ["city", "temperature_f"],
+                },
+            },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "{\"city\":\"Boston\",\"temperature_f\":72}"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 8, "totalTokenCount": 28}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_json_schema("gemini-2.0-flash");
+
+    provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_sends_json_object_response_format_with_no_schema() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "generationConfig": {"responseMimeType": "application/json"},
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "{}"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 1, "totalTokenCount": 6}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_json_object("gemini-2.0-flash");
+
+    let resp = provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+    assert_eq!(
+        resp.choices[0].message.content,
+        Some(rp_core::MessageContent::text("{}"))
+    );
+}
+
+#[tokio::test]
 async fn chat_stream_parses_function_call_delta() {
     let server = MockServer::start().await;
     let sse_body = concat!(

@@ -8,8 +8,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, MessageContent, Provider, ProviderError, Role, Tool, ToolCall, ToolCallDelta,
-    Usage,
+    ChunkChoice, MessageContent, Provider, ProviderError, ResponseFormat, Role, Tool, ToolCall,
+    ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,10 @@ struct WireRequest<'a> {
     tools: Option<&'a [Tool]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'a serde_json::Value>,
+    /// Matches the OpenAI wire format exactly, so this is a direct
+    /// passthrough -- no translation needed, unlike Anthropic and Gemini.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<&'a ResponseFormat>,
 }
 
 impl<'a> WireRequest<'a> {
@@ -73,6 +77,7 @@ impl<'a> WireRequest<'a> {
             stream,
             tools: req.tools.as_deref(),
             tool_choice: req.tool_choice.as_ref(),
+            response_format: req.response_format.as_ref(),
         }
     }
 }

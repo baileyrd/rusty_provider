@@ -118,6 +118,58 @@ modality there. `OpenAiCompatibleProvider` needs no translation for
 either content type — both pass straight through, since this router's
 wire shape already matches OpenAI's.
 
+A request can constrain the model's output shape with `response_format`,
+matching the OpenAI convention:
+
+```jsonc
+{
+  "model": "smart",
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "weather_report",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string"},
+          "temperature_f": {"type": "number"}
+        },
+        "required": ["city", "temperature_f"]
+      },
+      "strict": true
+    }
+  },
+  "messages": [{"role": "user", "content": "What's the weather in Boston?"}]
+}
+```
+
+`"type"` is one of:
+
+- `"text"` (the default) — unconstrained free-form output.
+- `"json_object"` — loose JSON mode: the model must emit syntactically
+  valid JSON, with no particular shape enforced.
+- `"json_schema"` — strict schema-constrained JSON, validated against
+  `json_schema.schema`.
+
+Per-provider support:
+
+- **OpenAI-compatible** needs no translation — `response_format` matches
+  the wire shape already and passes straight through.
+- **Gemini** has native support for both variants via
+  `generationConfig.responseMimeType`/`responseSchema`; Gemini's schema
+  dialect is a subset of OpenAPI 3.0 Schema, close enough to plain JSON
+  Schema for typical use but not a perfect match for every keyword.
+- **Anthropic** has no native `response_format`. `"json_schema"` is
+  emulated by defining a single synthetic tool from `json_schema.schema`,
+  forcing the model to call it (`tool_choice`), and unwrapping that tool
+  call back into plain JSON content in the response — transparent to the
+  client either way, streamed or not. `"json_object"` has no equivalent
+  trick (there's no schema to build a tool from, and nothing in the API
+  reliably constrains output to "valid JSON, any shape"), so it fails with
+  a retryable error instead: a `[[routes]]` fallback chain moves on to a
+  provider that actually supports it, and a direct `"anthropic/..."`
+  request fails with `400`.
+
 If `[[pricing]]` has an entry for the model that actually served the
 request, the response (and, for streaming, whichever chunk carries the
 final `usage`) includes an extra `cost_usd` field — the request's

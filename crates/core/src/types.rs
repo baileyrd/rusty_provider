@@ -214,6 +214,46 @@ pub struct ChatRequest {
     /// router is allowed to try, à la OpenRouter's `provider` request field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderPreferences>,
+    /// Constrains the shape of the model's output, per the OpenAI
+    /// `response_format` convention. Not every provider can represent every
+    /// variant natively -- see each adapter for its translation (or
+    /// rejection via `ProviderError::UnsupportedFeature`, which a fallback
+    /// chain treats the same as any other retryable error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Constrains a model's output shape, matching the OpenAI
+/// `response_format` wire convention exactly (`{"type": "text"}` /
+/// `{"type": "json_object"}` / `{"type": "json_schema", "json_schema": {...}}`)
+/// so the OpenAI-compatible adapter can pass it through unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// The default -- unconstrained free-form text (or a tool call).
+    Text,
+    /// Loose JSON mode: the model must emit syntactically valid JSON, but
+    /// with no particular shape enforced.
+    JsonObject,
+    /// Strict schema-constrained JSON: the model's output must validate
+    /// against `json_schema.schema`.
+    JsonSchema { json_schema: JsonSchemaFormat },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonSchemaFormat {
+    /// Identifies the schema -- required by the OpenAI wire format, and
+    /// reused by the Anthropic adapter as the name of the synthetic tool it
+    /// forces the model to call (see that adapter for why).
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A JSON Schema object describing the required output shape.
+    pub schema: serde_json::Value,
+    /// OpenAI-specific strict-mode flag; providers that don't have a
+    /// concept of "strict" schema adherence ignore this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Per-request routing constraints, applied to a resolved "provider/model"

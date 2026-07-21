@@ -849,6 +849,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             provider: None,
+            response_format: None,
         }
     }
 

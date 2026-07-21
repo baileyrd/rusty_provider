@@ -275,6 +275,87 @@ async fn chat_forwards_tools_and_tool_choice_verbatim_in_request_body() {
 }
 
 #[tokio::test]
+async fn chat_forwards_json_schema_response_format_verbatim_in_request_body() {
+    // Matches the OpenAI wire shape already, so this adapter does no
+    // translation -- straight passthrough.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "weather_report",
+                    "description": "A weather report for one city",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "temperature_f": {"type": "number"},
+                        },
+                        "required": ["city", "temperature_f"],
+                    },
+                    "strict": true,
+                }
+            },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "{\"city\":\"Boston\",\"temperature_f\":72}"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::request_with_json_schema("gpt-4o-mini");
+
+    provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_forwards_json_object_response_format_verbatim_in_request_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(
+            json!({"response_format": {"type": "json_object"}}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "{}"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::request_with_json_object("gpt-4o-mini");
+
+    provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
 async fn chat_forwards_image_content_verbatim_in_request_body() {
     // Since this adapter's WireRequest holds `&[ChatMessage]` directly,
     // MessageContent's untagged serialization should pass a parts array
