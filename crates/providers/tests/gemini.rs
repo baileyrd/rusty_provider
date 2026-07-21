@@ -190,6 +190,44 @@ async fn chat_sends_json_object_response_format_with_no_schema() {
 }
 
 #[tokio::test]
+async fn chat_forwards_its_native_sampling_params_camel_cased_but_has_no_field_for_the_rest() {
+    // Gemini's native API has an equivalent for top_k, frequency_penalty,
+    // presence_penalty, and seed among the sampling params exercised by
+    // `request_with_sampling_params`; the other 4 (min_p, top_a,
+    // repetition_penalty, logit_bias) have no field on this adapter's
+    // GenerationConfig at all, so there's nothing to serialize --
+    // enforced at compile time rather than needing a runtime assertion.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "generationConfig": {
+                "topK": 40,
+                "frequencyPenalty": 0.3,
+                "presencePenalty": 0.4,
+                "seed": 42,
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "ok"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_sampling_params("gemini-2.0-flash");
+
+    provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
 async fn chat_stream_parses_function_call_delta() {
     let server = MockServer::start().await;
     let sse_body = concat!(

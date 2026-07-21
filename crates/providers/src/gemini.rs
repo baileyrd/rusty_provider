@@ -67,6 +67,14 @@ struct GenerationConfig<'a> {
     response_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
     thinking_config: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "topK")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "frequencyPenalty")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "presencePenalty")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -307,6 +315,10 @@ fn build_request(req: &ChatRequest) -> WireRequest<'_> {
                 .reasoning
                 .as_ref()
                 .map(|r| thinking_config(r, req.max_tokens)),
+            top_k: req.top_k,
+            frequency_penalty: req.frequency_penalty,
+            presence_penalty: req.presence_penalty,
+            seed: req.seed,
         },
         tools: req.tools.as_deref().map(to_wire_tools),
         tool_config: req.tool_choice.as_ref().map(to_wire_tool_choice),

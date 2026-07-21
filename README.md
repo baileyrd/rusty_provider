@@ -277,6 +277,48 @@ pricing, so don't read a missing field as "this was free." Every request
 also adds to a running per-model total queryable at `GET /v1/usage`
 (below), whether or not pricing is configured for it.
 
+### Sampling parameters
+
+Beyond `temperature`, `top_p`, `max_tokens`, and `stop`, a request can set a
+fuller sampling-parameter surface:
+
+```jsonc
+{
+  "model": "smart",
+  "top_k": 40,
+  "min_p": 0.05,
+  "top_a": 0.2,
+  "frequency_penalty": 0.3,
+  "presence_penalty": 0.4,
+  "repetition_penalty": 1.1,
+  "logit_bias": {"1234": -100},
+  "seed": 42,
+  "messages": [{"role": "user", "content": "..."}]
+}
+```
+
+Each field is native to some providers and absent from others' own APIs; an
+unsupported field is silently dropped rather than erroring, on the same
+reasoning as `cache_control` above — these are sampling hints, not a
+structural contract like `response_format`, so the request still produces a
+valid response either way:
+
+| Field | Anthropic | Gemini | OpenAI-compatible |
+| --- | --- | --- | --- |
+| `top_k` | native | native | passthrough¹ |
+| `min_p` | ignored | ignored | passthrough¹ |
+| `top_a` | ignored | ignored | passthrough¹ |
+| `frequency_penalty` | ignored | native | native |
+| `presence_penalty` | ignored | native | native |
+| `repetition_penalty` | ignored | ignored | passthrough¹ |
+| `logit_bias` | ignored | ignored | native |
+| `seed` | ignored | native | native |
+
+¹ Not part of OpenAI's own API, but common on OpenAI-compatible inference
+servers (Groq, Together, Fireworks, vLLM, etc.), so the OpenAI-compatible
+adapter passes these through unconditionally rather than guessing which
+backend supports them.
+
 A request can also constrain and order the resolved fallback chain with a
 `provider` field, independent of whether `model` was a direct
 `"provider/model"` or a route alias:

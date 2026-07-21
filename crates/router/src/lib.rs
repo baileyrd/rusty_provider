@@ -941,6 +941,14 @@ mod tests {
             provider: None,
             response_format: None,
             reasoning: None,
+            top_k: None,
+            min_p: None,
+            top_a: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            logit_bias: None,
+            seed: None,
         }
     }
 

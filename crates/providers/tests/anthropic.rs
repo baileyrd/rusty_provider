@@ -323,6 +323,35 @@ async fn chat_sends_tools_and_tool_choice_translated_to_wire_format() {
 }
 
 #[tokio::test]
+async fn chat_forwards_top_k_but_has_no_field_for_the_rest_of_the_sampling_params() {
+    // Anthropic's native API only has an equivalent for `top_k` among the
+    // sampling params exercised by `request_with_sampling_params`; the
+    // other 7 (min_p, top_a, frequency_penalty, presence_penalty,
+    // repetition_penalty, logit_bias, seed) have no field on this
+    // adapter's WireRequest at all, so there's nothing to serialize --
+    // enforced at compile time rather than needing a runtime assertion.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({"top_k": 40})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::request_with_sampling_params("claude-sonnet-5");
+
+    provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
 async fn chat_stream_parses_text_deltas_and_final_usage() {
     let server = MockServer::start().await;
     let sse_body = concat!(
