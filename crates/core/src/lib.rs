@@ -6,5 +6,6 @@ pub use error::ProviderError;
 pub use provider::{ChatStream, Provider};
 pub use types::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, Choice, ChunkChoice,
-    ModelInfo, Role, Usage,
+    FunctionCall, FunctionCallDelta, FunctionDef, ModelInfo, Role, Tool, ToolCall, ToolCallDelta,
+    Usage,
 };

@@ -8,7 +8,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, Provider, ProviderError, Role, Usage,
+    ChunkChoice, Provider, ProviderError, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +54,10 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<&'a [String]>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Tool]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a serde_json::Value>,
 }
 
 impl<'a> WireRequest<'a> {
@@ -66,6 +70,8 @@ impl<'a> WireRequest<'a> {
             max_tokens: req.max_tokens,
             stop: req.stop.as_deref(),
             stream,
+            tools: req.tools.as_deref(),
+            tool_choice: req.tool_choice.as_ref(),
         }
     }
 }
@@ -100,6 +106,8 @@ fn parse_role(role: &str) -> Role {
 struct WireMessage {
     role: String,
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +127,8 @@ struct WireResponse {
 struct WireDelta {
     role: Option<String>,
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +186,8 @@ impl Provider for OpenAiCompatibleProvider {
                         role: parse_role(&c.message.role),
                         content: c.message.content,
                         name: None,
+                        tool_calls: c.message.tool_calls,
+                        tool_call_id: None,
                     },
                     finish_reason: c.finish_reason,
                 })
@@ -231,6 +243,7 @@ impl Provider for OpenAiCompatibleProvider {
                             delta: ChatMessageDelta {
                                 role: c.delta.role.as_deref().map(parse_role),
                                 content: c.delta.content,
+                                tool_calls: c.delta.tool_calls,
                             },
                             finish_reason: c.finish_reason,
                         })

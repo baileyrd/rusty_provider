@@ -64,6 +64,13 @@ happens before the first byte is streamed to the client; once a provider's
 stream has started, a mid-stream failure ends the SSE connection rather
 than silently switching providers.
 
+Tool/function calling is supported: pass `tools` (OpenAI's function-calling
+shape) and optionally `tool_choice` in the request; the router translates
+them into each provider's own tool-use convention (Anthropic's `tool_use`/
+`tool_result` content blocks, Gemini's `functionCall`/`functionResponse`
+parts) and translates `tool_calls` back into the OpenAI shape in the
+response — both streamed and non-streamed.
+
 ### `GET /v1/models`
 
 Lists configured route aliases and `provider/*` for every provider with a
@@ -79,9 +86,32 @@ See `config.example.toml`. Provider API keys are always read from
 environment variables (named by `api_key_env`) — never stored in the
 config file itself.
 
+## Using with local agent tools (Hermes, OpenClaw, etc.)
+
+Any local coding-agent tool that lets you point it at a custom
+OpenAI-compatible endpoint can use rusty_provider as its model backend —
+this covers tools like Hermes and OpenClaw, whose own model-provider
+settings just need:
+
+- **Base URL**: `http://localhost:8080/v1` (or wherever `rp-server` is
+  running/reachable).
+- **API key**: the value of `RUSTY_PROVIDER_API_KEY` (or whatever env var
+  `server.api_key_env` points at) if you've enabled auth; otherwise any
+  non-empty placeholder string, since most clients require *something* in
+  the field even when the server doesn't check it.
+- **Model**: a `"provider/model"` string or a configured route alias (see
+  `config.example.toml`) — whichever the tool lets you type in as the model
+  name.
+
+Since these tools drive actions (editing files, running commands) through
+function/tool calling, make sure the underlying model you route to
+actually supports tool use, and that your `[[routes]]` fallback chain (if
+you use one) only includes models that do — a chain that silently falls
+back to a model without tool support will make the agent behave oddly
+rather than fail loudly.
+
 ## Not yet implemented
 
-- Tool/function calling
 - Per-request cost/latency-based routing (only manual model selection and
   ordered fallback chains today)
 - Usage metering / billing
