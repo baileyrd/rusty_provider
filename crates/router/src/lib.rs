@@ -1174,6 +1174,60 @@ mod tests {
     }
 
     #[test]
+    fn apply_preferences_zdr_filters_before_latency_sort() {
+        // The fastest candidate ("gemini") isn't ZDR-flagged and must be
+        // dropped before latency sorting ever sees it, not merely sorted
+        // last among the full chain.
+        let router = test_router(vec![], vec![], vec![], vec!["anthropic", "openai"], vec![]);
+        {
+            let mut latency = router.latency.write().unwrap();
+            latency.insert("anthropic/m1".to_string(), 2000.0);
+            latency.insert("openai/m2".to_string(), 500.0);
+            latency.insert("gemini/m3".to_string(), 10.0);
+        }
+        let prefs = ProviderPreferences {
+            zdr: Some(true),
+            sort: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_zdr_and_latency_sort_unobserved_survivor_sorts_last() {
+        // Both "anthropic" and "openai" are ZDR-flagged and survive the
+        // filter; only "anthropic" has an observed latency. The unobserved
+        // ZDR survivor must still sort last among the *filtered* set, not
+        // be compared against the non-ZDR "gemini" that was dropped.
+        let router = test_router(vec![], vec![], vec![], vec!["anthropic", "openai"], vec![]);
+        router
+            .latency
+            .write()
+            .unwrap()
+            .insert("anthropic/m1".to_string(), 500.0);
+        let prefs = ProviderPreferences {
+            zdr: Some(true),
+            sort: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("openai", "m2"), ("anthropic", "m1"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
+    }
+
+    #[test]
     fn apply_preferences_sorts_ascending_by_price() {
         let router = test_router(
             vec![],
