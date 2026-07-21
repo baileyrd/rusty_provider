@@ -9,7 +9,9 @@ pub enum RouterError {
     #[error("provider \"{0}\" is unknown or not configured (missing API key?)")]
     ProviderNotConfigured(String),
 
-    #[error("no provider for \"{0}\" survives the request's provider.only/ignore/zdr filter")]
+    #[error(
+        "no provider for \"{0}\" survives the request's provider.only/ignore/zdr/data_collection filter"
+    )]
     NoEligibleProvider(String),
 
     #[error(transparent)]

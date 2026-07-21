@@ -74,6 +74,15 @@ pub struct ProviderConfig {
     /// requests that set `"provider": {"zdr": true}`.
     #[serde(default)]
     pub zdr: bool,
+    /// Whether the operator has confirmed this provider does not use
+    /// submitted data to train its models. Self-declared, same trust model
+    /// as `zdr` — but a distinct axis from it: `zdr` is about retention
+    /// (does the provider keep your data at all), this is about training
+    /// (if they keep it, do they learn from it). A provider can be one
+    /// without the other. Only consulted for requests that set
+    /// `"provider": {"data_collection": true}`.
+    #[serde(default)]
+    pub no_training: bool,
     /// Self-imposed outbound rate limit for this provider (requests per
     /// minute), so this router doesn't exceed the provider's own limits
     /// and get 429'd/banned. Unset means no self-imposed limit — only
@@ -396,6 +405,7 @@ mod tests {
         .unwrap();
         let provider = &config.providers["a"];
         assert!(!provider.zdr);
+        assert!(!provider.no_training);
         assert_eq!(provider.requests_per_minute, None);
     }
 
@@ -408,12 +418,14 @@ mod tests {
             base_url = "https://a"
             api_key_env = "A"
             zdr = true
+            no_training = true
             requests_per_minute = 500
             "#,
         )
         .unwrap();
         let provider = &config.providers["a"];
         assert!(provider.zdr);
+        assert!(provider.no_training);
         assert_eq!(provider.requests_per_minute, Some(500));
     }
 
