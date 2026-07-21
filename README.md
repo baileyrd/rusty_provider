@@ -330,6 +330,7 @@ A request can also constrain and order the resolved fallback chain with a
     "only": ["anthropic", "openai"],   // drop every other candidate in the chain
     "ignore": ["openai"],              // and then drop these too
     "zdr": true,                       // then drop any provider not marked zdr in config
+    "max_price": 5.0,                  // then drop anything pricier than $5/M prompt tokens
     "sort": "price"                    // or "latency" / "throughput" — sort what's left
   },
   "messages": [{"role": "user", "content": "..."}]
@@ -344,6 +345,13 @@ A request can also constrain and order the resolved fallback chain with a
   `[providers.*]` config. That flag is self-declared by the operator —
   the router trusts it and never verifies it against the provider, so it's
   only as accurate as your own config.
+- `max_price` drops any candidate priced above it, in USD per million
+  prompt tokens — the same `prompt_per_million` figure `sort: "price"`
+  reads from `[[pricing]]`. Unlike `sort: "price"`, this is a hard
+  ceiling enforced *before* dispatch, not an after-the-fact ranking, and a
+  candidate with no configured price is dropped along with everything
+  above the ceiling — with a cap in effect, an unpriced entry can't be
+  trusted to be under it.
 - `sort: "price"` stable-sorts the remaining candidates ascending by the
   prompt-token price configured in `[[pricing]]` (see `config.example.toml`)
   — entries with no configured price sort last, keeping their relative
