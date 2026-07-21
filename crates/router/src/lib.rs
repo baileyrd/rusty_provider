@@ -11,7 +11,10 @@ pub use error::RouterError;
 pub use metrics::Metrics;
 
 use futures::stream::StreamExt;
-use rp_core::{ChatRequest, ChatResponse, ChatStream, Provider, ProviderPreferences, Usage};
+use rp_core::{
+    ChatRequest, ChatResponse, ChatStream, Provider, ProviderError, ProviderPreferences,
+    RateLimiter, Usage,
+};
 use rp_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatibleProvider};
 
 /// Weight given to each new latency/throughput sample in its running
@@ -64,6 +67,11 @@ pub struct Router {
     /// Prometheus counters/histograms/gauges for `GET /metrics`, updated at
     /// the same points as `latency`/`throughput`/`usage` above.
     metrics: Metrics,
+    /// Provider names with a self-imposed `requests_per_minute` in config.
+    provider_rpm: HashMap<String, u32>,
+    /// Backs `provider_rpm`'s outbound self-throttling — one bucket per
+    /// provider name, checked before every dispatch attempt.
+    outbound_limiter: RateLimiter,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -173,6 +181,12 @@ impl Router {
             .map(|(name, _)| name.clone())
             .collect();
 
+        let provider_rpm = config
+            .providers
+            .iter()
+            .filter_map(|(name, cfg)| cfg.requests_per_minute.map(|rpm| (name.clone(), rpm)))
+            .collect();
+
         Self {
             providers,
             routes,
@@ -182,6 +196,8 @@ impl Router {
             throughput: Arc::new(RwLock::new(HashMap::new())),
             usage: Arc::new(RwLock::new(HashMap::new())),
             metrics,
+            provider_rpm,
+            outbound_limiter: RateLimiter::new(),
         }
     }
 
@@ -203,6 +219,13 @@ impl Router {
     /// format, for `GET /metrics`.
     pub fn render_prometheus_metrics(&self) -> String {
         self.metrics.render()
+    }
+
+    /// Record an inbound request rejected by the HTTP layer's own
+    /// per-client/per-IP rate limiter, so it shows up in `GET /metrics`
+    /// alongside every other counter this router tracks.
+    pub fn record_inbound_rate_limit_rejection(&self, identity: &str) {
+        self.metrics.record_inbound_rate_limit_rejection(identity);
     }
 
     /// Resolve a client-supplied `model` string into an ordered chain of
@@ -289,6 +312,22 @@ impl Router {
             .ok_or_else(|| RouterError::ProviderNotConfigured(name.to_string()))
     }
 
+    /// Self-imposed outbound throttle: if `provider_name` has a configured
+    /// `requests_per_minute`, consume one token from its bucket. A no-op
+    /// (always `Ok`) for providers with no configured limit. This never
+    /// talks to the provider itself — it's purely so this router doesn't
+    /// exceed limits it already knows about and get 429'd/banned.
+    fn check_outbound_rate_limit(&self, provider_name: &str) -> Result<(), ProviderError> {
+        let Some(&rpm) = self.provider_rpm.get(provider_name) else {
+            return Ok(());
+        };
+        self.outbound_limiter
+            .check(provider_name, rpm)
+            .map_err(|retry_after_secs| ProviderError::RateLimited {
+                retry_after_secs: Some(retry_after_secs.ceil() as u64),
+            })
+    }
+
     /// Wrap a streaming response so that whichever chunk carries the final
     /// `usage` (completion token count) also records a throughput sample
     /// and cumulative usage/cost/metrics, stamping the chunk's own
@@ -345,6 +384,14 @@ impl Router {
                     continue;
                 }
             };
+
+            if let Err(e) = self.check_outbound_rate_limit(provider_name) {
+                tracing::warn!(provider = %provider_name, model = %model_name, "outbound rate limit hit, falling back: {e}");
+                self.metrics
+                    .record_attempt(provider_name, model_name, "rate_limited");
+                last_err = Some(RouterError::Provider(e));
+                continue;
+            }
 
             let started_at = Instant::now();
             match provider.chat(req, model_name).await {
@@ -425,6 +472,14 @@ impl Router {
                     continue;
                 }
             };
+
+            if let Err(e) = self.check_outbound_rate_limit(provider_name) {
+                tracing::warn!(provider = %provider_name, model = %model_name, "outbound rate limit hit, falling back: {e}");
+                self.metrics
+                    .record_attempt(provider_name, model_name, "rate_limited");
+                last_err = Some(RouterError::Provider(e));
+                continue;
+            }
 
             let started_at = Instant::now();
             match provider.chat_stream(req, model_name).await {

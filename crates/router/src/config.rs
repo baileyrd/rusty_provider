@@ -18,9 +18,15 @@ pub struct ServerConfig {
     pub port: u16,
     /// If set, the env var holding a bearer token clients must present to
     /// this router. Leave unset to run with no auth (e.g. behind your own
-    /// gateway).
+    /// gateway). Any key from `[[clients]]` below also authenticates,
+    /// independent of this field.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Requests-per-minute limit applied to any caller not matched to a
+    /// `[[clients]]` entry, bucketed by source IP address. Unset means no
+    /// limit for such callers.
+    #[serde(default)]
+    pub default_rate_limit_rpm: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -29,6 +35,7 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             api_key_env: None,
+            default_rate_limit_rpm: None,
         }
     }
 }
@@ -56,6 +63,13 @@ pub struct ProviderConfig {
     /// requests that set `"provider": {"zdr": true}`.
     #[serde(default)]
     pub zdr: bool,
+    /// Self-imposed outbound rate limit for this provider (requests per
+    /// minute), so this router doesn't exceed the provider's own limits
+    /// and get 429'd/banned. Unset means no self-imposed limit — only
+    /// the provider's real limits apply. Enforced per-provider (not
+    /// per-model), since real-world provider rate limits are account-wide.
+    #[serde(default)]
+    pub requests_per_minute: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -78,6 +92,19 @@ pub struct PricingEntry {
     pub completion_per_million: f64,
 }
 
+/// A named inbound caller, identified by its own API key, with its own
+/// rate limit — independent of (and in addition to) `server.api_key_env`.
+/// Presenting this key both authenticates the request and buckets it
+/// under `name` rather than the source-IP fallback.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ClientConfig {
+    pub name: String,
+    /// Name of the environment variable holding this client's API key
+    /// (not the key itself — keeps secrets out of the config file).
+    pub api_key_env: String,
+    pub requests_per_minute: u32,
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
     #[serde(default)]
@@ -87,6 +114,8 @@ pub struct Config {
     pub routes: Vec<RouteAlias>,
     #[serde(default)]
     pub pricing: Vec<PricingEntry>,
+    #[serde(default)]
+    pub clients: Vec<ClientConfig>,
 }
 
 impl Config {

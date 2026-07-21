@@ -196,6 +196,47 @@ scrape_configs:
 
 Liveness check.
 
+## Rate limiting
+
+Both directions are entirely opt-in — with no `[[clients]]`,
+`server.default_rate_limit_rpm`, or per-provider `requests_per_minute`
+configured, nothing is limited.
+
+**Inbound** (protecting this router from its own callers): define
+`[[clients]]` in config, each with its own API key and requests-per-minute
+limit. Presenting a client's key both authenticates the request (in
+addition to `server.api_key_env`, if set) and buckets its rate limit under
+that client's name. A caller with no matching client key falls back to a
+bucket keyed by source IP, limited by `server.default_rate_limit_rpm` if
+set (otherwise uncapped). Only `POST /v1/chat/completions` is rate
+limited — metadata endpoints (`/v1/models`, `/v1/usage`, `/metrics`)
+aren't. Rejections return `429` with a `Retry-After` header.
+
+The source IP is the raw TCP peer address. Behind a reverse proxy this is
+the proxy's address, not the real client's — this router doesn't parse
+`X-Forwarded-For`, since trusting it without a configured list of trusted
+proxies would let any caller spoof their bucket. If you're behind a proxy
+and need real per-IP limits, terminate TLS/proxying somewhere that
+preserves the original connection, or rely on named `[[clients]]` keys
+instead (unaffected by this, since they're identified by API key).
+
+**Outbound** (protecting each provider's own limits from this router):
+set `requests_per_minute` on a `[providers.*]` entry to self-throttle
+calls to it. When that provider's bucket is empty, the router treats it
+exactly like a retryable provider error (429) and falls back to the next
+candidate in the chain — it does not queue or wait. If every candidate in
+a chain is outbound-throttled, the client gets a `429` with `Retry-After`
+for the shortest wait among them.
+
+Like the pricing table, none of this is a live feed — it's config you set
+based on limits you already know (a provider's published rate limit, or
+how much traffic you want to allow a given caller). Both directions show
+up in `GET /metrics` (`rusty_provider_dispatch_attempts_total` with
+`outcome="rate_limited"` for outbound,
+`rusty_provider_inbound_rate_limit_rejections_total` for inbound) and use
+the same in-memory, per-process, resets-on-restart token buckets as
+everything else this router tracks itself.
+
 ## Config
 
 See `config.example.toml`. Provider API keys are always read from
@@ -231,8 +272,10 @@ rather than fail loudly.
 
 ## Not yet implemented
 
-- Billing / spend limits / per-client quotas (cost estimation and
-  cumulative usage tracking are supported — see `cost_usd` and
-  `GET /v1/usage` above — but there's no persistence, multi-process
-  aggregation, or enforcement, e.g. cutting a client off at a spend cap)
+- Billing / spend-based limits (cost estimation, cumulative usage
+  tracking, and requests-per-minute rate limiting are supported — see
+  `cost_usd`, `GET /v1/usage`, and Rate limiting above — but there's no
+  persistence, multi-process aggregation, or spend-based enforcement, e.g.
+  cutting a client off once they've cost you $X rather than once they've
+  sent N requests/minute)
 - Multi-turn image or audio content

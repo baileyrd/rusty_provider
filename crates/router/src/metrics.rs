@@ -29,6 +29,7 @@ pub struct Metrics {
     response_latency_seconds: HistogramVec,
     throughput_tokens_per_second: HistogramVec,
     provider_configured: IntGaugeVec,
+    inbound_rate_limit_rejections_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -38,7 +39,7 @@ impl Metrics {
         let dispatch_attempts_total = IntCounterVec::new(
             Opts::new(
                 "rusty_provider_dispatch_attempts_total",
-                "Dispatch attempts per provider/model, labeled by outcome (success, retryable_error, error, not_configured).",
+                "Dispatch attempts per provider/model, labeled by outcome (success, retryable_error, error, not_configured, rate_limited).",
             ),
             &["provider", "model", "outcome"],
         )
@@ -100,6 +101,15 @@ impl Metrics {
         )
         .expect("valid metric definition");
 
+        let inbound_rate_limit_rejections_total = IntCounterVec::new(
+            Opts::new(
+                "rusty_provider_inbound_rate_limit_rejections_total",
+                "Requests to this router's own API rejected for exceeding a per-client or per-IP rate limit, labeled by the resolved caller identity (\"client:<name>\" or \"ip:<addr>\").",
+            ),
+            &["identity"],
+        )
+        .expect("valid metric definition");
+
         registry
             .register(Box::new(dispatch_attempts_total.clone()))
             .expect("metric name is unique");
@@ -121,6 +131,9 @@ impl Metrics {
         registry
             .register(Box::new(provider_configured.clone()))
             .expect("metric name is unique");
+        registry
+            .register(Box::new(inbound_rate_limit_rejections_total.clone()))
+            .expect("metric name is unique");
 
         Self {
             registry,
@@ -131,6 +144,7 @@ impl Metrics {
             response_latency_seconds,
             throughput_tokens_per_second,
             provider_configured,
+            inbound_rate_limit_rejections_total,
         }
     }
 
@@ -177,6 +191,12 @@ impl Metrics {
                 .with_label_values(&[provider, model])
                 .inc_by(cost);
         }
+    }
+
+    pub fn record_inbound_rate_limit_rejection(&self, identity: &str) {
+        self.inbound_rate_limit_rejections_total
+            .with_label_values(&[identity])
+            .inc();
     }
 
     /// Render every registered metric in the Prometheus text exposition
