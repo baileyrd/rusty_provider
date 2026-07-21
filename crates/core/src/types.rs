@@ -205,6 +205,13 @@ pub struct ChatResponse {
     pub choices: Vec<Choice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Estimated USD cost of this response, computed by the router from
+    /// its `[[pricing]]` config. Not part of the OpenAI schema — an
+    /// OpenAI SDK/client will just ignore it. `None` if the model that
+    /// served this request has no configured pricing. Always unset here;
+    /// provider adapters never populate it themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -256,6 +263,10 @@ pub struct ChatChunk {
     pub choices: Vec<ChunkChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Same as `ChatResponse::cost_usd`, set on whichever chunk carries the
+    /// final `usage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// Metadata describing a model exposed by the router, for `GET /v1/models`.

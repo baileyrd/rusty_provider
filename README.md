@@ -71,6 +71,17 @@ them into each provider's own tool-use convention (Anthropic's `tool_use`/
 parts) and translates `tool_calls` back into the OpenAI shape in the
 response — both streamed and non-streamed.
 
+If `[[pricing]]` has an entry for the model that actually served the
+request, the response (and, for streaming, whichever chunk carries the
+final `usage`) includes an extra `cost_usd` field — the request's
+estimated dollar cost, computed from `usage.prompt_tokens` /
+`usage.completion_tokens` against that pricing entry. It's not part of the
+OpenAI schema, so existing OpenAI SDKs/clients just ignore it; it's simply
+absent (not `0`/`null`) when the model has no configured pricing, so don't
+read a missing field as "this was free." Every request also adds to a
+running per-model total queryable at `GET /v1/usage` (below), whether or
+not pricing is configured for it.
+
 A request can also constrain and order the resolved fallback chain with a
 `provider` field, independent of whether `model` was a direct
 `"provider/model"` or a route alias:
@@ -121,6 +132,32 @@ A request can also constrain and order the resolved fallback chain with a
 Lists configured route aliases and `provider/*` for every provider with a
 resolved API key.
 
+### `GET /v1/usage`
+
+Cumulative request/token/cost totals per "provider/model", accumulated
+since the process started:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "model": "anthropic/claude-sonnet-5",
+      "requests": 42,
+      "prompt_tokens": 8190,
+      "completion_tokens": 3110,
+      "cost_usd": 0.071
+    }
+  ]
+}
+```
+
+Like the latency/throughput metrics, this is in-memory only — it resets on
+restart and isn't persisted or shared across processes. `cost_usd` only
+accumulates for models with a `[[pricing]]` entry; it stays `0.0` for
+everything else (which means "unpriced," not "free" — `requests` and
+`*_tokens` still count normally regardless of pricing).
+
 ### `GET /health`
 
 Liveness check.
@@ -160,5 +197,8 @@ rather than fail loudly.
 
 ## Not yet implemented
 
-- Usage metering / billing
+- Billing / spend limits / per-client quotas (cost estimation and
+  cumulative usage tracking are supported — see `cost_usd` and
+  `GET /v1/usage` above — but there's no persistence, multi-process
+  aggregation, or enforcement, e.g. cutting a client off at a spend cap)
 - Multi-turn image or audio content
