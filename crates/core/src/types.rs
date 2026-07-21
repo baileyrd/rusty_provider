@@ -466,6 +466,16 @@ pub struct ProviderPreferences {
     /// verifies against the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zdr: Option<bool>,
+    /// If `true`, drop every candidate whose provider isn't marked
+    /// `no_training = true` in config -- i.e. only route to providers the
+    /// operator has confirmed don't train on submitted data. A distinct
+    /// axis from `zdr`: that flag is about data *retention* (does the
+    /// provider keep your data at all), this is about data *training* (if
+    /// they keep it, do they learn from it) -- a provider can satisfy one
+    /// without the other, so a request can set either, both, or neither.
+    /// Same self-declared, unverified trust model as `zdr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_collection: Option<bool>,
     /// Drop every candidate priced above this, in USD per million prompt
     /// tokens -- the same `prompt_per_million` figure `sort: "price"`
     /// consults from `[[pricing]]`. A candidate with no configured price

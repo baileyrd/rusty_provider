@@ -266,6 +266,8 @@ pub struct Router {
     pricing: Arc<HashMap<String, PriceRates>>,
     /// Provider names with `zdr = true` in config.
     zdr_providers: HashSet<String>,
+    /// Provider names with `no_training = true` in config.
+    no_training_providers: HashSet<String>,
     /// "provider/model" -> EWMA response latency in milliseconds, measured
     /// from this process's own successful dispatches. In-memory only —
     /// resets on restart and isn't a live external feed.
@@ -480,6 +482,13 @@ impl Router {
             .map(|(name, _)| name.clone())
             .collect();
 
+        let no_training_providers = config
+            .providers
+            .iter()
+            .filter(|(_, cfg)| cfg.no_training)
+            .map(|(name, _)| name.clone())
+            .collect();
+
         let provider_rpm = config
             .providers
             .iter()
@@ -539,6 +548,7 @@ impl Router {
             routes,
             pricing: Arc::new(pricing),
             zdr_providers,
+            no_training_providers,
             latency: RwLock::new(HashMap::new()),
             uptime: RwLock::new(HashMap::new()),
             throughput: Arc::new(RwLock::new(HashMap::new())),
@@ -872,8 +882,8 @@ impl Router {
     }
 
     /// Apply a request's `provider.only`/`provider.ignore`/`provider.zdr`/
-    /// `provider.sort` constraints to a resolved chain, in that order:
-    /// filter, then sort.
+    /// `provider.data_collection`/`provider.sort` constraints to a resolved
+    /// chain, in that order: filter, then sort.
     fn apply_preferences(
         &self,
         model: &str,
@@ -890,6 +900,9 @@ impl Router {
         }
         if prefs.zdr == Some(true) {
             chain.retain(|(provider, _)| self.zdr_providers.contains(provider));
+        }
+        if prefs.data_collection == Some(true) {
+            chain.retain(|(provider, _)| self.no_training_providers.contains(provider));
         }
         if let Some(max_price) = prefs.max_price {
             chain.retain(|(provider, model)| {
@@ -1272,6 +1285,7 @@ mod tests {
                     .collect(),
             ),
             zdr_providers: zdr_providers.into_iter().map(String::from).collect(),
+            no_training_providers: HashSet::new(),
             latency: RwLock::new(HashMap::new()),
             uptime: RwLock::new(HashMap::new()),
             throughput: Arc::new(RwLock::new(HashMap::new())),
@@ -2727,6 +2741,173 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
+    }
+
+    #[test]
+    fn apply_preferences_data_collection_filters_to_flagged_providers_only() {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.no_training_providers = HashSet::from(["anthropic".to_string()]);
+        let prefs = ProviderPreferences {
+            data_collection: Some(true),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_data_collection_false_is_a_no_op() {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.no_training_providers = HashSet::from(["anthropic".to_string()]);
+        let prefs = ProviderPreferences {
+            data_collection: Some(false),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(
+            result, input,
+            "data_collection: false must not filter out non-no_training providers"
+        );
+    }
+
+    #[test]
+    fn apply_preferences_data_collection_unset_is_a_no_op() {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.no_training_providers = HashSet::from(["anthropic".to_string()]);
+        // `data_collection` left unset within an otherwise-present
+        // preferences object, as opposed to `prefs` being `None` entirely.
+        let prefs = ProviderPreferences {
+            only: Some(vec!["anthropic".to_string(), "openai".to_string()]),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn apply_preferences_data_collection_with_no_flagged_providers_empties_the_chain_and_errors() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            data_collection: Some(true),
+            ..Default::default()
+        };
+        let err = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap_err();
+        assert!(matches!(err, RouterError::NoEligibleProvider(_)));
+    }
+
+    #[test]
+    fn apply_preferences_data_collection_is_independent_of_zdr() {
+        // "anthropic" is zdr-flagged but not no_training-flagged; "openai"
+        // is the reverse. Requiring both must drop everything, since no
+        // single provider satisfies both axes here.
+        let mut router = test_router(vec![], vec![], vec![], vec!["anthropic"], vec![]);
+        router.no_training_providers = HashSet::from(["openai".to_string()]);
+        let prefs = ProviderPreferences {
+            zdr: Some(true),
+            data_collection: Some(true),
+            ..Default::default()
+        };
+        let err = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap_err();
+        assert!(matches!(err, RouterError::NoEligibleProvider(_)));
+    }
+
+    #[test]
+    fn apply_preferences_data_collection_combines_with_zdr_when_both_satisfied() {
+        // "anthropic" satisfies both axes and must survive; "openai"
+        // satisfies neither.
+        let mut router = test_router(vec![], vec![], vec![], vec!["anthropic"], vec![]);
+        router.no_training_providers = HashSet::from(["anthropic".to_string()]);
+        let prefs = ProviderPreferences {
+            zdr: Some(true),
+            data_collection: Some(true),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_data_collection_combines_with_only_filter() {
+        // "openai" passes `only` but isn't no_training-flagged, so it must
+        // still be dropped -- the two filters are independent, not either/or.
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.no_training_providers = HashSet::from(["anthropic".to_string()]);
+        let prefs = ProviderPreferences {
+            only: Some(vec!["anthropic".to_string(), "openai".to_string()]),
+            data_collection: Some(true),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_data_collection_filters_before_price_sort() {
+        // The cheapest candidate ("gemini") isn't no_training-flagged and
+        // must be dropped before price sorting ever sees it, not merely
+        // sorted last.
+        let mut router = test_router(
+            vec![],
+            vec![],
+            vec![
+                ("anthropic/m1", 3.0, 15.0),
+                ("openai/m2", 1.0, 5.0),
+                ("gemini/m3", 0.1, 0.4),
+            ],
+            vec![],
+            vec![],
+        );
+        router.no_training_providers =
+            HashSet::from(["anthropic".to_string(), "openai".to_string()]);
+        let prefs = ProviderPreferences {
+            data_collection: Some(true),
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
     }
 
     #[test]

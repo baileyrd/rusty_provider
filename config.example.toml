@@ -31,6 +31,13 @@ port = 8080
 # `"provider": {"zdr": true}`. Confirm your actual contract terms with the
 # provider before relying on this for anything sensitive.
 #
+# `no_training` (default false) self-declares that this provider does not
+# use submitted data to train its models — a separate axis from `zdr`: a
+# provider can retain data without training on it, or train on it without
+# retaining it beyond the request. Only consulted for requests that set
+# `"provider": {"data_collection": true}`. Same trust model as `zdr` —
+# self-declared, never verified.
+#
 # `requests_per_minute` (optional) self-throttles this router's own calls
 # to that provider, so it doesn't exceed limits it already knows about and
 # get 429'd/banned. When the bucket is empty, the router treats it exactly
@@ -42,6 +49,7 @@ kind = "openai"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 # zdr = true
+# no_training = true
 # requests_per_minute = 500
 
 [providers.anthropic]
@@ -49,6 +57,7 @@ kind = "anthropic"
 base_url = "https://api.anthropic.com"
 api_key_env = "ANTHROPIC_API_KEY"
 # zdr = true
+# no_training = true
 
 [providers.gemini]
 kind = "gemini"

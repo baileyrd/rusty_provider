@@ -390,6 +390,7 @@ A request can also constrain and order the resolved fallback chain with a
     "only": ["anthropic", "openai"],   // drop every other candidate in the chain
     "ignore": ["openai"],              // and then drop these too
     "zdr": true,                       // then drop any provider not marked zdr in config
+    "data_collection": true,           // then drop any provider not marked no_training in config
     "max_price": 5.0,                  // then drop anything pricier than $5/M prompt tokens
     "require_parameters": true,        // then drop anything that can't honor every field set below
     "sort": "price"                    // or "latency" / "throughput" — sort what's left
@@ -406,6 +407,14 @@ A request can also constrain and order the resolved fallback chain with a
   `[providers.*]` config. That flag is self-declared by the operator —
   the router trusts it and never verifies it against the provider, so it's
   only as accurate as your own config.
+- `data_collection: true` drops any provider not marked `no_training = true`
+  in `[providers.*]` config. This is a separate axis from `zdr`, not an
+  alias for it: `zdr` is about data *retention* (does the provider keep
+  your data at all), `data_collection` is about *training* (if they keep
+  it, do they learn from it). A provider can satisfy one without the
+  other — set either, both, or neither depending on what your compliance
+  requirements actually need. Same self-declared, unverified trust model
+  as `zdr`.
 - `max_price` drops any candidate priced above it, in USD per million
   prompt tokens — the same `prompt_per_million` figure `sort: "price"`
   reads from `[[pricing]]`. Unlike `sort: "price"`, this is a hard
