@@ -5,8 +5,13 @@
 host = "0.0.0.0"
 port = 8080
 # Uncomment to require clients to send `Authorization: Bearer <token>`
-# where <token> is the value of the named env var.
+# where <token> is the value of the named env var. Any key from
+# `[[clients]]` below also authenticates, independent of this field.
 # api_key_env = "RUSTY_PROVIDER_API_KEY"
+# Requests-per-minute limit for callers not matched to a `[[clients]]`
+# entry, bucketed by source IP. Unset (the default) means no limit for
+# such callers — rate limiting is entirely opt-in.
+# default_rate_limit_rpm = 60
 
 # --- Providers -------------------------------------------------------------
 # `kind` is one of: "openai" (any OpenAI-compatible /chat/completions API),
@@ -19,12 +24,19 @@ port = 8080
 # verifies it against the provider. Only consulted for requests that set
 # `"provider": {"zdr": true}`. Confirm your actual contract terms with the
 # provider before relying on this for anything sensitive.
+#
+# `requests_per_minute` (optional) self-throttles this router's own calls
+# to that provider, so it doesn't exceed limits it already knows about and
+# get 429'd/banned. When the bucket is empty, the router treats it exactly
+# like a retryable provider error and falls back to the next candidate in
+# the chain — it does not queue/wait.
 
 [providers.openai]
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 # zdr = true
+# requests_per_minute = 500
 
 [providers.anthropic]
 kind = "anthropic"
@@ -101,3 +113,20 @@ completion_per_million = 0.4
 model = "groq/llama-3.3-70b-versatile"
 prompt_per_million = 0.59
 completion_per_million = 0.79
+
+# --- Clients (optional) -------------------------------------------------------
+# Named inbound callers, each with their own API key and rate limit,
+# independent of (and in addition to) `server.api_key_env`. Presenting a
+# client's key both authenticates the request and buckets its rate limit
+# under that client's name rather than the source-IP fallback. Skipped
+# (with a warning) if its api_key_env isn't set, same as providers.
+
+# [[clients]]
+# name = "hermes"
+# api_key_env = "CLIENT_HERMES_API_KEY"
+# requests_per_minute = 60
+#
+# [[clients]]
+# name = "openclaw"
+# api_key_env = "CLIENT_OPENCLAW_API_KEY"
+# requests_per_minute = 120

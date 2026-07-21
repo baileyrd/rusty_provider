@@ -25,4 +25,16 @@ impl RouterError {
             RouterError::Provider(e) => e.status_code(),
         }
     }
+
+    /// Seconds the client should wait before retrying, if known — set when
+    /// this wraps a `ProviderError::RateLimited` (from the upstream
+    /// provider itself, or from this router's own outbound self-throttle).
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            RouterError::Provider(ProviderError::RateLimited { retry_after_secs }) => {
+                *retry_after_secs
+            }
+            _ => None,
+        }
+    }
 }
