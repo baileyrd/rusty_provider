@@ -850,6 +850,7 @@ mod tests {
             tool_choice: None,
             provider: None,
             response_format: None,
+            reasoning: None,
         }
     }
 
@@ -938,6 +939,7 @@ mod tests {
                                 role: Some(Role::Assistant),
                                 content: Some("ok".to_string()),
                                 tool_calls: None,
+                                reasoning: None,
                             },
                             finish_reason: Some("stop".to_string()),
                         }],
@@ -1000,6 +1002,7 @@ mod tests {
                     role: Some(Role::Assistant),
                     content: Some("ok".to_string()),
                     tool_calls: None,
+                    reasoning: None,
                 },
                 finish_reason: None,
             }],

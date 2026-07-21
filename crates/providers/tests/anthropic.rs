@@ -2,7 +2,7 @@ mod common;
 
 use futures_util::StreamExt;
 use rp_core::ProviderError;
-use rp_core::{ChatMessage, Provider};
+use rp_core::{ChatMessage, Provider, ReasoningConfig};
 use rp_providers::AnthropicProvider;
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path};
@@ -662,4 +662,282 @@ async fn chat_maps_429_to_retryable_rate_limited() {
             retry_after_secs: Some(20)
         }
     ));
+}
+
+// --- reasoning / extended thinking ------------------------------------------
+
+#[tokio::test]
+async fn chat_sends_extended_thinking_config_derived_from_effort() {
+    let server = MockServer::start().await;
+    // effort "high" with no client `max_tokens` falls back to the flat
+    // default (24_576); since that exceeds the request's own default
+    // max_tokens (4096), max_tokens gets bumped so budget_tokens < max_tokens.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({
+            "thinking": {"type": "enabled", "budget_tokens": 24_576},
+            "max_tokens": 28_672,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_reasoning(
+        "claude-sonnet-5",
+        ReasoningConfig {
+            effort: Some("high".to_string()),
+            max_tokens: None,
+            exclude: None,
+        },
+    );
+    req.max_tokens = None;
+    provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_clamps_thinking_budget_to_the_anthropic_minimum() {
+    let server = MockServer::start().await;
+    // An explicit `reasoning.max_tokens` below Anthropic's 1024 floor gets
+    // clamped up; the request's own max_tokens (unset -> default 4096)
+    // already exceeds it, so no bump is needed there.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "max_tokens": 4096,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_reasoning(
+        "claude-sonnet-5",
+        ReasoningConfig {
+            effort: None,
+            max_tokens: Some(10),
+            exclude: None,
+        },
+    );
+    req.max_tokens = None;
+    provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_bumps_max_tokens_when_thinking_budget_would_exceed_it() {
+    let server = MockServer::start().await;
+    // The client's own max_tokens (500) is below the requested thinking
+    // budget (2000) -- Anthropic requires max_tokens > budget_tokens, so
+    // it must get bumped rather than sent as-is.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "max_tokens": 6096,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_reasoning(
+        "claude-sonnet-5",
+        ReasoningConfig {
+            effort: None,
+            max_tokens: Some(2000),
+            exclude: None,
+        },
+    );
+    req.max_tokens = Some(500);
+    provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_parses_thinking_blocks_into_the_reasoning_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [
+                {"type": "thinking", "thinking": "Let me work through this step by step."},
+                {"type": "text", "text": "The answer is 42."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::request_with_reasoning(
+        "claude-sonnet-5",
+        ReasoningConfig {
+            effort: Some("low".to_string()),
+            max_tokens: None,
+            exclude: None,
+        },
+    );
+    let resp = provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+
+    assert_eq!(
+        resp.choices[0].message.reasoning.as_deref(),
+        Some("Let me work through this step by step.")
+    );
+    assert_eq!(
+        resp.choices[0].message.content,
+        Some(rp_core::MessageContent::text("The answer is 42."))
+    );
+}
+
+#[tokio::test]
+async fn chat_omits_reasoning_when_the_client_asked_to_exclude_it() {
+    let server = MockServer::start().await;
+    // Anthropic has no server-side toggle to suppress `thinking` blocks --
+    // it still sends one -- so `exclude` has to be enforced client-side.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [
+                {"type": "thinking", "thinking": "secret reasoning"},
+                {"type": "text", "text": "the answer"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::request_with_reasoning(
+        "claude-sonnet-5",
+        ReasoningConfig {
+            effort: Some("low".to_string()),
+            max_tokens: None,
+            exclude: Some(true),
+        },
+    );
+    let resp = provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+
+    assert_eq!(resp.choices[0].message.reasoning, None);
+}
+
+#[tokio::test]
+async fn chat_stream_emits_thinking_delta_as_reasoning_deltas() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Step 1: \"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"add them up.\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc123\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"7\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_reasoning(
+        "claude-sonnet-5",
+        ReasoningConfig {
+            effort: Some("low".to_string()),
+            max_tokens: None,
+            exclude: None,
+        },
+    );
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "claude-sonnet-5")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse"));
+    }
+
+    // `signature_delta` carries no readable text and isn't surfaced.
+    let reasoning: String = chunks
+        .iter()
+        .filter_map(|c| c.choices[0].delta.reasoning.clone())
+        .collect();
+    assert_eq!(reasoning, "Step 1: add them up.");
+
+    let content: String = chunks
+        .iter()
+        .filter_map(|c| c.choices[0].delta.content.clone())
+        .collect();
+    assert_eq!(content, "7");
+}
+
+#[tokio::test]
+async fn chat_stream_omits_reasoning_deltas_when_excluded() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"secret\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"7\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_reasoning(
+        "claude-sonnet-5",
+        ReasoningConfig {
+            effort: Some("low".to_string()),
+            max_tokens: None,
+            exclude: Some(true),
+        },
+    );
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "claude-sonnet-5")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse"));
+    }
+
+    assert!(chunks
+        .iter()
+        .all(|c| c.choices[0].delta.reasoning.is_none()));
 }

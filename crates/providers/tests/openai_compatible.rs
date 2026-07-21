@@ -1,7 +1,7 @@
 mod common;
 
 use futures_util::StreamExt;
-use rp_core::{Provider, ProviderError};
+use rp_core::{Provider, ProviderError, ReasoningConfig};
 use rp_providers::OpenAiCompatibleProvider;
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path};
@@ -614,4 +614,136 @@ async fn chat_falls_back_to_the_raw_body_when_the_error_response_is_not_json() {
         }
         other => panic!("expected Upstream, got {other:?}"),
     }
+}
+
+// --- reasoning ---------------------------------------------------------
+
+#[tokio::test]
+async fn chat_sends_reasoning_effort_and_parses_reasoning_content() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({"reasoning_effort": "high"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "42",
+                    "reasoning_content": "Let me work this out."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::request_with_reasoning(
+        "gpt-4o-mini",
+        ReasoningConfig {
+            effort: Some("high".to_string()),
+            max_tokens: None,
+            exclude: None,
+        },
+    );
+    let resp = provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect("chat should succeed");
+
+    assert_eq!(
+        resp.choices[0].message.reasoning.as_deref(),
+        Some("Let me work this out.")
+    );
+}
+
+#[tokio::test]
+async fn chat_omits_reasoning_content_when_the_client_asked_to_exclude_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "42",
+                    "reasoning_content": "secret reasoning"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::request_with_reasoning(
+        "gpt-4o-mini",
+        ReasoningConfig {
+            effort: Some("high".to_string()),
+            max_tokens: None,
+            exclude: Some(true),
+        },
+    );
+    let resp = provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect("chat should succeed");
+
+    assert_eq!(resp.choices[0].message.reasoning, None);
+}
+
+#[tokio::test]
+async fn chat_stream_parses_reasoning_content_deltas() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Step 1. \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Step 2.\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"42\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let mut req = common::request_with_reasoning(
+        "gpt-4o-mini",
+        ReasoningConfig {
+            effort: Some("high".to_string()),
+            max_tokens: None,
+            exclude: None,
+        },
+    );
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "gpt-4o-mini")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse"));
+    }
+
+    let reasoning: String = chunks
+        .iter()
+        .filter_map(|c| c.choices[0].delta.reasoning.clone())
+        .collect();
+    assert_eq!(reasoning, "Step 1. Step 2.");
+
+    let content: String = chunks
+        .iter()
+        .filter_map(|c| c.choices[0].delta.content.clone())
+        .collect();
+    assert_eq!(content, "42");
 }

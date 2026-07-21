@@ -63,6 +63,11 @@ struct WireRequest<'a> {
     /// passthrough -- no translation needed, unlike Anthropic and Gemini.
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<&'a ResponseFormat>,
+    /// The widely-adopted convention across DeepSeek/Groq/etc.
+    /// OpenAI-compatible reasoning models: a top-level effort hint, direct
+    /// passthrough from `reasoning.effort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 impl<'a> WireRequest<'a> {
@@ -78,6 +83,7 @@ impl<'a> WireRequest<'a> {
             tools: req.tools.as_deref(),
             tool_choice: req.tool_choice.as_ref(),
             response_format: req.response_format.as_ref(),
+            reasoning_effort: req.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
         }
     }
 }
@@ -114,6 +120,10 @@ struct WireMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+    /// The `reasoning_content` convention adopted across DeepSeek/Groq/etc.
+    /// OpenAI-compatible reasoning models.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +145,8 @@ struct WireDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +189,11 @@ impl Provider for OpenAiCompatibleProvider {
             .await
             .map_err(|e| ProviderError::Decode(e.to_string()))?;
         let full_model = format!("{}/{}", self.name, model);
+        let exclude_reasoning = req
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.exclude)
+            .unwrap_or(false);
 
         Ok(ChatResponse {
             id: gen_id("chatcmpl"),
@@ -194,6 +211,11 @@ impl Provider for OpenAiCompatibleProvider {
                         name: None,
                         tool_calls: c.message.tool_calls,
                         tool_call_id: None,
+                        reasoning: if exclude_reasoning {
+                            None
+                        } else {
+                            c.message.reasoning_content
+                        },
                     },
                     finish_reason: c.finish_reason,
                 })
@@ -223,6 +245,11 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let full_model = format!("{}/{}", self.name, model);
+        let exclude_reasoning = req
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.exclude)
+            .unwrap_or(false);
         let stream = resp.bytes_stream().eventsource().filter_map(move |ev| {
             let full_model = full_model.clone();
             async move {
@@ -251,6 +278,11 @@ impl Provider for OpenAiCompatibleProvider {
                                 role: c.delta.role.as_deref().map(parse_role),
                                 content: c.delta.content,
                                 tool_calls: c.delta.tool_calls,
+                                reasoning: if exclude_reasoning {
+                                    None
+                                } else {
+                                    c.delta.reasoning_content
+                                },
                             },
                             finish_reason: c.finish_reason,
                         })

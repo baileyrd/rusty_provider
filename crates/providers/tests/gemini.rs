@@ -1,7 +1,7 @@
 mod common;
 
 use futures_util::StreamExt;
-use rp_core::{ChatMessage, Provider, ProviderError, Role, ToolCall};
+use rp_core::{ChatMessage, Provider, ProviderError, ReasoningConfig, Role, ToolCall};
 use rp_providers::GeminiProvider;
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, method, path, query_param};
@@ -508,4 +508,171 @@ async fn chat_maps_429_to_retryable_rate_limited() {
 
     assert!(err.is_retryable());
     assert!(matches!(err, ProviderError::RateLimited { .. }));
+}
+
+// --- reasoning / thinking config --------------------------------------------
+
+#[tokio::test]
+async fn chat_sends_thinking_config_derived_from_reasoning_effort() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "generationConfig": {
+                "thinkingConfig": {"thinkingBudget": 8192, "includeThoughts": true}
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "ok"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_reasoning(
+        "gemini-2.0-flash",
+        ReasoningConfig {
+            effort: Some("medium".to_string()),
+            max_tokens: None,
+            exclude: None,
+        },
+    );
+    req.max_tokens = None;
+    provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_sets_include_thoughts_false_when_excluded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "generationConfig": {
+                "thinkingConfig": {"includeThoughts": false}
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "ok"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_reasoning(
+        "gemini-2.0-flash",
+        ReasoningConfig {
+            effort: None,
+            max_tokens: None,
+            exclude: Some(true),
+        },
+    );
+    provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_parses_thought_marked_parts_into_the_reasoning_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "Let me reason about this.", "thought": true},
+                        {"text": "The answer is 42."}
+                    ],
+                    "role": "model"
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20, "totalTokenCount": 30}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_reasoning(
+        "gemini-2.0-flash",
+        ReasoningConfig {
+            effort: Some("low".to_string()),
+            max_tokens: None,
+            exclude: None,
+        },
+    );
+    let resp = provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+
+    assert_eq!(
+        resp.choices[0].message.reasoning.as_deref(),
+        Some("Let me reason about this.")
+    );
+    assert_eq!(
+        resp.choices[0].message.content,
+        Some(rp_core::MessageContent::text("The answer is 42."))
+    );
+}
+
+#[tokio::test]
+async fn chat_stream_emits_thought_parts_as_reasoning_deltas() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true}],\"role\":\"model\"}}]}\n\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"42\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_reasoning(
+        "gemini-2.0-flash",
+        ReasoningConfig {
+            effort: Some("low".to_string()),
+            max_tokens: None,
+            exclude: None,
+        },
+    );
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse"));
+    }
+
+    let reasoning: String = chunks
+        .iter()
+        .filter_map(|c| c.choices[0].delta.reasoning.clone())
+        .collect();
+    assert_eq!(reasoning, "thinking...");
+
+    let content: String = chunks
+        .iter()
+        .filter_map(|c| c.choices[0].delta.content.clone())
+        .collect();
+    assert_eq!(content, "42");
 }
