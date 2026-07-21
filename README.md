@@ -412,6 +412,17 @@ A request can also constrain and order the resolved fallback chain with a
   hands streamed responses straight to the HTTP layer. Same caveats as
   `"latency"`: no config needed, in-memory only, per-process; an
   unobserved "provider/model" sorts last.
+- `sort: "uptime"` sorts descending (most reliable first) by a running
+  average (EWMA) of this router's own observed success rate per
+  "provider/model" — `1.0` recorded for a successful attempt, `0.0` for a
+  failed one (retryable or fatal), sampled only on an actual dispatch
+  attempt against that provider, not a candidate skipped locally (e.g. by
+  this router's own outbound rate limit). Same caveats as `"latency"`/
+  `"throughput"`: no config needed, in-memory only, per-process; an
+  unobserved "provider/model" sorts last rather than being assumed
+  healthy. This is a deterministic ranking, not weighted-random load
+  balancing across "healthy" candidates — every request still tries the
+  sorted chain in order with fallback, the same as any other `sort` value.
 
 ### `GET /v1/models`
 
