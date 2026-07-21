@@ -676,3 +676,64 @@ async fn chat_stream_emits_thought_parts_as_reasoning_deltas() {
         .collect();
     assert_eq!(content, "42");
 }
+
+// --- prompt caching ----------------------------------------------------------
+
+#[tokio::test]
+async fn chat_parses_cached_content_token_count_into_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "ok"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 20,
+                "totalTokenCount": 1020,
+                "cachedContentTokenCount": 800,
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::simple_request("gemini-2.0-flash");
+    let resp = provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+
+    let usage = resp.usage.expect("usage should be present");
+    // Already cache-inclusive on the wire -- no arithmetic needed, unlike Anthropic.
+    assert_eq!(usage.prompt_tokens, 1000);
+    assert_eq!(usage.cached_tokens, Some(800));
+    assert_eq!(usage.cache_creation_tokens, None);
+}
+
+#[tokio::test]
+async fn chat_leaves_cached_tokens_none_without_any_cache_hit() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "ok"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::simple_request("gemini-2.0-flash");
+    let resp = provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+
+    assert_eq!(resp.usage.unwrap().cached_tokens, None);
+}

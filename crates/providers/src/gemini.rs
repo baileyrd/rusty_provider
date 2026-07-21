@@ -356,12 +356,17 @@ struct WireCandidate {
 
 #[derive(Deserialize, Default)]
 struct WireUsageMetadata {
+    /// Total prompt tokens, already inclusive of any cached ones --
+    /// `cached_content_token_count` below is a breakdown of this, not
+    /// additive on top of it, matching how OpenAI reports it too.
     #[serde(rename = "promptTokenCount", default)]
     prompt_token_count: u32,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates_token_count: u32,
     #[serde(rename = "totalTokenCount", default)]
     total_token_count: u32,
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -370,6 +375,19 @@ struct WireResponse {
     candidates: Vec<WireCandidate>,
     #[serde(rename = "usageMetadata", default)]
     usage_metadata: WireUsageMetadata,
+}
+
+fn usage_from_wire(m: &WireUsageMetadata) -> Usage {
+    let cached = m.cached_content_token_count;
+    Usage {
+        prompt_tokens: m.prompt_token_count,
+        completion_tokens: m.candidates_token_count,
+        total_tokens: m.total_token_count,
+        cached_tokens: (cached > 0).then_some(cached),
+        // Gemini bills an implicit cache write the same as a normal
+        // prompt token -- no separate accounting to surface.
+        cache_creation_tokens: None,
+    }
 }
 
 fn candidate_text(c: &WireCandidate) -> String {
@@ -505,14 +523,11 @@ impl Provider for GeminiProvider {
                     },
                     tool_call_id: None,
                     reasoning,
+                    cache_control: None,
                 },
                 finish_reason,
             }],
-            usage: Some(Usage {
-                prompt_tokens: wire.usage_metadata.prompt_token_count,
-                completion_tokens: wire.usage_metadata.candidates_token_count,
-                total_tokens: wire.usage_metadata.total_token_count,
-            }),
+            usage: Some(usage_from_wire(&wire.usage_metadata)),
             cost_usd: None,
         })
     }
@@ -563,11 +578,7 @@ impl Provider for GeminiProvider {
                     None => (String::new(), None, Vec::new(), None),
                 };
                 let usage = if wire.usage_metadata.total_token_count > 0 {
-                    Some(Usage {
-                        prompt_tokens: wire.usage_metadata.prompt_token_count,
-                        completion_tokens: wire.usage_metadata.candidates_token_count,
-                        total_tokens: wire.usage_metadata.total_token_count,
-                    })
+                    Some(usage_from_wire(&wire.usage_metadata))
                 } else {
                     None
                 };
@@ -1047,6 +1058,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
+            cache_control: None,
         }];
         let (_, contents) = build_contents(&messages);
         assert_eq!(contents.len(), 1);
@@ -1070,6 +1082,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning: None,
+                cache_control: None,
             },
             ChatMessage::assistant("ok"),
         ];
@@ -1092,6 +1105,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
+            cache_control: None,
         }];
         let (_, contents) = build_contents(&messages);
         assert_eq!(

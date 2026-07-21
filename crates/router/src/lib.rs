@@ -60,6 +60,28 @@ pub struct ClientSpendStatus {
     pub period: BudgetPeriod,
 }
 
+/// Per-million-token USD rates for one "provider/model", derived from its
+/// `[[pricing]]` entry with `cache_read_per_million`/`cache_write_per_million`
+/// defaulted to `prompt_per_million` when the operator left them unset.
+#[derive(Debug, Clone, Copy)]
+struct PriceRates {
+    prompt_ppm: f64,
+    completion_ppm: f64,
+    cache_read_ppm: f64,
+    cache_write_ppm: f64,
+}
+
+impl From<&PricingEntry> for PriceRates {
+    fn from(p: &PricingEntry) -> Self {
+        Self {
+            prompt_ppm: p.prompt_per_million,
+            completion_ppm: p.completion_per_million,
+            cache_read_ppm: p.cache_read_per_million.unwrap_or(p.prompt_per_million),
+            cache_write_ppm: p.cache_write_per_million.unwrap_or(p.prompt_per_million),
+        }
+    }
+}
+
 /// Holds every provider adapter that could be built from config (i.e. its
 /// API key env var was set), the named fallback-chain aliases, static
 /// per-model pricing (used for `provider.sort: "price"` and for computing
@@ -71,8 +93,8 @@ pub struct ClientSpendStatus {
 pub struct Router {
     providers: HashMap<String, Arc<dyn Provider>>,
     routes: HashMap<String, Vec<String>>,
-    /// "provider/model" -> (prompt price, completion price) per million tokens.
-    pricing: Arc<HashMap<String, (f64, f64)>>,
+    /// "provider/model" -> per-million-token USD rates.
+    pricing: Arc<HashMap<String, PriceRates>>,
     /// Provider names with `zdr = true` in config.
     zdr_providers: HashSet<String>,
     /// "provider/model" -> EWMA response latency in milliseconds, measured
@@ -149,14 +171,20 @@ fn ewma_lookup(
 fn record_usage(
     usage_map: &RwLock<HashMap<String, UsageStats>>,
     persistence: Option<&Persistence>,
-    pricing: &HashMap<String, (f64, f64)>,
+    pricing: &HashMap<String, PriceRates>,
     provider: &str,
     model: &str,
     usage: &Usage,
 ) -> Option<f64> {
     let key = format!("{provider}/{model}");
-    let cost = pricing.get(&key).map(|(prompt_ppm, completion_ppm)| {
-        (usage.prompt_tokens as f64 * prompt_ppm + usage.completion_tokens as f64 * completion_ppm)
+    let cost = pricing.get(&key).map(|rates| {
+        let cached = usage.cached_tokens.unwrap_or(0) as f64;
+        let cache_write = usage.cache_creation_tokens.unwrap_or(0) as f64;
+        let fresh_prompt = usage.prompt_tokens as f64 - cached - cache_write;
+        (fresh_prompt * rates.prompt_ppm
+            + cached * rates.cache_read_ppm
+            + cache_write * rates.cache_write_ppm
+            + usage.completion_tokens as f64 * rates.completion_ppm)
             / 1_000_000.0
     });
 
@@ -256,12 +284,7 @@ impl Router {
         let pricing = config
             .pricing
             .iter()
-            .map(|p| {
-                (
-                    p.model.clone(),
-                    (p.prompt_per_million, p.completion_per_million),
-                )
-            })
+            .map(|p| (p.model.clone(), PriceRates::from(p)))
             .collect();
 
         let zdr_providers = config
@@ -528,7 +551,7 @@ impl Router {
                 let price_of = |entry: &(String, String)| {
                     self.pricing
                         .get(&format!("{}/{}", entry.0, entry.1))
-                        .map(|(prompt_ppm, _)| *prompt_ppm)
+                        .map(|rates| rates.prompt_ppm)
                         .unwrap_or(f64::MAX)
                 };
                 price_of(a).total_cmp(&price_of(b))
@@ -810,7 +833,17 @@ mod tests {
             pricing: Arc::new(
                 pricing
                     .into_iter()
-                    .map(|(k, p, c)| (k.to_string(), (p, c)))
+                    .map(|(k, p, c)| {
+                        (
+                            k.to_string(),
+                            PriceRates {
+                                prompt_ppm: p,
+                                completion_ppm: c,
+                                cache_read_ppm: p,
+                                cache_write_ppm: p,
+                            },
+                        )
+                    })
                     .collect(),
             ),
             zdr_providers: zdr_providers.into_iter().map(String::from).collect(),
@@ -913,6 +946,8 @@ mod tests {
                         prompt_tokens: 1,
                         completion_tokens: 1,
                         total_tokens: 2,
+                        cached_tokens: None,
+                        cache_creation_tokens: None,
                     }),
                     cost_usd: None,
                 }),
@@ -947,6 +982,8 @@ mod tests {
                             prompt_tokens: 1,
                             completion_tokens: 1,
                             total_tokens: 2,
+                            cached_tokens: None,
+                            cache_creation_tokens: None,
                         }),
                         cost_usd: None,
                     };
@@ -1010,6 +1047,8 @@ mod tests {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
+                cached_tokens: None,
+                cache_creation_tokens: None,
             }),
             cost_usd: None,
         }
@@ -2359,6 +2398,21 @@ mod tests {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+        }
+    }
+
+    /// Flat pricing with no cache discount/premium -- cache reads and
+    /// writes both cost the same as a normal prompt token, matching what
+    /// an operator gets by leaving `cache_read_per_million`/
+    /// `cache_write_per_million` unset in `[[pricing]]`.
+    fn flat_rates(prompt_ppm: f64, completion_ppm: f64) -> PriceRates {
+        PriceRates {
+            prompt_ppm,
+            completion_ppm,
+            cache_read_ppm: prompt_ppm,
+            cache_write_ppm: prompt_ppm,
         }
     }
 
@@ -2367,7 +2421,7 @@ mod tests {
         let usage_map = RwLock::new(HashMap::new());
         let mut pricing = HashMap::new();
         // $2/1M prompt tokens, $10/1M completion tokens.
-        pricing.insert("anthropic/m1".to_string(), (2.0, 10.0));
+        pricing.insert("anthropic/m1".to_string(), flat_rates(2.0, 10.0));
 
         let cost = record_usage(
             &usage_map,
@@ -2409,7 +2463,7 @@ mod tests {
     fn record_usage_zero_tokens_with_pricing_still_returns_some_zero_cost() {
         let usage_map = RwLock::new(HashMap::new());
         let mut pricing = HashMap::new();
-        pricing.insert("anthropic/m1".to_string(), (2.0, 10.0));
+        pricing.insert("anthropic/m1".to_string(), flat_rates(2.0, 10.0));
 
         let cost = record_usage(&usage_map, None, &pricing, "anthropic", "m1", &usage(0, 0));
 
@@ -2424,7 +2478,7 @@ mod tests {
     fn record_usage_accumulates_across_multiple_calls_for_the_same_key() {
         let usage_map = RwLock::new(HashMap::new());
         let mut pricing = HashMap::new();
-        pricing.insert("anthropic/m1".to_string(), (1.0, 1.0));
+        pricing.insert("anthropic/m1".to_string(), flat_rates(1.0, 1.0));
 
         record_usage(
             &usage_map,
@@ -2456,8 +2510,8 @@ mod tests {
     fn record_usage_keys_are_independent_per_provider_model() {
         let usage_map = RwLock::new(HashMap::new());
         let mut pricing = HashMap::new();
-        pricing.insert("anthropic/m1".to_string(), (1.0, 1.0));
-        pricing.insert("openai/m2".to_string(), (5.0, 5.0));
+        pricing.insert("anthropic/m1".to_string(), flat_rates(1.0, 1.0));
+        pricing.insert("openai/m2".to_string(), flat_rates(5.0, 5.0));
 
         record_usage(
             &usage_map,
@@ -2474,6 +2528,128 @@ mod tests {
         assert_eq!(stats["anthropic/m1"].prompt_tokens, 100);
         assert_eq!(stats["openai/m2"].requests, 1);
         assert_eq!(stats["openai/m2"].prompt_tokens, 200);
+    }
+
+    // --- PriceRates::from(&PricingEntry) ----------------------------------------
+
+    #[test]
+    fn price_rates_from_pricing_entry_defaults_cache_rates_to_prompt_price() {
+        let entry = PricingEntry {
+            model: "anthropic/m1".to_string(),
+            prompt_per_million: 3.0,
+            completion_per_million: 15.0,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+        };
+        let rates = PriceRates::from(&entry);
+        assert_eq!(rates.cache_read_ppm, 3.0);
+        assert_eq!(rates.cache_write_ppm, 3.0);
+    }
+
+    #[test]
+    fn price_rates_from_pricing_entry_honors_explicit_cache_rates() {
+        let entry = PricingEntry {
+            model: "anthropic/m1".to_string(),
+            prompt_per_million: 3.0,
+            completion_per_million: 15.0,
+            cache_read_per_million: Some(0.3),
+            cache_write_per_million: Some(3.75),
+        };
+        let rates = PriceRates::from(&entry);
+        assert_eq!(rates.cache_read_ppm, 0.3);
+        assert_eq!(rates.cache_write_ppm, 3.75);
+    }
+
+    // --- record_usage: cache-aware cost -----------------------------------------
+
+    fn usage_with_cache(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached: u32,
+        cache_creation: u32,
+    ) -> Usage {
+        Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            cached_tokens: (cached > 0).then_some(cached),
+            cache_creation_tokens: (cache_creation > 0).then_some(cache_creation),
+        }
+    }
+
+    #[test]
+    fn record_usage_prices_cached_tokens_at_the_discounted_rate() {
+        let usage_map = RwLock::new(HashMap::new());
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "anthropic/m1".to_string(),
+            PriceRates {
+                prompt_ppm: 3.0,
+                completion_ppm: 15.0,
+                cache_read_ppm: 0.3,
+                cache_write_ppm: 3.75,
+            },
+        );
+
+        // 1000 total prompt tokens: 200 fresh, 800 cached (read), 0 written.
+        let cost = record_usage(
+            &usage_map,
+            None,
+            &pricing,
+            "anthropic",
+            "m1",
+            &usage_with_cache(1000, 100, 800, 0),
+        );
+
+        let expected = (200.0 * 3.0 + 800.0 * 0.3 + 100.0 * 15.0) / 1_000_000.0;
+        assert!((cost.unwrap() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn record_usage_prices_cache_write_tokens_at_the_premium_rate() {
+        let usage_map = RwLock::new(HashMap::new());
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "anthropic/m1".to_string(),
+            PriceRates {
+                prompt_ppm: 3.0,
+                completion_ppm: 15.0,
+                cache_read_ppm: 0.3,
+                cache_write_ppm: 3.75,
+            },
+        );
+
+        // 1000 total prompt tokens: 500 fresh, 0 read, 500 written.
+        let cost = record_usage(
+            &usage_map,
+            None,
+            &pricing,
+            "anthropic",
+            "m1",
+            &usage_with_cache(1000, 0, 0, 500),
+        );
+
+        let expected = (500.0 * 3.0 + 500.0 * 3.75) / 1_000_000.0;
+        assert!((cost.unwrap() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn record_usage_with_no_cache_tokens_matches_flat_prompt_pricing() {
+        let usage_map = RwLock::new(HashMap::new());
+        let mut pricing = HashMap::new();
+        pricing.insert("anthropic/m1".to_string(), flat_rates(3.0, 15.0));
+
+        let cost = record_usage(
+            &usage_map,
+            None,
+            &pricing,
+            "anthropic",
+            "m1",
+            &usage_with_cache(1000, 100, 0, 0),
+        );
+
+        let expected = (1000.0 * 3.0 + 100.0 * 15.0) / 1_000_000.0;
+        assert!((cost.unwrap() - expected).abs() < 1e-12);
     }
 
     // --- check_outbound_rate_limit ----------------------------------------------

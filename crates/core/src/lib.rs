@@ -7,8 +7,8 @@ pub use error::ProviderError;
 pub use provider::{ChatStream, Provider};
 pub use rate_limit::RateLimiter;
 pub use types::{
-    ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, Choice, ChunkChoice,
-    ContentPart, FunctionCall, FunctionCallDelta, FunctionDef, ImageUrl, InputAudio,
+    CacheControl, ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, Choice,
+    ChunkChoice, ContentPart, FunctionCall, FunctionCallDelta, FunctionDef, ImageUrl, InputAudio,
     JsonSchemaFormat, MessageContent, ModelInfo, ProviderPreferences, ReasoningConfig,
     ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };

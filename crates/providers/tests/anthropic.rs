@@ -941,3 +941,131 @@ async fn chat_stream_omits_reasoning_deltas_when_excluded() {
         .iter()
         .all(|c| c.choices[0].delta.reasoning.is_none()));
 }
+
+// --- prompt caching ----------------------------------------------------------
+
+#[tokio::test]
+async fn chat_sends_system_as_a_cache_control_block_array_when_requested() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({
+            "system": [{
+                "type": "text",
+                "text": "You are a helpful assistant.",
+                "cache_control": {"type": "ephemeral"},
+            }],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("claude-sonnet-5");
+    let mut system = ChatMessage::system("You are a helpful assistant.");
+    system.cache_control = Some(rp_core::CacheControl::Ephemeral);
+    req.messages = vec![system, ChatMessage::user("hi")];
+    provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_parses_cache_creation_and_cache_read_tokens_into_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 500,
+                "cache_read_input_tokens": 1000,
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::simple_request("claude-sonnet-5");
+    let resp = provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+
+    let usage = resp.usage.expect("usage should be present");
+    // Cache-inclusive total: 100 (fresh) + 500 (written) + 1000 (read).
+    assert_eq!(usage.prompt_tokens, 1600);
+    assert_eq!(usage.cached_tokens, Some(1000));
+    assert_eq!(usage.cache_creation_tokens, Some(500));
+}
+
+#[tokio::test]
+async fn chat_leaves_cache_usage_fields_none_without_any_caching() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 20}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::simple_request("claude-sonnet-5");
+    let resp = provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+
+    let usage = resp.usage.expect("usage should be present");
+    assert_eq!(usage.prompt_tokens, 100);
+    assert_eq!(usage.cached_tokens, None);
+    assert_eq!(usage.cache_creation_tokens, None);
+}
+
+#[tokio::test]
+async fn chat_stream_reports_cache_tokens_from_message_start_in_the_final_usage() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":500,\"cache_read_input_tokens\":1000}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":20}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("claude-sonnet-5");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "claude-sonnet-5")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse"));
+    }
+
+    let usage = chunks
+        .iter()
+        .find_map(|c| c.usage.clone())
+        .expect("final chunk should carry usage");
+    assert_eq!(usage.prompt_tokens, 1600);
+    assert_eq!(usage.cached_tokens, Some(1000));
+    assert_eq!(usage.cache_creation_tokens, Some(500));
+}

@@ -218,16 +218,64 @@ Per-provider translation:
   OpenAI-compatible reasoning models. `effort` maps straight through;
   `max_tokens` has no equivalent on this wire format and is ignored.
 
+### Prompt caching
+
+A message can mark itself as the end of a cacheable prefix with
+`cache_control`, matching Anthropic's own breakpoint shape:
+
+```jsonc
+{
+  "model": "smart",
+  "messages": [
+    {"role": "system", "content": "... a long, reused system prompt ...", "cache_control": {"type": "ephemeral"}},
+    {"role": "user", "content": "What's the weather in Boston?"}
+  ]
+}
+```
+
+- **Anthropic** is the only provider with an explicit cache-breakpoint API,
+  so this is a direct, mostly-untranslated passthrough: the marked
+  message's last content block gets Anthropic's
+  `"cache_control": {"type": "ephemeral"}`, and a system message with
+  `cache_control` set switches `system` from a plain string to a block
+  array (only the block form can carry a breakpoint) — every other request
+  keeps the plain-string `system` shape exactly as before. Anthropic's
+  response usage separately reports `cache_creation_input_tokens` (tokens
+  newly written to the cache, billed at a premium) and
+  `cache_read_input_tokens` (tokens served from it, billed at a steep
+  discount) on top of its already-non-cached `input_tokens` — this router
+  folds all three into a single cache-inclusive `usage.prompt_tokens`,
+  matching how OpenAI and Gemini already report theirs, and surfaces the
+  breakdown separately.
+- **OpenAI-compatible** and **Gemini** cache automatically server-side, with
+  no request-side marker — `cache_control` is silently a no-op there rather
+  than an error, since it's an optimization hint, not a correctness
+  requirement, and both still answer correctly without it.
+
+Every response's `usage` may include `cached_tokens` (prompt tokens served
+from a cache) and `cache_creation_tokens` (prompt tokens newly written to
+one, Anthropic only) — both a breakdown of `prompt_tokens`, not additive on
+top of it, and both absent (not `0`) when the provider reports no cache
+accounting or nothing was cached. `[[pricing]]` entries can price these
+separately with `cache_read_per_million`/`cache_write_per_million`
+(defaulting to `prompt_per_million`, i.e. no assumed discount, when unset)
+so `cost_usd` reflects the actual cache economics instead of pricing every
+prompt token at the full rate. The cumulative totals at `GET /v1/usage` and
+`GET /metrics`, and the SQLite/Postgres persistence layer, still only track
+`prompt_tokens`/`completion_tokens`/`cost_usd` — the cache breakdown is
+per-response only, not accumulated.
+
 If `[[pricing]]` has an entry for the model that actually served the
 request, the response (and, for streaming, whichever chunk carries the
 final `usage`) includes an extra `cost_usd` field — the request's
 estimated dollar cost, computed from `usage.prompt_tokens` /
-`usage.completion_tokens` against that pricing entry. It's not part of the
-OpenAI schema, so existing OpenAI SDKs/clients just ignore it; it's simply
-absent (not `0`/`null`) when the model has no configured pricing, so don't
-read a missing field as "this was free." Every request also adds to a
-running per-model total queryable at `GET /v1/usage` (below), whether or
-not pricing is configured for it.
+`usage.completion_tokens` (split into fresh/cached/cache-write portions
+when the response reports any caching) against that pricing entry. It's
+not part of the OpenAI schema, so existing OpenAI SDKs/clients just ignore
+it; it's simply absent (not `0`/`null`) when the model has no configured
+pricing, so don't read a missing field as "this was free." Every request
+also adds to a running per-model total queryable at `GET /v1/usage`
+(below), whether or not pricing is configured for it.
 
 A request can also constrain and order the resolved fallback chain with a
 `provider` field, independent of whether `model` was a direct

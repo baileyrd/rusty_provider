@@ -747,3 +747,68 @@ async fn chat_stream_parses_reasoning_content_deltas() {
         .collect();
     assert_eq!(content, "42");
 }
+
+// --- prompt caching ----------------------------------------------------------
+
+#[tokio::test]
+async fn chat_parses_prompt_tokens_details_cached_tokens_into_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 20,
+                "total_tokens": 1020,
+                "prompt_tokens_details": {"cached_tokens": 900}
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::simple_request("gpt-4o-mini");
+    let resp = provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect("chat should succeed");
+
+    let usage = resp.usage.expect("usage should be present");
+    // Already cache-inclusive on the wire -- no arithmetic needed.
+    assert_eq!(usage.prompt_tokens, 1000);
+    assert_eq!(usage.cached_tokens, Some(900));
+    assert_eq!(usage.cache_creation_tokens, None);
+}
+
+#[tokio::test]
+async fn chat_leaves_cached_tokens_none_without_prompt_tokens_details() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::simple_request("gpt-4o-mini");
+    let resp = provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect("chat should succeed");
+
+    assert_eq!(resp.usage.unwrap().cached_tokens, None);
+}
