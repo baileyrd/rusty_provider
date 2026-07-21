@@ -2,7 +2,8 @@ mod config;
 mod error;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 pub use config::{Config, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig};
 pub use error::RouterError;
@@ -10,12 +11,17 @@ pub use error::RouterError;
 use rp_core::{ChatRequest, ChatResponse, ChatStream, Provider, ProviderPreferences};
 use rp_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatibleProvider};
 
+/// Weight given to each new latency sample in the running average — higher
+/// reacts faster to recent conditions, lower smooths out noise.
+const LATENCY_EWMA_ALPHA: f64 = 0.3;
+
 /// Holds every provider adapter that could be built from config (i.e. its
-/// API key env var was set), the named fallback-chain aliases, and static
-/// per-model pricing (used only for `provider.sort: "price"` requests).
-/// Model strings are resolved to a chain of (provider, model) pairs and
-/// tried in order, falling back on retryable errors (rate limits,
-/// timeouts, 5xxs).
+/// API key env var was set), the named fallback-chain aliases, static
+/// per-model pricing (used only for `provider.sort: "price"` requests),
+/// and a running average of this router's own observed per-model response
+/// latency (used only for `provider.sort: "latency"` requests). Model
+/// strings are resolved to a chain of (provider, model) pairs and tried in
+/// order, falling back on retryable errors (rate limits, timeouts, 5xxs).
 pub struct Router {
     providers: HashMap<String, Arc<dyn Provider>>,
     routes: HashMap<String, Vec<String>>,
@@ -23,6 +29,10 @@ pub struct Router {
     pricing: HashMap<String, f64>,
     /// Provider names with `zdr = true` in config.
     zdr_providers: HashSet<String>,
+    /// "provider/model" -> EWMA response latency in milliseconds, measured
+    /// from this process's own successful dispatches. In-memory only —
+    /// resets on restart and isn't a live external feed.
+    latency: RwLock<HashMap<String, f64>>,
 }
 
 impl Router {
@@ -76,6 +86,7 @@ impl Router {
             routes,
             pricing,
             zdr_providers,
+            latency: RwLock::new(HashMap::new()),
         }
     }
 
@@ -131,8 +142,8 @@ impl Router {
             return Err(RouterError::NoEligibleProvider(model.to_string()));
         }
 
-        if prefs.sort.as_deref() == Some("price") {
-            chain.sort_by(|a, b| {
+        match prefs.sort.as_deref() {
+            Some("price") => chain.sort_by(|a, b| {
                 let price_of = |entry: &(String, String)| {
                     self.pricing
                         .get(&format!("{}/{}", entry.0, entry.1))
@@ -140,10 +151,38 @@ impl Router {
                         .unwrap_or(f64::MAX)
                 };
                 price_of(a).total_cmp(&price_of(b))
-            });
+            }),
+            Some("latency") => chain.sort_by(|a, b| {
+                self.latency_of(&a.0, &a.1)
+                    .total_cmp(&self.latency_of(&b.0, &b.1))
+            }),
+            _ => {}
         }
 
         Ok(chain)
+    }
+
+    /// Observed EWMA latency in milliseconds for "provider/model", or
+    /// `f64::MAX` (sorts last) if this router hasn't yet seen a successful
+    /// call to it.
+    fn latency_of(&self, provider: &str, model: &str) -> f64 {
+        self.latency
+            .read()
+            .unwrap()
+            .get(&format!("{provider}/{model}"))
+            .copied()
+            .unwrap_or(f64::MAX)
+    }
+
+    fn record_latency(&self, provider: &str, model: &str, elapsed_ms: f64) {
+        let key = format!("{provider}/{model}");
+        let mut latency = self.latency.write().unwrap();
+        latency
+            .entry(key)
+            .and_modify(|avg| {
+                *avg = LATENCY_EWMA_ALPHA * elapsed_ms + (1.0 - LATENCY_EWMA_ALPHA) * *avg
+            })
+            .or_insert(elapsed_ms);
     }
 
     fn get_provider(&self, name: &str) -> Result<&Arc<dyn Provider>, RouterError> {
@@ -167,8 +206,14 @@ impl Router {
                 }
             };
 
+            let started_at = Instant::now();
             match provider.chat(req, model_name).await {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+                    self.record_latency(provider_name, model_name, elapsed_ms);
+                    tracing::debug!(provider = %provider_name, model = %model_name, elapsed_ms, "recorded latency");
+                    return Ok(resp);
+                }
                 Err(e) if e.is_retryable() => {
                     tracing::warn!(provider = %provider_name, model = %model_name, "provider failed, falling back: {e}");
                     last_err = Some(RouterError::Provider(e));
@@ -195,8 +240,14 @@ impl Router {
                 }
             };
 
+            let started_at = Instant::now();
             match provider.chat_stream(req, model_name).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+                    self.record_latency(provider_name, model_name, elapsed_ms);
+                    tracing::debug!(provider = %provider_name, model = %model_name, elapsed_ms, "recorded latency (time to first byte)");
+                    return Ok(stream);
+                }
                 Err(e) if e.is_retryable() => {
                     tracing::warn!(provider = %provider_name, model = %model_name, "provider failed, falling back: {e}");
                     last_err = Some(RouterError::Provider(e));

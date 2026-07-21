@@ -82,7 +82,7 @@ A request can also constrain and order the resolved fallback chain with a
     "only": ["anthropic", "openai"],   // drop every other candidate in the chain
     "ignore": ["openai"],              // and then drop these too
     "zdr": true,                       // then drop any provider not marked zdr in config
-    "sort": "price"                    // stable-sort what's left, cheapest prompt price first
+    "sort": "price"                    // or "latency" — stable-sort what's left
   },
   "messages": [{"role": "user", "content": "..."}]
 }
@@ -100,6 +100,13 @@ A request can also constrain and order the resolved fallback chain with a
   prompt-token price configured in `[[pricing]]` (see `config.example.toml`)
   — entries with no configured price sort last, keeping their relative
   order. This is a static, operator-maintained price table, not a live feed.
+- `sort: "latency"` stable-sorts ascending by a running average (EWMA) of
+  this router's own observed response time per "provider/model", measured
+  from request-sent to response-received (time-to-first-byte for streaming
+  requests, full round-trip for non-streaming). This needs no config —
+  it's built up automatically from real traffic — but it's in-memory only
+  (resets on restart) and per-process, not a shared/global feed; a
+  "provider/model" this router hasn't successfully called yet sorts last.
 
 ### `GET /v1/models`
 
@@ -145,7 +152,7 @@ rather than fail loudly.
 
 ## Not yet implemented
 
-- Latency/throughput-based routing (price-based sort via `[[pricing]]` is
-  supported; there's no live latency/throughput telemetry to sort by)
+- Throughput-based routing (price- and latency-based sort are supported —
+  see `provider.sort` above; there's no tokens/sec telemetry to sort by yet)
 - Usage metering / billing
 - Multi-turn image or audio content
