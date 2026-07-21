@@ -437,3 +437,206 @@ impl Provider for GeminiProvider {
         Ok(Box::pin(stream))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rp_core::FunctionDef;
+
+    fn tool(name: &str, description: Option<&str>, parameters: Option<Value>) -> Tool {
+        Tool {
+            kind: "function".to_string(),
+            function: FunctionDef {
+                name: name.to_string(),
+                description: description.map(str::to_string),
+                parameters,
+            },
+        }
+    }
+
+    // --- to_wire_tools -----------------------------------------------------
+
+    #[test]
+    fn to_wire_tools_maps_name_description_and_parameters() {
+        let params = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let tools = vec![tool(
+            "get_weather",
+            Some("Look up the weather"),
+            Some(params.clone()),
+        )];
+        let wire = to_wire_tools(&tools);
+        assert_eq!(
+            wire,
+            json!([{
+                "functionDeclarations": [{
+                    "name": "get_weather",
+                    "description": "Look up the weather",
+                    "parameters": params,
+                }]
+            }])
+        );
+    }
+
+    #[test]
+    fn to_wire_tools_defaults_parameters_when_absent() {
+        let tools = vec![tool("no_args_tool", None, None)];
+        let wire = to_wire_tools(&tools);
+        assert_eq!(
+            wire[0]["functionDeclarations"][0]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn to_wire_tools_wraps_every_tool_in_a_single_function_declarations_entry() {
+        let tools = vec![tool("first", None, None), tool("second", None, None)];
+        let wire = to_wire_tools(&tools);
+        let declarations = wire[0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations[0]["name"], "first");
+        assert_eq!(declarations[1]["name"], "second");
+    }
+
+    // --- to_wire_tool_choice -------------------------------------------------
+
+    #[test]
+    fn to_wire_tool_choice_maps_auto() {
+        assert_eq!(
+            to_wire_tool_choice(&json!("auto")),
+            json!({"functionCallingConfig": {"mode": "AUTO"}})
+        );
+    }
+
+    #[test]
+    fn to_wire_tool_choice_maps_none() {
+        assert_eq!(
+            to_wire_tool_choice(&json!("none")),
+            json!({"functionCallingConfig": {"mode": "NONE"}})
+        );
+    }
+
+    #[test]
+    fn to_wire_tool_choice_maps_required_to_any() {
+        assert_eq!(
+            to_wire_tool_choice(&json!("required")),
+            json!({"functionCallingConfig": {"mode": "ANY"}})
+        );
+    }
+
+    #[test]
+    fn to_wire_tool_choice_maps_named_function_to_allowed_function_names() {
+        let choice = json!({"type": "function", "function": {"name": "get_weather"}});
+        assert_eq!(
+            to_wire_tool_choice(&choice),
+            json!({"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["get_weather"]}})
+        );
+    }
+
+    #[test]
+    fn to_wire_tool_choice_falls_back_to_auto_for_an_object_without_a_function_name() {
+        let choice = json!({"type": "function"});
+        assert_eq!(
+            to_wire_tool_choice(&choice),
+            json!({"functionCallingConfig": {"mode": "AUTO"}})
+        );
+    }
+
+    #[test]
+    fn to_wire_tool_choice_falls_back_to_auto_for_an_unrecognized_shape() {
+        assert_eq!(
+            to_wire_tool_choice(&json!(null)),
+            json!({"functionCallingConfig": {"mode": "AUTO"}})
+        );
+    }
+
+    // --- candidate_tool_calls / resolve_finish_reason / tool_call_deltas ------
+
+    fn candidate_with_function_call(name: &str, args: Value) -> WireCandidate {
+        WireCandidate {
+            content: WireContent {
+                parts: vec![WirePart {
+                    text: String::new(),
+                    function_call: Some(WireFunctionCall {
+                        name: name.to_string(),
+                        args,
+                    }),
+                }],
+            },
+            finish_reason: Some("STOP".to_string()),
+        }
+    }
+
+    fn candidate_with_text_only(text: &str, finish_reason: &str) -> WireCandidate {
+        WireCandidate {
+            content: WireContent {
+                parts: vec![WirePart {
+                    text: text.to_string(),
+                    function_call: None,
+                }],
+            },
+            finish_reason: Some(finish_reason.to_string()),
+        }
+    }
+
+    #[test]
+    fn candidate_tool_calls_extracts_function_call_parts_and_ignores_text_parts() {
+        let candidate = candidate_with_function_call("get_weather", json!({"city": "Boston"}));
+        let calls = candidate_tool_calls(&candidate);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"city": "Boston"}));
+    }
+
+    #[test]
+    fn candidate_tool_calls_is_empty_for_a_text_only_candidate() {
+        let candidate = candidate_with_text_only("hello", "STOP");
+        assert!(candidate_tool_calls(&candidate).is_empty());
+    }
+
+    #[test]
+    fn resolve_finish_reason_overrides_stop_to_tool_calls_when_a_tool_call_is_present() {
+        let candidate = candidate_with_function_call("get_weather", json!({}));
+        let tool_calls = candidate_tool_calls(&candidate);
+        assert_eq!(
+            resolve_finish_reason(&candidate, &tool_calls),
+            Some("tool_calls".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_finish_reason_falls_back_to_the_raw_reason_without_tool_calls() {
+        let candidate = candidate_with_text_only("hello", "MAX_TOKENS");
+        assert_eq!(
+            resolve_finish_reason(&candidate, &[]),
+            Some("length".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_call_deltas_is_none_for_an_empty_slice() {
+        assert!(tool_call_deltas(&[]).is_none());
+    }
+
+    #[test]
+    fn tool_call_deltas_carries_the_full_call_in_one_delta_per_index() {
+        let calls = vec![
+            ToolCall::function("call_1", "get_weather", "{\"city\":\"Boston\"}"),
+            ToolCall::function("call_2", "get_time", "{}"),
+        ];
+        let deltas = tool_call_deltas(&calls).unwrap();
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].index, 0);
+        assert_eq!(deltas[0].id.as_deref(), Some("call_1"));
+        assert_eq!(
+            deltas[0].function.as_ref().unwrap().name.as_deref(),
+            Some("get_weather")
+        );
+        assert_eq!(
+            deltas[0].function.as_ref().unwrap().arguments.as_deref(),
+            Some("{\"city\":\"Boston\"}")
+        );
+        assert_eq!(deltas[1].index, 1);
+        assert_eq!(deltas[1].id.as_deref(), Some("call_2"));
+    }
+}

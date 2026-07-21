@@ -168,6 +168,46 @@ async fn chat_maps_tool_call_request_into_tool_use_and_tool_result_blocks() {
 }
 
 #[tokio::test]
+async fn chat_sends_tools_and_tool_choice_translated_to_wire_format() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get the current weather for a city",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                }
+            }],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_01abc",
+                "name": "get_weather",
+                "input": {"city": "Boston"}
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 20, "output_tokens": 8}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_tool("claude-sonnet-5");
+    req.tool_choice = Some(json!({"type": "function", "function": {"name": "get_weather"}}));
+
+    provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
 async fn chat_stream_parses_text_deltas_and_final_usage() {
     let server = MockServer::start().await;
     let sse_body = concat!(

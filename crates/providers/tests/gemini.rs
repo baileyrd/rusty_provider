@@ -81,6 +81,102 @@ async fn chat_parses_function_call_and_overrides_finish_reason() {
 }
 
 #[tokio::test]
+async fn chat_sends_tools_and_tool_choice_translated_to_function_declarations() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "get_weather",
+                    "description": "Get the current weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    }
+                }]
+            }],
+            "toolConfig": {
+                "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["get_weather"]}
+            },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Boston"}}}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 8, "totalTokenCount": 28}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_tool("gemini-2.0-flash");
+    req.tool_choice = Some(json!({"type": "function", "function": {"name": "get_weather"}}));
+
+    provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_stream_parses_function_call_delta() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Boston\"}}}]},\"finishReason\":\"STOP\"}],",
+        "\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":6,\"totalTokenCount\":18}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_tool("gemini-2.0-flash");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse"));
+    }
+
+    assert_eq!(chunks.len(), 1);
+    // Unlike Anthropic's index-based fragments, Gemini emits the whole call
+    // -- name and complete arguments -- in a single delta.
+    let tool_calls = chunks[0].choices[0].delta.tool_calls.as_ref().unwrap();
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(
+        tool_calls[0].function.as_ref().unwrap().name.as_deref(),
+        Some("get_weather")
+    );
+    let args: serde_json::Value = serde_json::from_str(
+        tool_calls[0]
+            .function
+            .as_ref()
+            .unwrap()
+            .arguments
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(args["city"], "Boston");
+    assert_eq!(
+        chunks[0].choices[0].finish_reason.as_deref(),
+        Some("tool_calls")
+    );
+}
+
+#[tokio::test]
 async fn chat_tracks_call_id_to_function_name_across_turns_for_tool_result() {
     let server = MockServer::start().await;
     // The Role::Tool message only carries a call id (OpenAI-shaped, like
