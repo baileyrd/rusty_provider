@@ -11,8 +11,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, FunctionCallDelta, Provider, ProviderError, Role, Tool, ToolCall, ToolCallDelta,
-    Usage,
+    ChunkChoice, ContentPart, FunctionCallDelta, MessageContent, Provider, ProviderError, Role,
+    Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -91,7 +91,7 @@ fn build_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<WireMessage>
         match m.role {
             Role::System => {
                 if let Some(c) = &m.content {
-                    system_parts.push(c.clone());
+                    system_parts.push(c.as_plain_text());
                 }
             }
             Role::Tool => {
@@ -100,21 +100,25 @@ fn build_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<WireMessage>
                     content: vec![json!({
                         "type": "tool_result",
                         "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
-                        "content": m.content.clone().unwrap_or_default(),
+                        "content": m.content.as_ref().map(MessageContent::as_plain_text).unwrap_or_default(),
                     })],
                 });
             }
             Role::User => {
+                let content = m
+                    .content
+                    .as_ref()
+                    .map(content_to_blocks)
+                    .unwrap_or_else(|| vec![json!({"type": "text", "text": ""})]);
                 turns.push(WireMessage {
                     role: "user",
-                    content: vec![
-                        json!({"type": "text", "text": m.content.clone().unwrap_or_default()}),
-                    ],
+                    content,
                 });
             }
             Role::Assistant => {
                 let mut blocks = Vec::new();
-                if let Some(text) = &m.content {
+                if let Some(content) = &m.content {
+                    let text = content.as_plain_text();
                     if !text.is_empty() {
                         blocks.push(json!({"type": "text", "text": text}));
                     }
@@ -146,6 +150,45 @@ fn build_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<WireMessage>
         Some(system_parts.join("\n\n"))
     };
     (system, turns)
+}
+
+/// Translates a message's content into Anthropic content blocks, turning
+/// `image_url` parts into `image` blocks: a `data:<mime>;base64,<data>`
+/// URI becomes a `base64` source, anything else (an `https://` URL) an
+/// `url` source.
+fn content_to_blocks(content: &MessageContent) -> Vec<Value> {
+    match content {
+        MessageContent::Text(text) => vec![json!({"type": "text", "text": text})],
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => json!({"type": "text", "text": text}),
+                ContentPart::ImageUrl { image_url } => image_block(&image_url.url),
+            })
+            .collect(),
+    }
+}
+
+fn image_block(url: &str) -> Value {
+    match parse_data_uri(url) {
+        Some((media_type, data)) => json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data},
+        }),
+        None => json!({
+            "type": "image",
+            "source": {"type": "url", "url": url},
+        }),
+    }
+}
+
+/// Parses a `data:<mime>;base64,<data>` URI into its `(mime, data)` parts.
+/// Returns `None` for anything else (e.g. a plain `https://` URL).
+fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    Some((media_type, data))
 }
 
 fn to_wire_tools(tools: &[Tool]) -> Vec<WireTool<'_>> {
@@ -285,7 +328,11 @@ impl Provider for AnthropicProvider {
                 index: 0,
                 message: ChatMessage {
                     role: Role::Assistant,
-                    content: if text.is_empty() { None } else { Some(text) },
+                    content: if text.is_empty() {
+                        None
+                    } else {
+                        Some(MessageContent::Text(text))
+                    },
                     name: None,
                     tool_calls: if tool_calls.is_empty() {
                         None
@@ -604,5 +651,134 @@ mod tests {
         assert_eq!(map_stop_reason("stop_sequence"), "stop");
         assert_eq!(map_stop_reason("max_tokens"), "length");
         assert_eq!(map_stop_reason("unknown_future_reason"), "stop");
+    }
+
+    // --- parse_data_uri --------------------------------------------------------
+
+    #[test]
+    fn parse_data_uri_extracts_media_type_and_data() {
+        assert_eq!(
+            parse_data_uri("data:image/png;base64,aGVsbG8="),
+            Some(("image/png", "aGVsbG8="))
+        );
+    }
+
+    #[test]
+    fn parse_data_uri_rejects_a_plain_url() {
+        assert_eq!(parse_data_uri("https://example.com/a.png"), None);
+    }
+
+    #[test]
+    fn parse_data_uri_rejects_a_non_base64_data_uri() {
+        assert_eq!(parse_data_uri("data:text/plain,hello"), None);
+    }
+
+    // --- image_block -----------------------------------------------------------
+
+    #[test]
+    fn image_block_uses_base64_source_for_a_data_uri() {
+        assert_eq!(
+            image_block("data:image/jpeg;base64,aGVsbG8="),
+            json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": "aGVsbG8="},
+            })
+        );
+    }
+
+    #[test]
+    fn image_block_uses_url_source_for_an_https_url() {
+        assert_eq!(
+            image_block("https://example.com/a.png"),
+            json!({
+                "type": "image",
+                "source": {"type": "url", "url": "https://example.com/a.png"},
+            })
+        );
+    }
+
+    // --- content_to_blocks -------------------------------------------------------
+
+    #[test]
+    fn content_to_blocks_wraps_plain_text_as_a_single_text_block() {
+        let content = MessageContent::text("hi");
+        assert_eq!(
+            content_to_blocks(&content),
+            vec![json!({"type": "text", "text": "hi"})]
+        );
+    }
+
+    #[test]
+    fn content_to_blocks_translates_mixed_text_and_image_parts() {
+        let content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "what's in this image?".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: rp_core::ImageUrl {
+                    url: "data:image/png;base64,aGVsbG8=".to_string(),
+                    detail: None,
+                },
+            },
+        ]);
+        assert_eq!(
+            content_to_blocks(&content),
+            vec![
+                json!({"type": "text", "text": "what's in this image?"}),
+                json!({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+                }),
+            ]
+        );
+    }
+
+    // --- build_messages: image content -------------------------------------------
+
+    #[test]
+    fn build_messages_translates_a_user_image_content_part() {
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: rp_core::ImageUrl {
+                    url: "https://example.com/a.png".to_string(),
+                    detail: None,
+                },
+            }])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let (_, turns) = build_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].content,
+            vec![json!({
+                "type": "image",
+                "source": {"type": "url", "url": "https://example.com/a.png"},
+            })]
+        );
+    }
+
+    #[test]
+    fn build_messages_collapses_assistant_and_system_image_parts_to_plain_text() {
+        let messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: Some(MessageContent::Parts(vec![ContentPart::Text {
+                    text: "be concise".to_string(),
+                }])),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage::assistant("ok"),
+        ];
+        let (system, turns) = build_messages(&messages);
+        assert_eq!(system, Some("be concise".to_string()));
+        assert_eq!(
+            turns[0].content,
+            vec![json!({"type": "text", "text": "ok"})]
+        );
     }
 }

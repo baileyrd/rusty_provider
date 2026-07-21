@@ -16,7 +16,7 @@ pub enum Role {
 pub struct ChatMessage {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Set on assistant messages that invoke one or more tools.
@@ -32,7 +32,7 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
-            content: Some(content.into()),
+            content: Some(MessageContent::text(content)),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -42,7 +42,7 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: Some(content.into()),
+            content: Some(MessageContent::text(content)),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -52,12 +52,72 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: Some(content.into()),
+            content: Some(MessageContent::text(content)),
             name: None,
             tool_calls: None,
             tool_call_id: None,
         }
     }
+}
+
+/// A chat message's `content`, matching the OpenAI wire shape where it may
+/// be either a plain string or an array of typed parts (for multimodal
+/// messages). `#[serde(untagged)]` makes both forms transparently
+/// interchangeable on the wire: a plain JSON string deserializes as
+/// `Text`, a JSON array as `Parts`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    pub fn text(content: impl Into<String>) -> Self {
+        Self::Text(content.into())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(s) => s.is_empty(),
+            Self::Parts(parts) => parts.is_empty(),
+        }
+    }
+
+    /// Collapses this content down to its plain text, discarding any image
+    /// parts. Used by adapters/roles that only understand text (e.g. tool
+    /// results, or providers translating non-user roles).
+    pub fn as_plain_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+}
+
+/// One part of a multimodal message's content array, in the OpenAI
+/// `content: [{"type": "text", ...}, {"type": "image_url", ...}]` shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageUrl {
+    /// Either a `data:<mime>;base64,<data>` URI or an `https://` URL,
+    /// per the OpenAI convention.
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// A tool the model may call, in the OpenAI function-calling shape.
@@ -288,4 +348,139 @@ fn chat_completion_chunk_object() -> &'static str {
 
 fn model_object() -> &'static str {
     "model"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- MessageContent (de)serialization ---------------------------------
+
+    #[test]
+    fn message_content_deserializes_a_plain_string_as_text() {
+        let content: MessageContent = serde_json::from_str(r#""hello""#).unwrap();
+        assert_eq!(content, MessageContent::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn message_content_deserializes_an_array_as_parts() {
+        let content: MessageContent = serde_json::from_str(
+            r#"[{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            content,
+            MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "hi".to_string()
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/a.png".to_string(),
+                        detail: None,
+                    }
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn message_content_text_serializes_as_a_plain_string() {
+        let json = serde_json::to_value(MessageContent::text("hi")).unwrap();
+        assert_eq!(json, serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn message_content_parts_serializes_as_an_array() {
+        let content = MessageContent::Parts(vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/a.png".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]);
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/a.png", "detail": "high"}
+            }])
+        );
+    }
+
+    #[test]
+    fn message_content_round_trips_through_a_chat_message() {
+        let msg = ChatMessage {
+            role: Role::User,
+            content: Some(MessageContent::Parts(vec![ContentPart::Text {
+                text: "describe this".to_string(),
+            }])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let round_tripped: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.content, msg.content);
+    }
+
+    // --- MessageContent helpers ---------------------------------------------
+
+    #[test]
+    fn text_is_empty_reflects_the_string() {
+        assert!(MessageContent::text("").is_empty());
+        assert!(!MessageContent::text("hi").is_empty());
+    }
+
+    #[test]
+    fn parts_is_empty_reflects_the_vec() {
+        assert!(MessageContent::Parts(vec![]).is_empty());
+        assert!(!MessageContent::Parts(vec![ContentPart::Text {
+            text: "hi".to_string()
+        }])
+        .is_empty());
+    }
+
+    #[test]
+    fn as_plain_text_returns_the_string_for_text_content() {
+        assert_eq!(MessageContent::text("hello").as_plain_text(), "hello");
+    }
+
+    #[test]
+    fn as_plain_text_concatenates_text_parts_and_drops_images() {
+        let content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "look at this: ".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/a.png".to_string(),
+                    detail: None,
+                },
+            },
+            ContentPart::Text {
+                text: "neat, right?".to_string(),
+            },
+        ]);
+        assert_eq!(content.as_plain_text(), "look at this: neat, right?");
+    }
+
+    #[test]
+    fn as_plain_text_is_empty_when_parts_has_no_text() {
+        let content = MessageContent::Parts(vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/a.png".to_string(),
+                detail: None,
+            },
+        }]);
+        assert_eq!(content.as_plain_text(), "");
+    }
+
+    // --- constructors wrap in MessageContent::Text ---------------------------
+
+    #[test]
+    fn user_constructor_wraps_content_as_text() {
+        let msg = ChatMessage::user("hi");
+        assert_eq!(msg.content, Some(MessageContent::text("hi")));
+    }
 }

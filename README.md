@@ -73,6 +73,37 @@ them into each provider's own tool-use convention (Anthropic's `tool_use`/
 parts) and translates `tool_calls` back into the OpenAI shape in the
 response — both streamed and non-streamed.
 
+A message's `content` can be either a plain string or an array of typed
+parts, matching OpenAI's multimodal shape, so a user turn can attach one
+or more images alongside text:
+
+```jsonc
+{
+  "model": "smart",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "What's in this image?"},
+      {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}}
+      // or a base64-encoded image inline:
+      // {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KG..."}}
+    ]
+  }]
+}
+```
+
+The router translates `image_url` parts into each provider's own image
+format (Anthropic's `image` content block, Gemini's `inlineData`/
+`fileData` parts) for `Role::User` messages. A `data:<mime>;base64,<data>`
+URI is passed through as inline base64; a plain `https://` URL is passed
+through as a remote reference (Gemini additionally needs a MIME type for
+this case, which is guessed from the URL's extension, defaulting to
+`image/jpeg`). System, assistant, and tool messages only ever send their
+plain text to a provider — image parts in a non-user role are silently
+dropped rather than translated, since none of the three providers accept
+images there. Audio content isn't supported yet (see "Not yet
+implemented" below).
+
 If `[[pricing]]` has an entry for the model that actually served the
 request, the response (and, for streaming, whichever chunk carries the
 final `usage`) includes an extra `cost_usd` field — the request's
@@ -318,4 +349,5 @@ rather than fail loudly.
 - Multi-host/distributed usage aggregation (persistence is a single
   SQLite file shared by processes on one host or a shared volume, not a
   networked database multiple machines can write to)
-- Multi-turn image or audio content
+- Audio content (image content in messages is supported, see `POST
+  /v1/chat/completions` above)

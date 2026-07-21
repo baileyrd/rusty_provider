@@ -1,4 +1,4 @@
-use rp_core::{ChatMessage, ChatRequest, Tool};
+use rp_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent, Role, Tool};
 
 /// A minimal single-user-turn request, for tests that don't care about the
 /// rest of the request shape.
@@ -16,6 +16,31 @@ pub fn simple_request(model: &str) -> ChatRequest {
         tool_choice: None,
         provider: None,
     }
+}
+
+/// Same as [`simple_request`], but the user turn's content is a
+/// multimodal parts array (text + a `data:` image), for tests exercising
+/// image content translation.
+pub fn request_with_image(model: &str) -> ChatRequest {
+    let mut req = simple_request(model);
+    req.messages = vec![ChatMessage {
+        role: Role::User,
+        content: Some(MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "what's in this image?".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,aGVsbG8=".to_string(),
+                    detail: None,
+                },
+            },
+        ])),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+    req
 }
 
 /// Same as [`simple_request`], but with a tool attached, for tests
