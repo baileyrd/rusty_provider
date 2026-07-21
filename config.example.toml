@@ -56,6 +56,11 @@ api_key_env = "OPENAI_API_KEY"
 # zdr = true
 # no_training = true
 # requests_per_minute = 500
+# Total per-request timeout in seconds (connect + send + read the full
+# response, including a streamed one). Defaults to 300 -- generous enough
+# for a slow completion or a long-running stream, but still bounds a
+# connection that hangs forever.
+# timeout_secs = 300
 
 [providers.anthropic]
 kind = "anthropic"
@@ -252,6 +257,7 @@ completion_per_million = 0.79
 # [webhook]
 # url = "https://hooks.example.com/rusty-provider"
 # auth_header_env = "WEBHOOK_AUTH_HEADER"  # e.g. set to "Bearer <token>"
+# timeout_secs = 10  # optional, this is the default
 
 # --- Guardrails (optional) ------------------------------------------------------
 # Regex-based content guardrails, checked against every request's message text
@@ -290,6 +296,7 @@ completion_per_million = 0.79
 # api_key_env = "OPENAI_API_KEY"  # can reuse [providers.openai]'s key
 # base_url = "https://api.openai.com/v1"  # optional, this is the default
 # model = "omni-moderation-latest"        # optional, this is the default
+# timeout_secs = 10                       # optional, this is the default
 
 # --- Web search (optional) --------------------------------------------------------
 # A request setting `"web_search": true` triggers a live search (via Brave
@@ -308,6 +315,7 @@ completion_per_million = 0.79
 # api_key_env = "BRAVE_SEARCH_API_KEY"
 # base_url = "https://api.search.brave.com/res/v1/web/search"  # optional, this is the default
 # max_results = 5                                                # optional, this is the default
+# timeout_secs = 10                                              # optional, this is the default
 
 # --- Presets (optional) ----------------------------------------------------------
 # A named, reusable bundle of request defaults, referenced from a request via

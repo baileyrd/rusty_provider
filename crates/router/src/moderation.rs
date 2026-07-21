@@ -7,6 +7,7 @@
 //! patterns for.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use rp_core::{ChatRequest, ContentPart, MessageContent};
 use serde::Deserialize;
@@ -46,7 +47,10 @@ struct ModerationResult {
 impl ModerationClient {
     pub(crate) fn new(config: &ModerationConfig, api_key: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(config.timeout_secs))
+                .build()
+                .expect("reqwest client should build with a timeout configured"),
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_key,
             model: config.model.clone(),
@@ -140,6 +144,7 @@ mod tests {
             api_key_env: "UNUSED".to_string(),
             base_url: base_url.to_string(),
             model: "omni-moderation-latest".to_string(),
+            timeout_secs: 5,
         }
     }
 
@@ -261,6 +266,28 @@ mod tests {
         // Port 0 never accepts connections -- proves a network-level
         // failure (not just a non-2xx) also maps to RequestFailed.
         let client = ModerationClient::new(&config("http://127.0.0.1:0"), "test-key".to_string());
+        let err = client.check(&request_with_text("hello")).await.unwrap_err();
+        assert!(matches!(err, ModerationError::RequestFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn check_fails_with_requestfailed_when_the_backend_outlasts_timeout_secs() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/moderations"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(1200))
+                    .set_body_json(
+                        serde_json::json!({"results": [{"flagged": false, "categories": {}}]}),
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = config(&server.uri());
+        cfg.timeout_secs = 1;
+        let client = ModerationClient::new(&cfg, "test-key".to_string());
         let err = client.check(&request_with_text("hello")).await.unwrap_err();
         assert!(matches!(err, ModerationError::RequestFailed(_)));
     }

@@ -62,6 +62,10 @@ pub enum ProviderKind {
     Gemini,
 }
 
+fn default_provider_timeout_secs() -> u64 {
+    300
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
@@ -69,6 +73,14 @@ pub struct ProviderConfig {
     /// Name of the environment variable holding the API key for this
     /// provider (not the key itself — keeps secrets out of the config file).
     pub api_key_env: String,
+    /// Total per-request timeout (connect + send + read the full response,
+    /// including a streamed one), in seconds. Generous by default -- a
+    /// slow non-streaming completion or a long-running stream can
+    /// legitimately take minutes, so this only needs to bound a
+    /// connection that hangs forever rather than shave time off normal
+    /// slow responses.
+    #[serde(default = "default_provider_timeout_secs")]
+    pub timeout_secs: u64,
     /// Whether the operator has a Zero Data Retention agreement with this
     /// provider. Self-declared — the router trusts this flag and never
     /// verifies it against the provider itself. Only consulted for
@@ -420,6 +432,10 @@ pub enum GuardrailAction {
 /// push notification on top of the `402` a client already sees on its next
 /// request and the `client_budget_rejections_total` Prometheus counter, so
 /// an operator can wire up alerting without polling either.
+fn default_auxiliary_timeout_secs() -> u64 {
+    10
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct WebhookConfig {
     /// URL this router POSTs a JSON event payload to.
@@ -430,6 +446,12 @@ pub struct WebhookConfig {
     /// Unset means no `Authorization` header is sent.
     #[serde(default)]
     pub auth_header_env: Option<String>,
+    /// Total per-request timeout, in seconds. Short by default -- this is
+    /// a small fire-and-forget JSON POST, not a long-running completion,
+    /// and delivery failure is only ever logged (see `WebhookNotifier`),
+    /// never surfaced to the client that triggered the event.
+    #[serde(default = "default_auxiliary_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 fn default_moderation_base_url() -> String {
@@ -459,6 +481,12 @@ pub struct ModerationConfig {
     pub base_url: String,
     #[serde(default = "default_moderation_model")]
     pub model: String,
+    /// Total per-request timeout, in seconds. Short by default -- this is
+    /// a single small classification call, and an unreachable/slow
+    /// backend fails open (see `Router::apply_moderation`) rather than
+    /// blocking the request, so there's no reason to wait long for it.
+    #[serde(default = "default_auxiliary_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 fn default_web_search_base_url() -> String {
@@ -483,6 +511,12 @@ pub struct WebSearchConfig {
     pub base_url: String,
     #[serde(default = "default_web_search_max_results")]
     pub max_results: u32,
+    /// Total per-request timeout, in seconds. Short by default -- this is
+    /// a single small search call, and an unreachable/slow backend fails
+    /// open (see `Router::apply_web_search`) rather than blocking the
+    /// request, so there's no reason to wait long for it.
+    #[serde(default = "default_auxiliary_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 impl Config {
@@ -651,6 +685,35 @@ mod tests {
         assert!(provider.zdr);
         assert!(provider.no_training);
         assert_eq!(provider.requests_per_minute, Some(500));
+    }
+
+    #[test]
+    fn provider_config_timeout_secs_defaults_to_300_when_absent() {
+        let config = Config::from_toml_str(
+            r#"
+            [providers.a]
+            kind = "openai"
+            base_url = "https://a"
+            api_key_env = "A"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.providers["a"].timeout_secs, 300);
+    }
+
+    #[test]
+    fn provider_config_timeout_secs_is_honored_when_set() {
+        let config = Config::from_toml_str(
+            r#"
+            [providers.a]
+            kind = "openai"
+            base_url = "https://a"
+            api_key_env = "A"
+            timeout_secs = 30
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.providers["a"].timeout_secs, 30);
     }
 
     // --- routes/pricing/clients default to empty --------------------------------
@@ -1106,6 +1169,43 @@ mod tests {
         assert_eq!(auto_routing.medium_max_score, 300);
     }
 
+    // --- webhook ---------------------------------------------------------------------
+
+    #[test]
+    fn webhook_defaults_to_absent() {
+        let config = Config::from_toml_str("providers = {}").unwrap();
+        assert!(config.webhook.is_none());
+    }
+
+    #[test]
+    fn webhook_timeout_secs_defaults_to_10() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [webhook]
+            url = "http://localhost:9999/events"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.webhook.unwrap().timeout_secs, 10);
+    }
+
+    #[test]
+    fn webhook_timeout_secs_is_honored_when_set() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [webhook]
+            url = "http://localhost:9999/events"
+            timeout_secs = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.webhook.unwrap().timeout_secs, 3);
+    }
+
     // --- moderation ----------------------------------------------------------------
 
     #[test]
@@ -1129,6 +1229,7 @@ mod tests {
         assert_eq!(moderation.api_key_env, "OPENAI_API_KEY");
         assert_eq!(moderation.base_url, "https://api.openai.com/v1");
         assert_eq!(moderation.model, "omni-moderation-latest");
+        assert_eq!(moderation.timeout_secs, 10);
     }
 
     #[test]
@@ -1141,12 +1242,14 @@ mod tests {
             api_key_env = "OPENAI_API_KEY"
             base_url = "http://localhost:9999/v1"
             model = "text-moderation-stable"
+            timeout_secs = 3
             "#,
         )
         .unwrap();
         let moderation = config.moderation.unwrap();
         assert_eq!(moderation.base_url, "http://localhost:9999/v1");
         assert_eq!(moderation.model, "text-moderation-stable");
+        assert_eq!(moderation.timeout_secs, 3);
     }
 
     // --- web_search ------------------------------------------------------------
@@ -1175,6 +1278,7 @@ mod tests {
             "https://api.search.brave.com/res/v1/web/search"
         );
         assert_eq!(web_search.max_results, 5);
+        assert_eq!(web_search.timeout_secs, 10);
     }
 
     #[test]
@@ -1187,12 +1291,14 @@ mod tests {
             api_key_env = "BRAVE_SEARCH_API_KEY"
             base_url = "http://localhost:9999/search"
             max_results = 3
+            timeout_secs = 3
             "#,
         )
         .unwrap();
         let web_search = config.web_search.unwrap();
         assert_eq!(web_search.base_url, "http://localhost:9999/search");
         assert_eq!(web_search.max_results, 3);
+        assert_eq!(web_search.timeout_secs, 3);
     }
 
     // --- persistence backend -----------------------------------------------------

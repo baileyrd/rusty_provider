@@ -551,16 +551,18 @@ impl Router {
                 }
             };
 
+            let timeout = std::time::Duration::from_secs(cfg.timeout_secs);
             let provider: Arc<dyn Provider> = match cfg.kind {
-                ProviderKind::Openai => Arc::new(OpenAiCompatibleProvider::new(
-                    name.clone(),
-                    cfg.base_url.clone(),
-                    key,
-                )),
-                ProviderKind::Anthropic => {
-                    Arc::new(AnthropicProvider::new(cfg.base_url.clone(), key))
+                ProviderKind::Openai => Arc::new(
+                    OpenAiCompatibleProvider::new(name.clone(), cfg.base_url.clone(), key)
+                        .with_timeout(timeout),
+                ),
+                ProviderKind::Anthropic => Arc::new(
+                    AnthropicProvider::new(cfg.base_url.clone(), key).with_timeout(timeout),
+                ),
+                ProviderKind::Gemini => {
+                    Arc::new(GeminiProvider::new(cfg.base_url.clone(), key).with_timeout(timeout))
                 }
-                ProviderKind::Gemini => Arc::new(GeminiProvider::new(cfg.base_url.clone(), key)),
             };
             metrics.set_provider_configured(name, true);
             providers.insert(name.clone(), provider);
@@ -643,7 +645,11 @@ impl Router {
                     }
                 }
             });
-            Arc::new(WebhookNotifier::new(cfg.url.clone(), auth_header))
+            Arc::new(WebhookNotifier::new(
+                cfg.url.clone(),
+                auth_header,
+                cfg.timeout_secs,
+            ))
         });
 
         // A guardrail with an invalid regex is a soft failure -- skipped
@@ -2142,7 +2148,7 @@ mod tests {
     ) -> Router {
         let router = router_with_budgeted_client(budget_usd, BudgetPeriod::Total);
         Router {
-            webhook: Some(Arc::new(WebhookNotifier::new(webhook_url, auth_header))),
+            webhook: Some(Arc::new(WebhookNotifier::new(webhook_url, auth_header, 5))),
             ..router
         }
     }
@@ -2267,7 +2273,7 @@ mod tests {
 
         let router = test_router(vec![], vec![], vec![], vec![], vec![]);
         let router = Router {
-            webhook: Some(Arc::new(WebhookNotifier::new(server.uri(), None))),
+            webhook: Some(Arc::new(WebhookNotifier::new(server.uri(), None, 5))),
             ..router
         };
         assert!(!router.reset_client_spend("acme"));
@@ -2605,6 +2611,7 @@ mod tests {
             api_key_env: "UNUSED".to_string(),
             base_url: base_url.to_string(),
             model: "omni-moderation-latest".to_string(),
+            timeout_secs: 5,
         }
     }
 
@@ -2670,6 +2677,7 @@ mod tests {
             api_key_env: "UNUSED".to_string(),
             base_url: base_url.to_string(),
             max_results: 5,
+            timeout_secs: 5,
         }
     }
 
