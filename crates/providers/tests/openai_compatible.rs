@@ -133,9 +133,70 @@ async fn chat_stream_parses_delta_chunks_and_stops_at_done() {
 
     // The [DONE] sentinel ends the stream and isn't yielded as a chunk.
     assert_eq!(chunks.len(), 3);
+    assert!(matches!(
+        chunks[0].choices[0].delta.role,
+        Some(rp_core::Role::Assistant)
+    ));
     assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("Hi"));
     assert_eq!(chunks[2].choices[0].finish_reason.as_deref(), Some("stop"));
     assert_eq!(chunks[2].usage.as_ref().unwrap().completion_tokens, 2);
+}
+
+#[tokio::test]
+async fn chat_stream_yields_a_decode_error_for_malformed_event_json() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {not valid json\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let mut req = common::simple_request("gpt-4o-mini");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "gpt-4o-mini")
+        .await
+        .expect("chat_stream should succeed");
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+    }
+
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_ok());
+    match &items[1] {
+        Err(ProviderError::Decode(_)) => {}
+        other => panic!("expected a Decode error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn chat_stream_yields_no_chunks_for_an_immediately_done_stream() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let mut req = common::simple_request("gpt-4o-mini");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "gpt-4o-mini")
+        .await
+        .expect("chat_stream should succeed");
+    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]

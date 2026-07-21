@@ -265,6 +265,103 @@ async fn chat_stream_parses_text_parts() {
     );
     assert_eq!(chunks[1].choices[0].finish_reason.as_deref(), Some("stop"));
     assert_eq!(chunks[1].usage.as_ref().unwrap().completion_tokens, 2);
+    // No usageMetadata on the first event -- it defaults to all-zero counts,
+    // which the adapter treats as "no usage" rather than a real zero-token
+    // observation.
+    assert!(chunks[0].usage.is_none());
+}
+
+#[tokio::test]
+async fn chat_stream_handles_a_candidate_with_no_parts_gracefully() {
+    let server = MockServer::start().await;
+    // No "candidates" key at all -- the adapter must not panic when there's
+    // nothing to translate for an event.
+    let sse_body = "data: {\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":0,\"totalTokenCount\":1}}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("gemini-2.0-flash");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse without a candidate"));
+    }
+
+    assert_eq!(chunks.len(), 1);
+    assert!(chunks[0].choices[0].delta.content.is_none());
+    assert!(chunks[0].choices[0].delta.tool_calls.is_none());
+    assert!(chunks[0].choices[0].finish_reason.is_none());
+}
+
+#[tokio::test]
+async fn chat_stream_yields_a_decode_error_for_malformed_event_json() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        "data: {not valid json\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("gemini-2.0-flash");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat_stream should succeed");
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+    }
+
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_ok());
+    match &items[1] {
+        Err(ProviderError::Decode(_)) => {}
+        other => panic!("expected a Decode error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn chat_stream_yields_no_chunks_for_an_empty_stream() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("", "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("gemini-2.0-flash");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat_stream should succeed");
+    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]
