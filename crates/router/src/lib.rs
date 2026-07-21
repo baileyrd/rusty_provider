@@ -1425,6 +1425,67 @@ mod tests {
         assert_eq!(ewma_lookup(&map, "openai", "m2", -1.0), 900.0);
     }
 
+    // --- check_outbound_rate_limit ----------------------------------------------
+
+    #[test]
+    fn check_outbound_rate_limit_is_a_noop_for_a_provider_with_no_configured_limit() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        for _ in 0..10 {
+            assert!(router.check_outbound_rate_limit("anthropic").is_ok());
+        }
+    }
+
+    #[test]
+    fn check_outbound_rate_limit_allows_up_to_capacity_then_rejects() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![("anthropic", 2)]);
+        assert!(router.check_outbound_rate_limit("anthropic").is_ok());
+        assert!(router.check_outbound_rate_limit("anthropic").is_ok());
+
+        let err = router.check_outbound_rate_limit("anthropic").unwrap_err();
+        assert!(matches!(err, ProviderError::RateLimited { .. }));
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn check_outbound_rate_limit_rejection_reports_a_positive_retry_after() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![("anthropic", 1)]);
+        router.check_outbound_rate_limit("anthropic").unwrap();
+        let err = router.check_outbound_rate_limit("anthropic").unwrap_err();
+        match err {
+            ProviderError::RateLimited { retry_after_secs } => {
+                assert!(retry_after_secs.unwrap_or(0) > 0);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_outbound_rate_limit_zero_rpm_always_rejects() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![("anthropic", 0)]);
+        let err = router.check_outbound_rate_limit("anthropic").unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_secs: Some(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn check_outbound_rate_limit_buckets_are_independent_per_provider() {
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![("anthropic", 1), ("openai", 1)],
+        );
+        router.check_outbound_rate_limit("anthropic").unwrap();
+        assert!(router.check_outbound_rate_limit("anthropic").is_err());
+        // "openai" has its own bucket and is untouched by "anthropic"'s.
+        assert!(router.check_outbound_rate_limit("openai").is_ok());
+    }
+
     // --- dispatch ------------------------------------------------------------
 
     #[tokio::test]
@@ -1598,6 +1659,105 @@ mod tests {
         assert!(err.retry_after_secs().is_some());
         // The mock was only actually invoked once -- the second dispatch
         // was stopped by the outbound limiter before ever calling it.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_falls_back_to_next_provider_when_outbound_limit_is_exhausted() {
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let limited = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_a.clone(),
+        });
+        let unlimited = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_b.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", limited), ("openai", unlimited)],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            // A 0/min budget for "anthropic" means it is rejected on every
+            // attempt, forcing every dispatch to fall through to "openai".
+            vec![("anthropic", 0)],
+        );
+
+        let resp = router
+            .dispatch(&test_request("smart"))
+            .await
+            .expect("should fall through to the unlimited provider");
+
+        assert_eq!(resp.model, "openai/m2");
+        assert_eq!(
+            calls_a.load(Ordering::SeqCst),
+            0,
+            "the outbound-limited provider must never actually be called"
+        );
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_records_the_rate_limited_outcome_in_metrics() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", mock)],
+            vec![],
+            vec![],
+            vec![],
+            vec![("anthropic", 0)],
+        );
+
+        let _ = router.dispatch(&test_request("anthropic/m1")).await;
+
+        let metrics = router.render_prometheus_metrics();
+        assert!(metrics.contains("rusty_provider_dispatch_attempts_total"));
+        assert!(metrics.contains(r#"outcome="rate_limited""#));
+        assert!(metrics.contains(r#"provider="anthropic""#));
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_respects_outbound_rate_limit_and_reports_it_as_retryable() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", mock)],
+            vec![],
+            vec![],
+            vec![],
+            vec![("anthropic", 1)],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.stream = Some(true);
+
+        let _stream = router
+            .dispatch_stream(&req)
+            .await
+            .expect("first request is within the 1/min budget");
+        // ChatStream (the Ok side) isn't Debug, so unwrap_err() doesn't
+        // typecheck here -- match instead.
+        let err = match router.dispatch_stream(&req).await {
+            Ok(_) => panic!("expected the second call to be outbound rate limited"),
+            Err(e) => e,
+        };
+
+        assert!(matches!(
+            err,
+            RouterError::Provider(ProviderError::RateLimited { .. })
+        ));
+        assert!(err.retry_after_secs().is_some());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
