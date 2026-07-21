@@ -2,7 +2,7 @@ pub mod errors;
 pub mod routes;
 pub mod state;
 
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::Router as AxumRouter;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -19,7 +19,14 @@ pub fn build_app(state: AppState) -> AxumRouter {
         .route("/v1/usage", get(routes::usage_stats))
         .route("/metrics", get(routes::metrics))
         .route("/v1/chat/completions", post(routes::chat_completions))
-        .route("/v1/admin/clients", get(routes::admin_list_clients))
+        .route(
+            "/v1/admin/clients",
+            get(routes::admin_list_clients).post(routes::admin_create_client),
+        )
+        .route(
+            "/v1/admin/clients/:name",
+            patch(routes::admin_update_client).delete(routes::admin_delete_client),
+        )
         .route(
             "/v1/admin/clients/:name/reset-spend",
             post(routes::admin_reset_client_spend),

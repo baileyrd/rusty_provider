@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rp_core::RateLimiter;
 use rp_router::{Config, Router as ProviderRouter};
@@ -70,10 +70,10 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         router,
         api_key,
-        client_keys: Arc::new(client_keys),
+        client_keys: Arc::new(RwLock::new(client_keys)),
         default_rate_limit_rpm: config.server.default_rate_limit_rpm,
         rate_limiter: Arc::new(RateLimiter::new()),
-        clients: Arc::new(config.clients.clone()),
+        clients: Arc::new(RwLock::new(config.clients.clone())),
         admin_key,
     };
 

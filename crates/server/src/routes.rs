@@ -1,15 +1,15 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, State};
-use axum::http::HeaderMap;
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::{stream, StreamExt};
 use rp_core::{ChatRequest, ModelInfo};
-use rp_router::UsageStats;
-use serde::Serialize;
+use rp_router::{BudgetPeriod, ClientConfig, UsageStats};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::errors::{json_error, json_error_with_retry_after, router_error_response};
@@ -26,7 +26,8 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 /// configured `[[clients]]` key. Auth is skipped entirely if neither is
 /// configured.
 pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    if state.api_key.is_none() && state.client_keys.is_empty() {
+    let client_keys = state.client_keys.read().unwrap();
+    if state.api_key.is_none() && client_keys.is_empty() {
         return None;
     }
 
@@ -35,7 +36,7 @@ pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> {
     };
 
     let legacy_ok = state.api_key.as_deref() == Some(token);
-    let client_ok = state.client_keys.contains_key(token);
+    let client_ok = client_keys.contains_key(token);
 
     if legacy_ok || client_ok {
         None
@@ -79,7 +80,7 @@ fn resolve_rate_limit(
     addr: SocketAddr,
 ) -> Option<(String, u32)> {
     if let Some(token) = bearer_token(headers) {
-        if let Some((name, rpm)) = state.client_keys.get(token) {
+        if let Some((name, rpm)) = state.client_keys.read().unwrap().get(token) {
             return Some((format!("client:{name}"), *rpm));
         }
     }
@@ -103,9 +104,14 @@ fn rate_limited_response(state: &AppState, identity: &str, retry_after_secs: f64
 /// only the shared `server.api_key_env` token, or an unmatched caller —
 /// spend budgets only apply to named clients, never the IP-bucketed
 /// fallback.
-fn matched_client_name<'a>(state: &'a AppState, headers: &HeaderMap) -> Option<&'a str> {
+fn matched_client_name(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let token = bearer_token(headers)?;
-    state.client_keys.get(token).map(|(name, _)| name.as_str())
+    state
+        .client_keys
+        .read()
+        .unwrap()
+        .get(token)
+        .map(|(name, _)| name.clone())
 }
 
 fn budget_exceeded_response(
@@ -146,10 +152,10 @@ mod tests {
         AppState {
             router,
             api_key: None,
-            client_keys: Arc::new(client_keys),
+            client_keys: Arc::new(std::sync::RwLock::new(client_keys)),
             default_rate_limit_rpm,
             rate_limiter: Arc::new(RateLimiter::new()),
-            clients: Arc::new(vec![]),
+            clients: Arc::new(std::sync::RwLock::new(vec![])),
             admin_key: None,
         }
     }
@@ -293,7 +299,7 @@ mod tests {
         let state = test_state(vec![("secret-key", "acme", 30)], None).await;
         assert_eq!(
             matched_client_name(&state, &bearer_headers("secret-key")),
-            Some("acme")
+            Some("acme".to_string())
         );
     }
 
@@ -485,8 +491,12 @@ pub async fn admin_list_clients(State(state): State<AppState>, headers: HeaderMa
         return resp;
     }
 
-    let mut data = Vec::with_capacity(state.clients.len());
-    for client in state.clients.iter() {
+    // Clone out of the lock before the `.await` loop below -- a std
+    // `RwLockReadGuard` held across an await point would make this
+    // future non-`Send`, which axum handlers must be.
+    let clients = state.clients.read().unwrap().clone();
+    let mut data = Vec::with_capacity(clients.len());
+    for client in &clients {
         let status = state.router.client_spend_status(&client.name).await;
         data.push(AdminClientEntry {
             name: client.name.clone(),
@@ -503,7 +513,7 @@ pub async fn admin_list_clients(State(state): State<AppState>, headers: HeaderMa
 pub async fn admin_reset_client_spend(
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    Path(name): Path<String>,
 ) -> Response {
     if let Some(resp) = check_admin_auth(&state, &headers) {
         return resp;
@@ -517,6 +527,261 @@ pub async fn admin_reset_client_spend(
             &format!("no client named \"{name}\" with a configured budget"),
         )
     }
+}
+
+/// Random 64-character hex token (32 bytes of CSPRNG output via `ring`,
+/// already a transitive dependency through `rustls`) for a
+/// runtime-provisioned client's API key, prefixed for recognizability the
+/// same way GitHub/Stripe-style tokens are.
+fn generate_api_key() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("system RNG should not fail");
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("rp_{hex}")
+}
+
+#[derive(Deserialize)]
+pub struct CreateClientRequest {
+    name: String,
+    requests_per_minute: u32,
+    #[serde(default)]
+    budget_usd: Option<f64>,
+    #[serde(default)]
+    budget_period: BudgetPeriod,
+    /// Explicit API key value to assign. If omitted, the server generates
+    /// a random one and returns it in the response -- the only time it's
+    /// ever shown, the same hygiene as GitHub/Stripe-style API keys.
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ClientProvisionResponse {
+    name: String,
+    requests_per_minute: u32,
+    budget_usd: Option<f64>,
+    budget_period: BudgetPeriod,
+    /// Only present when this response is the one time the key is shown:
+    /// creation, or an update that rotated it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+}
+
+pub async fn admin_create_client(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = check_admin_auth(&state, &headers) {
+        return resp;
+    }
+    // Deserialized only after the auth check above -- unlike a `Json<T>`
+    // extractor parameter, which axum would run before the handler body
+    // (and thus before `check_admin_auth`) even executes, leaking a 415 on
+    // a malformed/missing body to an unauthenticated caller instead of the
+    // 401/404 they should see.
+    let req: CreateClientRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => return json_error(400, &format!("invalid request body: {e}")),
+    };
+    if req.name.is_empty() {
+        return json_error(400, "\"name\" must not be empty");
+    }
+    if req.requests_per_minute == 0 {
+        return json_error(400, "\"requests_per_minute\" must be greater than zero");
+    }
+    if req.budget_usd.is_some_and(|b| b < 0.0) {
+        return json_error(400, "\"budget_usd\" must not be negative");
+    }
+
+    {
+        let clients = state.clients.read().unwrap();
+        if clients.iter().any(|c| c.name == req.name) {
+            return json_error(
+                409,
+                &format!("a client named \"{}\" already exists", req.name),
+            );
+        }
+    }
+
+    let api_key = req.api_key.unwrap_or_else(generate_api_key);
+    {
+        let mut keys = state.client_keys.write().unwrap();
+        if keys.contains_key(&api_key) {
+            return json_error(409, "a client with this API key already exists");
+        }
+        keys.insert(api_key.clone(), (req.name.clone(), req.requests_per_minute));
+    }
+    state.clients.write().unwrap().push(ClientConfig {
+        name: req.name.clone(),
+        // Runtime-provisioned clients hold their key directly in
+        // `client_keys` rather than resolving one from an env var --
+        // there's no env var to name here.
+        api_key_env: String::new(),
+        requests_per_minute: req.requests_per_minute,
+        budget_usd: req.budget_usd,
+        budget_period: req.budget_period,
+    });
+    state.router.set_client_budget(
+        &req.name,
+        req.budget_usd
+            .map(|budget_usd| (budget_usd, req.budget_period)),
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(ClientProvisionResponse {
+            name: req.name,
+            requests_per_minute: req.requests_per_minute,
+            budget_usd: req.budget_usd,
+            budget_period: req.budget_period,
+            api_key: Some(api_key),
+        }),
+    )
+        .into_response()
+}
+
+/// Distinguishes "field omitted" (`None`, leave alone) from "field
+/// explicitly set to `null`" (`Some(None)`, clear it) for `budget_usd` --
+/// the standard serde workaround, since `#[serde(default)]` alone can't
+/// tell those two cases apart for a plain `Option<T>` field.
+fn deserialize_present_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize, Default)]
+pub struct UpdateClientRequest {
+    #[serde(default)]
+    requests_per_minute: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    budget_usd: Option<Option<f64>>,
+    #[serde(default)]
+    budget_period: Option<BudgetPeriod>,
+    /// If `true`, revokes the client's current API key (if any) and
+    /// issues a new one, returned in the response. Otherwise the existing
+    /// key (if any) keeps working unchanged.
+    #[serde(default)]
+    rotate_api_key: bool,
+}
+
+pub async fn admin_update_client(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = check_admin_auth(&state, &headers) {
+        return resp;
+    }
+    // See `admin_create_client` for why this is deserialized manually
+    // after the auth check, rather than via a `Json<T>` extractor
+    // parameter.
+    let req: UpdateClientRequest = if body.is_empty() {
+        UpdateClientRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(req) => req,
+            Err(e) => return json_error(400, &format!("invalid request body: {e}")),
+        }
+    };
+    if req.requests_per_minute == Some(0) {
+        return json_error(400, "\"requests_per_minute\" must be greater than zero");
+    }
+    if let Some(Some(budget_usd)) = req.budget_usd {
+        if budget_usd < 0.0 {
+            return json_error(400, "\"budget_usd\" must not be negative");
+        }
+    }
+
+    let updated = {
+        let mut clients = state.clients.write().unwrap();
+        let Some(client) = clients.iter_mut().find(|c| c.name == name) else {
+            return json_error(404, &format!("no client named \"{name}\""));
+        };
+        if let Some(rpm) = req.requests_per_minute {
+            client.requests_per_minute = rpm;
+        }
+        if let Some(budget_usd) = req.budget_usd {
+            client.budget_usd = budget_usd;
+        }
+        if let Some(period) = req.budget_period {
+            client.budget_period = period;
+        }
+        client.clone()
+    };
+
+    let mut new_api_key = None;
+    {
+        let mut keys = state.client_keys.write().unwrap();
+        let existing_key = keys
+            .iter()
+            .find(|(_, (n, _))| n == &name)
+            .map(|(k, _)| k.clone());
+        if req.rotate_api_key {
+            if let Some(old_key) = &existing_key {
+                keys.remove(old_key);
+            }
+            let key = generate_api_key();
+            keys.insert(key.clone(), (name.clone(), updated.requests_per_minute));
+            new_api_key = Some(key);
+        } else if let Some(old_key) = existing_key {
+            if let Some(entry) = keys.get_mut(&old_key) {
+                entry.1 = updated.requests_per_minute;
+            }
+        }
+    }
+
+    state.router.set_client_budget(
+        &name,
+        updated
+            .budget_usd
+            .map(|budget_usd| (budget_usd, updated.budget_period)),
+    );
+
+    Json(ClientProvisionResponse {
+        name: updated.name,
+        requests_per_minute: updated.requests_per_minute,
+        budget_usd: updated.budget_usd,
+        budget_period: updated.budget_period,
+        api_key: new_api_key,
+    })
+    .into_response()
+}
+
+pub async fn admin_delete_client(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(resp) = check_admin_auth(&state, &headers) {
+        return resp;
+    }
+
+    let removed = {
+        let mut clients = state.clients.write().unwrap();
+        let before = clients.len();
+        clients.retain(|c| c.name != name);
+        clients.len() != before
+    };
+    if !removed {
+        return json_error(404, &format!("no client named \"{name}\""));
+    }
+
+    state
+        .client_keys
+        .write()
+        .unwrap()
+        .retain(|_, (n, _)| n != &name);
+    state.router.remove_client(&name);
+
+    Json(json!({ "status": "ok" })).into_response()
 }
 
 pub async fn chat_completions(
@@ -537,7 +802,7 @@ pub async fn chat_completions(
         return json_error(400, "\"messages\" must not be empty");
     }
 
-    let client_name = matched_client_name(&state, &headers).map(str::to_string);
+    let client_name = matched_client_name(&state, &headers);
     if let Some(name) = &client_name {
         if let Err(exceeded) = state.router.check_client_budget(name).await {
             return budget_exceeded_response(&state, name, exceeded);
