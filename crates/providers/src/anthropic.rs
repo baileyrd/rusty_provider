@@ -494,3 +494,115 @@ fn empty_chunk(model: &str, delta: ChatMessageDelta, finish_reason: Option<Strin
         cost_usd: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rp_core::FunctionDef;
+
+    fn tool(name: &str, description: Option<&str>, parameters: Option<Value>) -> Tool {
+        Tool {
+            kind: "function".to_string(),
+            function: FunctionDef {
+                name: name.to_string(),
+                description: description.map(str::to_string),
+                parameters,
+            },
+        }
+    }
+
+    // --- to_wire_tools -----------------------------------------------------
+
+    #[test]
+    fn to_wire_tools_maps_name_description_and_parameters() {
+        let params = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let tools = vec![tool(
+            "get_weather",
+            Some("Look up the weather"),
+            Some(params.clone()),
+        )];
+        let wire = to_wire_tools(&tools);
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0].name, "get_weather");
+        assert_eq!(wire[0].description, Some("Look up the weather"));
+        assert_eq!(wire[0].input_schema, params);
+    }
+
+    #[test]
+    fn to_wire_tools_defaults_input_schema_when_parameters_absent() {
+        let tools = vec![tool("no_args_tool", None, None)];
+        let wire = to_wire_tools(&tools);
+        assert_eq!(
+            wire[0].input_schema,
+            json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(wire[0].description, None);
+    }
+
+    #[test]
+    fn to_wire_tools_preserves_order_across_multiple_tools() {
+        let tools = vec![tool("first", None, None), tool("second", None, None)];
+        let wire = to_wire_tools(&tools);
+        assert_eq!(wire[0].name, "first");
+        assert_eq!(wire[1].name, "second");
+    }
+
+    // --- to_wire_tool_choice -------------------------------------------------
+
+    #[test]
+    fn to_wire_tool_choice_maps_auto() {
+        assert_eq!(to_wire_tool_choice(&json!("auto")), json!({"type": "auto"}));
+    }
+
+    #[test]
+    fn to_wire_tool_choice_maps_none() {
+        assert_eq!(to_wire_tool_choice(&json!("none")), json!({"type": "none"}));
+    }
+
+    #[test]
+    fn to_wire_tool_choice_maps_required_to_any() {
+        assert_eq!(
+            to_wire_tool_choice(&json!("required")),
+            json!({"type": "any"})
+        );
+    }
+
+    #[test]
+    fn to_wire_tool_choice_maps_named_function() {
+        let choice = json!({"type": "function", "function": {"name": "get_weather"}});
+        assert_eq!(
+            to_wire_tool_choice(&choice),
+            json!({"type": "tool", "name": "get_weather"})
+        );
+    }
+
+    #[test]
+    fn to_wire_tool_choice_falls_back_to_auto_for_an_object_without_a_function_name() {
+        let choice = json!({"type": "function"});
+        assert_eq!(to_wire_tool_choice(&choice), json!({"type": "auto"}));
+    }
+
+    #[test]
+    fn to_wire_tool_choice_falls_back_to_auto_for_an_unrecognized_shape() {
+        assert_eq!(to_wire_tool_choice(&json!(null)), json!({"type": "auto"}));
+        assert_eq!(
+            to_wire_tool_choice(&json!("something-else")),
+            json!({"type": "auto"})
+        );
+    }
+
+    // --- map_stop_reason -----------------------------------------------------
+
+    #[test]
+    fn map_stop_reason_maps_tool_use_to_tool_calls() {
+        assert_eq!(map_stop_reason("tool_use"), "tool_calls");
+    }
+
+    #[test]
+    fn map_stop_reason_maps_every_documented_reason() {
+        assert_eq!(map_stop_reason("end_turn"), "stop");
+        assert_eq!(map_stop_reason("stop_sequence"), "stop");
+        assert_eq!(map_stop_reason("max_tokens"), "length");
+        assert_eq!(map_stop_reason("unknown_future_reason"), "stop");
+    }
+}
