@@ -85,8 +85,8 @@ impl MessageContent {
     }
 
     /// Collapses this content down to its plain text, discarding any image
-    /// parts. Used by adapters/roles that only understand text (e.g. tool
-    /// results, or providers translating non-user roles).
+    /// or audio parts. Used by adapters/roles that only understand text
+    /// (e.g. tool results, or providers translating non-user roles).
     pub fn as_plain_text(&self) -> String {
         match self {
             Self::Text(s) => s.clone(),
@@ -94,7 +94,7 @@ impl MessageContent {
                 .iter()
                 .filter_map(|part| match part {
                     ContentPart::Text { text } => Some(text.as_str()),
-                    ContentPart::ImageUrl { .. } => None,
+                    ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join(""),
@@ -103,12 +103,14 @@ impl MessageContent {
 }
 
 /// One part of a multimodal message's content array, in the OpenAI
-/// `content: [{"type": "text", ...}, {"type": "image_url", ...}]` shape.
+/// `content: [{"type": "text", ...}, {"type": "image_url", ...},
+/// {"type": "input_audio", ...}]` shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrl },
+    InputAudio { input_audio: InputAudio },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +120,15 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputAudio {
+    /// Raw base64-encoded audio (not a `data:` URI — just the payload),
+    /// per the OpenAI convention.
+    pub data: String,
+    /// e.g. `"wav"`, `"mp3"`.
+    pub format: String,
 }
 
 /// A tool the model may call, in the OpenAI function-calling shape.
@@ -474,6 +485,59 @@ mod tests {
             },
         }]);
         assert_eq!(content.as_plain_text(), "");
+    }
+
+    // --- ContentPart::InputAudio ---------------------------------------------
+
+    #[test]
+    fn content_part_deserializes_input_audio() {
+        let content: MessageContent = serde_json::from_str(
+            r#"[{"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "wav"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            content,
+            MessageContent::Parts(vec![ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "aGVsbG8=".to_string(),
+                    format: "wav".to_string(),
+                }
+            }])
+        );
+    }
+
+    #[test]
+    fn content_part_serializes_input_audio() {
+        let content = MessageContent::Parts(vec![ContentPart::InputAudio {
+            input_audio: InputAudio {
+                data: "aGVsbG8=".to_string(),
+                format: "mp3".to_string(),
+            },
+        }]);
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "type": "input_audio",
+                "input_audio": {"data": "aGVsbG8=", "format": "mp3"}
+            }])
+        );
+    }
+
+    #[test]
+    fn as_plain_text_drops_audio_parts_the_same_as_images() {
+        let content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "listen: ".to_string(),
+            },
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "aGVsbG8=".to_string(),
+                    format: "wav".to_string(),
+                },
+            },
+        ]);
+        assert_eq!(content.as_plain_text(), "listen: ");
     }
 
     // --- constructors wrap in MessageContent::Text ---------------------------

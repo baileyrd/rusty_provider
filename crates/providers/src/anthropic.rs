@@ -44,7 +44,7 @@ impl AnthropicProvider {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct WireMessage {
     role: &'static str,
     content: Vec<Value>,
@@ -83,7 +83,14 @@ struct WireRequest<'a> {
 /// user/assistant turns, each with content as typed blocks — text,
 /// `tool_use` (an assistant message's `tool_calls`), or `tool_result` (a
 /// `Role::Tool` message answering one).
-fn build_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<WireMessage>) {
+///
+/// Errs with `ProviderError::UnsupportedContent` if any user message
+/// contains audio -- Anthropic's Messages API has no audio-input support,
+/// unlike image content -- so a fallback chain can move on to a candidate
+/// that might support it instead of silently dropping it.
+fn build_messages(
+    messages: &[ChatMessage],
+) -> Result<(Option<String>, Vec<WireMessage>), ProviderError> {
     let mut system_parts = Vec::new();
     let mut turns = Vec::new();
 
@@ -105,11 +112,10 @@ fn build_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<WireMessage>
                 });
             }
             Role::User => {
-                let content = m
-                    .content
-                    .as_ref()
-                    .map(content_to_blocks)
-                    .unwrap_or_else(|| vec![json!({"type": "text", "text": ""})]);
+                let content = match &m.content {
+                    Some(content) => content_to_blocks(content)?,
+                    None => vec![json!({"type": "text", "text": ""})],
+                };
                 turns.push(WireMessage {
                     role: "user",
                     content,
@@ -149,21 +155,25 @@ fn build_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<WireMessage>
     } else {
         Some(system_parts.join("\n\n"))
     };
-    (system, turns)
+    Ok((system, turns))
 }
 
 /// Translates a message's content into Anthropic content blocks, turning
 /// `image_url` parts into `image` blocks: a `data:<mime>;base64,<data>`
 /// URI becomes a `base64` source, anything else (an `https://` URL) an
-/// `url` source.
-fn content_to_blocks(content: &MessageContent) -> Vec<Value> {
+/// `url` source. Errs on `input_audio` parts -- Anthropic's Messages API
+/// has no audio-input support to translate them into.
+fn content_to_blocks(content: &MessageContent) -> Result<Vec<Value>, ProviderError> {
     match content {
-        MessageContent::Text(text) => vec![json!({"type": "text", "text": text})],
+        MessageContent::Text(text) => Ok(vec![json!({"type": "text", "text": text})]),
         MessageContent::Parts(parts) => parts
             .iter()
             .map(|part| match part {
-                ContentPart::Text { text } => json!({"type": "text", "text": text}),
-                ContentPart::ImageUrl { image_url } => image_block(&image_url.url),
+                ContentPart::Text { text } => Ok(json!({"type": "text", "text": text})),
+                ContentPart::ImageUrl { image_url } => Ok(image_block(&image_url.url)),
+                ContentPart::InputAudio { .. } => Err(ProviderError::UnsupportedContent(
+                    "Anthropic's Messages API does not support audio input content".to_string(),
+                )),
             })
             .collect(),
     }
@@ -231,9 +241,13 @@ fn map_stop_reason(reason: &str) -> &'static str {
 }
 
 impl<'a> WireRequest<'a> {
-    fn from_core(req: &'a ChatRequest, model: &'a str, stream: bool) -> Self {
-        let (system, messages) = build_messages(&req.messages);
-        Self {
+    fn from_core(
+        req: &'a ChatRequest,
+        model: &'a str,
+        stream: bool,
+    ) -> Result<Self, ProviderError> {
+        let (system, messages) = build_messages(&req.messages)?;
+        Ok(Self {
             model,
             max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             messages,
@@ -244,7 +258,7 @@ impl<'a> WireRequest<'a> {
             stream,
             tools: req.tools.as_deref().map(to_wire_tools),
             tool_choice: req.tool_choice.as_ref().map(to_wire_tool_choice),
-        }
+        })
     }
 }
 
@@ -283,7 +297,7 @@ impl Provider for AnthropicProvider {
     }
 
     async fn chat(&self, req: &ChatRequest, model: &str) -> Result<ChatResponse, ProviderError> {
-        let body = WireRequest::from_core(req, model, false);
+        let body = WireRequest::from_core(req, model, false)?;
 
         let resp = self
             .client
@@ -361,7 +375,7 @@ impl Provider for AnthropicProvider {
         req: &ChatRequest,
         model: &str,
     ) -> Result<ChatStream, ProviderError> {
-        let body = WireRequest::from_core(req, model, true);
+        let body = WireRequest::from_core(req, model, true)?;
 
         let resp = self
             .client
@@ -703,7 +717,7 @@ mod tests {
     fn content_to_blocks_wraps_plain_text_as_a_single_text_block() {
         let content = MessageContent::text("hi");
         assert_eq!(
-            content_to_blocks(&content),
+            content_to_blocks(&content).unwrap(),
             vec![json!({"type": "text", "text": "hi"})]
         );
     }
@@ -722,7 +736,7 @@ mod tests {
             },
         ]);
         assert_eq!(
-            content_to_blocks(&content),
+            content_to_blocks(&content).unwrap(),
             vec![
                 json!({"type": "text", "text": "what's in this image?"}),
                 json!({
@@ -731,6 +745,18 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn content_to_blocks_errs_on_an_audio_part() {
+        let content = MessageContent::Parts(vec![ContentPart::InputAudio {
+            input_audio: rp_core::InputAudio {
+                data: "aGVsbG8=".to_string(),
+                format: "wav".to_string(),
+            },
+        }]);
+        let err = content_to_blocks(&content).unwrap_err();
+        assert!(matches!(err, ProviderError::UnsupportedContent(_)));
     }
 
     // --- build_messages: image content -------------------------------------------
@@ -749,7 +775,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        let (_, turns) = build_messages(&messages);
+        let (_, turns) = build_messages(&messages).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(
             turns[0].content,
@@ -774,11 +800,70 @@ mod tests {
             },
             ChatMessage::assistant("ok"),
         ];
-        let (system, turns) = build_messages(&messages);
+        let (system, turns) = build_messages(&messages).unwrap();
         assert_eq!(system, Some("be concise".to_string()));
         assert_eq!(
             turns[0].content,
             vec![json!({"type": "text", "text": "ok"})]
         );
+    }
+
+    // --- build_messages / chat: audio content is unsupported ----------------------
+
+    #[test]
+    fn build_messages_errs_on_a_user_audio_content_part() {
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: Some(MessageContent::Parts(vec![ContentPart::InputAudio {
+                input_audio: rp_core::InputAudio {
+                    data: "aGVsbG8=".to_string(),
+                    format: "wav".to_string(),
+                },
+            }])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let err = build_messages(&messages).unwrap_err();
+        assert!(matches!(err, ProviderError::UnsupportedContent(_)));
+        assert!(
+            err.is_retryable(),
+            "a fallback chain should move on to a candidate that might support audio"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_errs_on_audio_content_without_making_any_http_request() {
+        // No mock server is started at all -- if this somehow tried to make
+        // a real HTTP call it would fail with a connection error, not
+        // UnsupportedContent, so this also proves the check happens before
+        // any request is sent.
+        let provider = AnthropicProvider::new("http://127.0.0.1:1", "test-key");
+        let req = ChatRequest {
+            model: "anthropic/claude-sonnet-5".to_string(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: Some(MessageContent::Parts(vec![ContentPart::InputAudio {
+                    input_audio: rp_core::InputAudio {
+                        data: "aGVsbG8=".to_string(),
+                        format: "wav".to_string(),
+                    },
+                }])),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: None,
+            stream: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            provider: None,
+        };
+        let err = provider.chat(&req, "claude-sonnet-5").await.unwrap_err();
+        assert!(matches!(err, ProviderError::UnsupportedContent(_)));
     }
 }

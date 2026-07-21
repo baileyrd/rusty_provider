@@ -1,4 +1,6 @@
-use rp_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent, Role, Tool};
+use rp_core::{
+    ChatMessage, ChatRequest, ContentPart, ImageUrl, InputAudio, MessageContent, Role, Tool,
+};
 
 /// A minimal single-user-turn request, for tests that don't care about the
 /// rest of the request shape.
@@ -33,6 +35,31 @@ pub fn request_with_image(model: &str) -> ChatRequest {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,aGVsbG8=".to_string(),
                     detail: None,
+                },
+            },
+        ])),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+    req
+}
+
+/// Same as [`simple_request`], but the user turn's content is a
+/// multimodal parts array (text + base64 audio), for tests exercising
+/// audio content translation.
+pub fn request_with_audio(model: &str) -> ChatRequest {
+    let mut req = simple_request(model);
+    req.messages = vec![ChatMessage {
+        role: Role::User,
+        content: Some(MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "what's said in this clip?".to_string(),
+            },
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "aGVsbG8=".to_string(),
+                    format: "wav".to_string(),
                 },
             },
         ])),

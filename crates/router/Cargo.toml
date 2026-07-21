@@ -17,6 +17,7 @@ futures.workspace = true
 prometheus.workspace = true
 rusqlite.workspace = true
 tokio.workspace = true
+tokio-postgres.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -129,17 +129,42 @@ pub enum BudgetPeriod {
     Monthly,
 }
 
-/// Durable storage for cumulative usage/cost stats, so they survive a
-/// restart and stay consistent across multiple router processes sharing
-/// the same file (e.g. on one host, or a shared local volume — this is a
-/// single SQLite file, not a distributed/multi-host store). Omit this
-/// section entirely to keep the original in-memory-only behavior, which
-/// resets on every restart and is never shared across processes.
-#[derive(Debug, Deserialize, Clone)]
+/// Which database backend `[persistence]` uses.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PersistenceBackend {
+    /// A single local file. Fine for multiple processes on one host or a
+    /// shared local volume, not for processes spread across machines.
+    #[default]
+    Sqlite,
+    /// A shared Postgres database, reachable over the network — the way
+    /// to get usage/spend tracking consistent across multiple hosts, not
+    /// just multiple processes on one.
+    Postgres,
+}
+
+/// Durable storage for cumulative usage/cost stats and client spend
+/// budgets, so they survive a restart and stay consistent across every
+/// router process pointed at the same backend. Omit this section entirely
+/// to keep the original in-memory-only behavior, which resets on every
+/// restart and is never shared across processes.
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct PersistenceConfig {
-    /// Path to a SQLite database file. Created (along with the
-    /// `usage_stats` table) on first use if it doesn't already exist.
-    pub sqlite_path: String,
+    #[serde(default)]
+    pub backend: PersistenceBackend,
+    /// Path to a SQLite database file. Created (along with its tables) on
+    /// first use if it doesn't already exist. Required when `backend` is
+    /// `"sqlite"` (the default); ignored otherwise.
+    #[serde(default)]
+    pub sqlite_path: Option<String>,
+    /// Name of the environment variable holding a Postgres connection
+    /// string (e.g. `postgres://user:pass@host/dbname`), kept out of the
+    /// config file the same way provider/client API keys are. Required
+    /// when `backend` is `"postgres"`; ignored otherwise. Connections are
+    /// unencrypted (no TLS support yet) — use a trusted network or an
+    /// external tunnel.
+    #[serde(default)]
+    pub postgres_url_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -466,6 +491,60 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("budget_period"));
+    }
+
+    // --- persistence backend -----------------------------------------------------
+
+    #[test]
+    fn persistence_backend_defaults_to_sqlite_when_absent() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [persistence]
+            sqlite_path = "usage.db"
+            "#,
+        )
+        .unwrap();
+        let persistence = config.persistence.unwrap();
+        assert_eq!(persistence.backend, PersistenceBackend::Sqlite);
+        assert_eq!(persistence.sqlite_path.as_deref(), Some("usage.db"));
+        assert_eq!(persistence.postgres_url_env, None);
+    }
+
+    #[test]
+    fn persistence_postgres_backend_is_honored_when_set() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [persistence]
+            backend = "postgres"
+            postgres_url_env = "DATABASE_URL"
+            "#,
+        )
+        .unwrap();
+        let persistence = config.persistence.unwrap();
+        assert_eq!(persistence.backend, PersistenceBackend::Postgres);
+        assert_eq!(
+            persistence.postgres_url_env.as_deref(),
+            Some("DATABASE_URL")
+        );
+        assert_eq!(persistence.sqlite_path, None);
+    }
+
+    #[test]
+    fn persistence_backend_rejects_unknown_value() {
+        let err = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [persistence]
+            backend = "mysql"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("backend"));
     }
 
     // --- malformed input / from_file --------------------------------------------

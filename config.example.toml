@@ -144,16 +144,30 @@ completion_per_million = 0.79
 # requests_per_minute = 120
 
 # --- Persistence (optional) ---------------------------------------------------
-# By default, GET /v1/usage's cumulative request/token/cost totals live only
-# in memory: they reset on restart and each process only knows about its own
-# traffic. Uncomment this to persist them to a SQLite file instead (created
-# automatically if it doesn't exist) -- restarts keep their history, and
-# multiple rusty_provider processes pointed at the same file report a
-# consistent combined total. This is a single file, not a distributed
-# database: fine for multiple processes on one host or a shared local volume,
-# not for processes spread across different machines over a network
-# filesystem. An invalid path is a startup warning, not a hard failure -- the
-# router falls back to in-memory-only tracking rather than refusing to start.
+# By default, GET /v1/usage's cumulative request/token/cost totals and each
+# client's budget_usd spend tracking both live only in memory: they reset on
+# restart and each process only knows about its own traffic. Uncomment one of
+# the two backends below to persist them instead. An unreachable/misconfigured
+# backend is a startup warning, not a hard failure -- the router falls back to
+# in-memory-only tracking rather than refusing to start.
+
+# Backend 1: a single SQLite file (created automatically if it doesn't
+# exist). Restarts keep their history, and multiple rusty_provider processes
+# pointed at the same file report a consistent combined total. This is a
+# single file, not a distributed database: fine for multiple processes on one
+# host or a shared local volume, not for processes spread across different
+# machines over a network filesystem.
 
 # [persistence]
+# backend = "sqlite"
 # sqlite_path = "usage.db"
+
+# Backend 2: a shared Postgres database, reachable over the network -- the
+# way to get usage/spend tracking consistent across multiple *hosts*, not
+# just multiple processes on one. Tables are created automatically on first
+# use. Connections are unencrypted (no TLS support yet), so use a trusted
+# network or an external tunnel.
+
+# [persistence]
+# backend = "postgres"
+# postgres_url_env = "DATABASE_URL"

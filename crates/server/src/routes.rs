@@ -93,7 +93,7 @@ fn matched_client_name<'a>(state: &'a AppState, headers: &HeaderMap) -> Option<&
 fn budget_exceeded_response(
     state: &AppState,
     client_name: &str,
-    exceeded: crate::budget::BudgetExceeded,
+    exceeded: rp_router::ClientBudgetExceeded,
 ) -> Response {
     state.router.record_client_budget_rejection(client_name);
     json_error(
@@ -115,13 +115,12 @@ mod tests {
     use rp_core::RateLimiter;
     use rp_router::{Config, Router};
 
-    fn test_state(
+    async fn test_state(
         client_keys: Vec<(&str, &str, u32)>,
         default_rate_limit_rpm: Option<u32>,
     ) -> AppState {
-        let router = Arc::new(Router::from_config(
-            &Config::from_toml_str("providers = {}").unwrap(),
-        ));
+        let router =
+            Arc::new(Router::from_config(&Config::from_toml_str("providers = {}").unwrap()).await);
         let client_keys = client_keys
             .into_iter()
             .map(|(key, name, rpm)| (key.to_string(), (name.to_string(), rpm)))
@@ -132,7 +131,6 @@ mod tests {
             client_keys: Arc::new(client_keys),
             default_rate_limit_rpm,
             rate_limiter: Arc::new(RateLimiter::new()),
-            client_budgets: Arc::new(crate::budget::ClientBudgets::from_clients(&[])),
         }
     }
 
@@ -151,30 +149,30 @@ mod tests {
 
     // --- resolve_rate_limit ----------------------------------------------------
 
-    #[test]
-    fn resolve_rate_limit_is_none_with_no_client_match_and_no_default() {
-        let state = test_state(vec![], None);
+    #[tokio::test]
+    async fn resolve_rate_limit_is_none_with_no_client_match_and_no_default() {
+        let state = test_state(vec![], None).await;
         let result = resolve_rate_limit(&state, &HeaderMap::new(), addr());
         assert_eq!(result, None);
     }
 
-    #[test]
-    fn resolve_rate_limit_falls_back_to_ip_bucket_when_default_is_configured() {
-        let state = test_state(vec![], Some(60));
+    #[tokio::test]
+    async fn resolve_rate_limit_falls_back_to_ip_bucket_when_default_is_configured() {
+        let state = test_state(vec![], Some(60)).await;
         let result = resolve_rate_limit(&state, &HeaderMap::new(), addr());
         assert_eq!(result, Some(("ip:127.0.0.1".to_string(), 60)));
     }
 
-    #[test]
-    fn resolve_rate_limit_uses_client_bucket_when_bearer_token_matches() {
-        let state = test_state(vec![("secret-key", "acme", 30)], None);
+    #[tokio::test]
+    async fn resolve_rate_limit_uses_client_bucket_when_bearer_token_matches() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None).await;
         let result = resolve_rate_limit(&state, &bearer_headers("secret-key"), addr());
         assert_eq!(result, Some(("client:acme".to_string(), 30)));
     }
 
-    #[test]
-    fn resolve_rate_limit_prefers_client_bucket_over_ip_fallback() {
-        let state = test_state(vec![("secret-key", "acme", 30)], Some(60));
+    #[tokio::test]
+    async fn resolve_rate_limit_prefers_client_bucket_over_ip_fallback() {
+        let state = test_state(vec![("secret-key", "acme", 30)], Some(60)).await;
         let result = resolve_rate_limit(&state, &bearer_headers("secret-key"), addr());
         assert_eq!(
             result,
@@ -183,23 +181,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_rate_limit_falls_back_to_ip_when_bearer_present_but_unmatched() {
-        let state = test_state(vec![("secret-key", "acme", 30)], Some(60));
+    #[tokio::test]
+    async fn resolve_rate_limit_falls_back_to_ip_when_bearer_present_but_unmatched() {
+        let state = test_state(vec![("secret-key", "acme", 30)], Some(60)).await;
         let result = resolve_rate_limit(&state, &bearer_headers("wrong-key"), addr());
         assert_eq!(result, Some(("ip:127.0.0.1".to_string(), 60)));
     }
 
-    #[test]
-    fn resolve_rate_limit_is_none_when_bearer_unmatched_and_no_default() {
-        let state = test_state(vec![("secret-key", "acme", 30)], None);
+    #[tokio::test]
+    async fn resolve_rate_limit_is_none_when_bearer_unmatched_and_no_default() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None).await;
         let result = resolve_rate_limit(&state, &bearer_headers("wrong-key"), addr());
         assert_eq!(result, None);
     }
 
-    #[test]
-    fn resolve_rate_limit_ip_bucket_key_reflects_the_caller_address() {
-        let state = test_state(vec![], Some(60));
+    #[tokio::test]
+    async fn resolve_rate_limit_ip_bucket_key_reflects_the_caller_address() {
+        let state = test_state(vec![], Some(60)).await;
         let other_addr = SocketAddr::from(([10, 0, 0, 5], 8080));
         let result = resolve_rate_limit(&state, &HeaderMap::new(), other_addr);
         assert_eq!(result, Some(("ip:10.0.0.5".to_string(), 60)));
@@ -207,9 +205,9 @@ mod tests {
 
     // --- rate_limited_response ---------------------------------------------------
 
-    #[test]
-    fn rate_limited_response_returns_429_with_a_rounded_up_retry_after_header() {
-        let state = test_state(vec![], None);
+    #[tokio::test]
+    async fn rate_limited_response_returns_429_with_a_rounded_up_retry_after_header() {
+        let state = test_state(vec![], None).await;
         let resp = rate_limited_response(&state, "ip:127.0.0.1", 0.2);
         assert_eq!(resp.status(), 429);
         assert_eq!(
@@ -219,9 +217,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rate_limited_response_retry_after_ceils_fractional_seconds() {
-        let state = test_state(vec![], None);
+    #[tokio::test]
+    async fn rate_limited_response_retry_after_ceils_fractional_seconds() {
+        let state = test_state(vec![], None).await;
         let resp = rate_limited_response(&state, "ip:127.0.0.1", 4.1);
         assert_eq!(
             resp.headers().get("retry-after").unwrap(),
@@ -229,9 +227,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rate_limited_response_records_the_rejection_under_the_given_identity() {
-        let state = test_state(vec![], None);
+    #[tokio::test]
+    async fn rate_limited_response_records_the_rejection_under_the_given_identity() {
+        let state = test_state(vec![], None).await;
         rate_limited_response(&state, "client:acme", 1.0);
         let metrics = state.router.render_prometheus_metrics();
         assert!(metrics.contains("rusty_provider_inbound_rate_limit_rejections_total"));
@@ -240,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limited_response_body_reports_the_rounded_retry_after_in_the_message() {
-        let state = test_state(vec![], None);
+        let state = test_state(vec![], None).await;
         let resp = rate_limited_response(&state, "ip:127.0.0.1", 4.1);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -255,24 +253,24 @@ mod tests {
 
     // --- matched_client_name -------------------------------------------------
 
-    #[test]
-    fn matched_client_name_is_none_with_no_bearer_token() {
-        let state = test_state(vec![("secret-key", "acme", 30)], None);
+    #[tokio::test]
+    async fn matched_client_name_is_none_with_no_bearer_token() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None).await;
         assert_eq!(matched_client_name(&state, &HeaderMap::new()), None);
     }
 
-    #[test]
-    fn matched_client_name_is_none_for_an_unmatched_token() {
-        let state = test_state(vec![("secret-key", "acme", 30)], None);
+    #[tokio::test]
+    async fn matched_client_name_is_none_for_an_unmatched_token() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None).await;
         assert_eq!(
             matched_client_name(&state, &bearer_headers("wrong-key")),
             None
         );
     }
 
-    #[test]
-    fn matched_client_name_returns_the_name_for_a_matching_client_token() {
-        let state = test_state(vec![("secret-key", "acme", 30)], None);
+    #[tokio::test]
+    async fn matched_client_name_returns_the_name_for_a_matching_client_token() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None).await;
         assert_eq!(
             matched_client_name(&state, &bearer_headers("secret-key")),
             Some("acme")
@@ -281,13 +279,13 @@ mod tests {
 
     // --- budget_exceeded_response ----------------------------------------------
 
-    #[test]
-    fn budget_exceeded_response_returns_402() {
-        let state = test_state(vec![], None);
+    #[tokio::test]
+    async fn budget_exceeded_response_returns_402() {
+        let state = test_state(vec![], None).await;
         let resp = budget_exceeded_response(
             &state,
             "acme",
-            crate::budget::BudgetExceeded {
+            rp_router::ClientBudgetExceeded {
                 spent_usd: 12.5,
                 budget_usd: 10.0,
             },
@@ -295,13 +293,13 @@ mod tests {
         assert_eq!(resp.status(), 402);
     }
 
-    #[test]
-    fn budget_exceeded_response_records_the_rejection_under_the_client_name() {
-        let state = test_state(vec![], None);
+    #[tokio::test]
+    async fn budget_exceeded_response_records_the_rejection_under_the_client_name() {
+        let state = test_state(vec![], None).await;
         budget_exceeded_response(
             &state,
             "acme",
-            crate::budget::BudgetExceeded {
+            rp_router::ClientBudgetExceeded {
                 spent_usd: 12.5,
                 budget_usd: 10.0,
             },
@@ -313,11 +311,11 @@ mod tests {
 
     #[tokio::test]
     async fn budget_exceeded_response_body_reports_the_client_and_amounts() {
-        let state = test_state(vec![], None);
+        let state = test_state(vec![], None).await;
         let resp = budget_exceeded_response(
             &state,
             "acme",
-            crate::budget::BudgetExceeded {
+            rp_router::ClientBudgetExceeded {
                 spent_usd: 12.5,
                 budget_usd: 10.0,
             },
@@ -419,7 +417,7 @@ pub async fn chat_completions(
 
     let client_name = matched_client_name(&state, &headers).map(str::to_string);
     if let Some(name) = &client_name {
-        if let Err(exceeded) = state.client_budgets.check(name) {
+        if let Err(exceeded) = state.router.check_client_budget(name).await {
             return budget_exceeded_response(&state, name, exceeded);
         }
     }
@@ -427,13 +425,13 @@ pub async fn chat_completions(
     if req.is_streaming() {
         match state.router.dispatch_stream(&req).await {
             Ok(chunk_stream) => {
-                let client_budgets = state.client_budgets.clone();
+                let router = state.router.clone();
                 let events = chunk_stream
                     .map(move |item| {
                         let event = match item {
                             Ok(chunk) => {
                                 if let (Some(name), Some(cost)) = (&client_name, chunk.cost_usd) {
-                                    client_budgets.record(name, cost);
+                                    router.record_client_spend(name, cost);
                                 }
                                 Event::default()
                                     .json_data(&chunk)
@@ -457,7 +455,7 @@ pub async fn chat_completions(
         match state.router.dispatch(&req).await {
             Ok(resp) => {
                 if let (Some(name), Some(cost)) = (&client_name, resp.cost_usd) {
-                    state.client_budgets.record(name, cost);
+                    state.router.record_client_spend(name, cost);
                 }
                 Json(resp).into_response()
             }

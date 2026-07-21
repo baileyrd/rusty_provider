@@ -197,6 +197,23 @@ async fn chat_sends_image_content_as_a_base64_image_block() {
 }
 
 #[tokio::test]
+async fn chat_rejects_audio_content_without_contacting_the_server() {
+    // No Mock is registered on this server at all -- if the adapter tried
+    // to make an HTTP request it would get a 404 from wiremock's default
+    // "no matching mock" response, not this specific error, proving the
+    // rejection happens before any request is sent.
+    let server = MockServer::start().await;
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::request_with_audio("claude-sonnet-5");
+
+    let err = provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect_err("Anthropic has no audio-input support");
+    assert!(matches!(err, ProviderError::UnsupportedContent(_)));
+}
+
+#[tokio::test]
 async fn chat_sends_tools_and_tool_choice_translated_to_wire_format() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

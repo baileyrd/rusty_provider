@@ -1,19 +1,21 @@
+mod client_budget;
 mod config;
 mod error;
 mod metrics;
 mod persistence;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
-    BudgetPeriod, ClientConfig, Config, PersistenceConfig, PricingEntry, ProviderConfig,
-    ProviderKind, RouteAlias, ServerConfig,
+    BudgetPeriod, ClientConfig, Config, PersistenceBackend, PersistenceConfig, PricingEntry,
+    ProviderConfig, ProviderKind, RouteAlias, ServerConfig,
 };
 pub use error::RouterError;
 pub use metrics::Metrics;
-use persistence::Persistence;
+use persistence::{Persistence, PersistenceTarget};
 
 use futures::stream::StreamExt;
 use rp_core::{
@@ -39,6 +41,14 @@ pub struct UsageStats {
     /// unpriced model still count toward `requests`/`*_tokens` but leave
     /// this at 0.0, which is "unknown," not "free."
     pub cost_usd: f64,
+}
+
+/// A client's current-period spend and configured cap, returned by
+/// [`Router::check_client_budget`] when it's been exceeded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClientBudgetExceeded {
+    pub spent_usd: f64,
+    pub budget_usd: f64,
 }
 
 /// Holds every provider adapter that could be built from config (i.e. its
@@ -87,6 +97,14 @@ pub struct Router {
     /// Backs `provider_rpm`'s outbound self-throttling — one bucket per
     /// provider name, checked before every dispatch attempt.
     outbound_limiter: RateLimiter,
+    /// `[[clients]]` entries with a configured `budget_usd`. Absent here
+    /// means unrestricted.
+    client_budgets: HashMap<String, ClientBudgetSetting>,
+    /// In-memory spend per budgeted client, used when `persistence` is
+    /// `None`. When persistence is configured, `persistence`'s
+    /// `client_spend` table is the source of truth instead and this map
+    /// goes unused, mirroring how `usage`/`persistence` split their roles.
+    client_spend: Mutex<HashMap<String, SpendState>>,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -151,8 +169,44 @@ fn record_usage(
     cost
 }
 
+/// Resolve `config.persistence` into a connectable `PersistenceTarget`,
+/// or `None` if the section is absent or missing what its backend needs
+/// (an unset `sqlite_path`/`postgres_url_env`, or a `postgres_url_env`
+/// that names an env var that isn't actually set) -- every such case is a
+/// soft, warned-about failure, not a hard error, matching how a
+/// misconfigured provider or client is skipped rather than refused at
+/// startup.
+fn resolve_persistence_target(config: &PersistenceConfig) -> Option<PersistenceTarget> {
+    match config.backend {
+        PersistenceBackend::Sqlite => match &config.sqlite_path {
+            Some(path) => Some(PersistenceTarget::Sqlite(path.into())),
+            None => {
+                tracing::warn!(
+                    "persistence backend is \"sqlite\" but sqlite_path is not set; falling back to in-memory usage tracking"
+                );
+                None
+            }
+        },
+        PersistenceBackend::Postgres => match &config.postgres_url_env {
+            Some(var) => match std::env::var(var) {
+                Ok(url) if !url.is_empty() => Some(PersistenceTarget::Postgres(url)),
+                _ => {
+                    tracing::warn!(env_var = %var, "persistence backend is \"postgres\" but the connection string env var isn't set; falling back to in-memory usage tracking");
+                    None
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "persistence backend is \"postgres\" but postgres_url_env is not set; falling back to in-memory usage tracking"
+                );
+                None
+            }
+        },
+    }
+}
+
 impl Router {
-    pub fn from_config(config: &Config) -> Self {
+    pub async fn from_config(config: &Config) -> Self {
         let metrics = Metrics::new();
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
 
@@ -211,29 +265,39 @@ impl Router {
             .filter_map(|(name, cfg)| cfg.requests_per_minute.map(|rpm| (name.clone(), rpm)))
             .collect();
 
-        // A bad [persistence] config (e.g. an unwritable path) is a soft
-        // failure -- the router still starts and runs with in-memory-only
-        // usage tracking, matching how a misconfigured provider or client
-        // is skipped-with-a-warning rather than refused at startup.
-        let persistence = config.persistence.as_ref().and_then(|p| {
-            match Persistence::open(&p.sqlite_path) {
+        // A bad [persistence] config (e.g. an unwritable path, or an
+        // unreachable Postgres database) is a soft failure -- the router
+        // still starts and runs with in-memory-only usage/budget tracking,
+        // matching how a misconfigured provider or client is
+        // skipped-with-a-warning rather than refused at startup.
+        let persistence = match config
+            .persistence
+            .as_ref()
+            .and_then(resolve_persistence_target)
+        {
+            None => None,
+            Some(target) => match Persistence::open(target).await {
                 Ok(p) => Some(Arc::new(p)),
                 Err(e) => {
-                    tracing::warn!(path = %p.sqlite_path, "failed to open persistence database, falling back to in-memory usage tracking: {e}");
+                    tracing::warn!(
+                        "failed to open persistence database, falling back to in-memory usage tracking: {e}"
+                    );
                     None
                 }
-            }
-        });
-        let usage = persistence
-            .as_ref()
-            .and_then(|p| match p.load_all() {
-                Ok(loaded) => Some(loaded),
+            },
+        };
+        let usage = match &persistence {
+            Some(p) => match p.load_all().await {
+                Ok(loaded) => loaded,
                 Err(e) => {
                     tracing::warn!("failed to load persisted usage stats: {e}");
-                    None
+                    HashMap::new()
                 }
-            })
-            .unwrap_or_default();
+            },
+            None => HashMap::new(),
+        };
+
+        let client_budgets = client_budget::settings_from_clients(&config.clients);
 
         Self {
             providers,
@@ -247,6 +311,8 @@ impl Router {
             metrics,
             provider_rpm,
             outbound_limiter: RateLimiter::new(),
+            client_budgets,
+            client_spend: Mutex::new(HashMap::new()),
         }
     }
 
@@ -274,6 +340,65 @@ impl Router {
             }
         }
         self.usage.read().unwrap().clone()
+    }
+
+    /// `Ok(())` if `client_name` has no configured `budget_usd`, or
+    /// hasn't yet reached it for the current `budget_period`.
+    /// `Err(ClientBudgetExceeded)` if it has. When `[persistence]` is
+    /// configured this reads fresh from the shared database (so a
+    /// client's budget is enforced consistently across every process/host
+    /// sharing it, not just this one); without persistence it's this
+    /// process's own in-memory view, same as latency/throughput tracking.
+    pub async fn check_client_budget(&self, client_name: &str) -> Result<(), ClientBudgetExceeded> {
+        let Some(setting) = self.client_budgets.get(client_name) else {
+            return Ok(());
+        };
+        let current_key = client_budget::period_key_at(setting.period, client_budget::now_unix());
+
+        let spent_usd = if let Some(persistence) = &self.persistence {
+            match persistence.client_spend(client_name).await {
+                Ok(Some((period_key, spent_usd))) if period_key == current_key => spent_usd,
+                Ok(_) => 0.0,
+                Err(e) => {
+                    tracing::warn!("failed to read client spend from persistence, treating as unspent for this check: {e}");
+                    0.0
+                }
+            }
+        } else {
+            let mut spend = self.client_spend.lock().unwrap();
+            let state = spend.entry(client_name.to_string()).or_default();
+            client_budget::roll_period_if_needed(state, current_key);
+            state.spent_usd
+        };
+
+        if spent_usd >= setting.budget_usd {
+            Err(ClientBudgetExceeded {
+                spent_usd,
+                budget_usd: setting.budget_usd,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Adds `cost_usd` to `client_name`'s tracked spend for the current
+    /// `budget_period`. A no-op for clients with no configured budget —
+    /// there's nothing to track against. Never blocks the caller on I/O
+    /// when `[persistence]` is configured, the same as `record_usage`.
+    pub fn record_client_spend(&self, client_name: &str, cost_usd: f64) {
+        let Some(setting) = self.client_budgets.get(client_name) else {
+            return;
+        };
+        let current_key = client_budget::period_key_at(setting.period, client_budget::now_unix());
+
+        if let Some(persistence) = &self.persistence {
+            persistence.record_client_spend(client_name, current_key, cost_usd);
+        } else {
+            let mut spend = self.client_spend.lock().unwrap();
+            let state = spend.entry(client_name.to_string()).or_default();
+            client_budget::roll_period_if_needed(state, current_key);
+            state.spent_usd += cost_usd;
+        }
     }
 
     /// Every registered metric rendered in the Prometheus text exposition
@@ -641,6 +766,8 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
             outbound_limiter: RateLimiter::new(),
+            client_budgets: HashMap::new(),
+            client_spend: Mutex::new(HashMap::new()),
         }
     }
 
@@ -835,8 +962,8 @@ mod tests {
 
     // --- from_config ---------------------------------------------------------
 
-    #[test]
-    fn from_config_duplicate_route_alias_keeps_only_the_last_entry() {
+    #[tokio::test]
+    async fn from_config_duplicate_route_alias_keeps_only_the_last_entry() {
         // Config::routes is a plain Vec (TOML happily accepts two [[routes]]
         // blocks with the same alias), but Router::from_config folds them
         // into a HashMap keyed by alias -- the last one parsed silently
@@ -855,7 +982,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let router = Router::from_config(&config);
+        let router = Router::from_config(&config).await;
 
         assert_eq!(router.route_aliases().collect::<Vec<_>>(), vec!["smart"]);
         assert_eq!(
@@ -874,15 +1001,15 @@ mod tests {
         path
     }
 
-    #[test]
-    fn from_config_has_no_persistence_when_the_section_is_absent() {
+    #[tokio::test]
+    async fn from_config_has_no_persistence_when_the_section_is_absent() {
         let config = Config::from_toml_str("providers = {}").unwrap();
-        let router = Router::from_config(&config);
+        let router = Router::from_config(&config).await;
         assert!(router.persistence.is_none());
     }
 
-    #[test]
-    fn from_config_opens_persistence_when_configured() {
+    #[tokio::test]
+    async fn from_config_opens_persistence_when_configured() {
         let path = unique_temp_db_path("opens");
         let config = Config::from_toml_str(&format!(
             "providers = {{}}\n\n[persistence]\nsqlite_path = {:?}\n",
@@ -890,13 +1017,13 @@ mod tests {
         ))
         .unwrap();
 
-        let router = Router::from_config(&config);
+        let router = Router::from_config(&config).await;
 
         assert!(router.persistence.is_some());
     }
 
-    #[test]
-    fn from_config_falls_back_to_in_memory_when_persistence_path_is_invalid() {
+    #[tokio::test]
+    async fn from_config_falls_back_to_in_memory_when_persistence_path_is_invalid() {
         // The parent directory doesn't exist, so Persistence::open fails --
         // from_config must not panic or refuse to start, just skip it.
         let bad_path = std::env::temp_dir()
@@ -908,9 +1035,138 @@ mod tests {
         ))
         .unwrap();
 
-        let router = Router::from_config(&config);
+        let router = Router::from_config(&config).await;
 
         assert!(router.persistence.is_none());
+    }
+
+    #[tokio::test]
+    async fn from_config_falls_back_to_in_memory_when_persistence_backend_is_postgres_but_env_var_is_unset(
+    ) {
+        let unset_var = "RP_ROUTER_TEST_UNSET_POSTGRES_URL_VAR";
+        std::env::remove_var(unset_var);
+        let config = Config::from_toml_str(&format!(
+            "providers = {{}}\n\n[persistence]\nbackend = \"postgres\"\npostgres_url_env = {unset_var:?}\n"
+        ))
+        .unwrap();
+
+        let router = Router::from_config(&config).await;
+
+        assert!(router.persistence.is_none());
+    }
+
+    #[tokio::test]
+    async fn from_config_falls_back_to_in_memory_when_persistence_backend_is_sqlite_but_path_is_unset(
+    ) {
+        let config = Config::from_toml_str("providers = {}\n\n[persistence]\n").unwrap();
+        let router = Router::from_config(&config).await;
+        assert!(router.persistence.is_none());
+    }
+
+    #[tokio::test]
+    async fn from_config_reads_client_budget_settings() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[clients]]
+            name = "acme"
+            api_key_env = "ACME_KEY"
+            requests_per_minute = 60
+            budget_usd = 10.0
+            budget_period = "monthly"
+
+            [[clients]]
+            name = "globex"
+            api_key_env = "GLOBEX_KEY"
+            requests_per_minute = 60
+            "#,
+        )
+        .unwrap();
+        let router = Router::from_config(&config).await;
+
+        assert!(router.check_client_budget("globex").await.is_ok());
+        router.record_client_spend("acme", 100.0);
+        assert!(router.check_client_budget("acme").await.is_err());
+        // "globex" has no configured budget, so it stays unrestricted
+        // regardless of what "acme" (a completely different client) spent.
+        assert!(router.check_client_budget("globex").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn client_budget_is_persisted_and_shared_across_two_router_instances_sqlite() {
+        // Same shape as the usage-sharing test below, but for client spend
+        // budgets: router_a records spend against "acme"; router_b, a
+        // separate Router pointed at the same SQLite file, must see it via
+        // check_client_budget() -- proving the budget check itself (not
+        // just the underlying Persistence API) reads through to the
+        // shared backend rather than router_a's in-memory state.
+        let path = unique_temp_db_path("client_budget_shared");
+        let setting = ClientBudgetSetting {
+            budget_usd: 10.0,
+            period: BudgetPeriod::Total,
+        };
+
+        let mut router_a = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router_a.persistence = Some(Arc::new(
+            Persistence::open(PersistenceTarget::Sqlite(path.clone()))
+                .await
+                .unwrap(),
+        ));
+        router_a.client_budgets.insert("acme".to_string(), setting);
+        router_a.record_client_spend("acme", 12.0);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut router_b = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router_b.persistence = Some(Arc::new(
+            Persistence::open(PersistenceTarget::Sqlite(path))
+                .await
+                .unwrap(),
+        ));
+        router_b.client_budgets.insert("acme".to_string(), setting);
+
+        assert!(router_b.check_client_budget("acme").await.is_err());
+    }
+
+    fn test_postgres_url() -> Option<String> {
+        std::env::var("TEST_POSTGRES_URL").ok()
+    }
+
+    #[tokio::test]
+    async fn client_budget_is_persisted_and_shared_across_two_router_instances_postgres() {
+        let Some(url) = test_postgres_url() else {
+            eprintln!("skipping: TEST_POSTGRES_URL not set");
+            return;
+        };
+        // Unlike the SQLite test's per-test temp file, the Postgres test
+        // database persists across `cargo test` invocations, so the
+        // client name needs to be unique across runs too, not just within
+        // this one.
+        let client_name = format!("router_test_client_budget_{}", std::process::id());
+        let setting = ClientBudgetSetting {
+            budget_usd: 10.0,
+            period: BudgetPeriod::Total,
+        };
+
+        let mut router_a = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router_a.persistence = Some(Arc::new(
+            Persistence::open(PersistenceTarget::Postgres(url.clone()))
+                .await
+                .unwrap(),
+        ));
+        router_a.client_budgets.insert(client_name.clone(), setting);
+        router_a.record_client_spend(&client_name, 12.0);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut router_b = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router_b.persistence = Some(Arc::new(
+            Persistence::open(PersistenceTarget::Postgres(url))
+                .await
+                .unwrap(),
+        ));
+        router_b.client_budgets.insert(client_name.clone(), setting);
+
+        assert!(router_b.check_client_budget(&client_name).await.is_err());
     }
 
     #[tokio::test]
@@ -935,7 +1191,9 @@ mod tests {
             vec![],
         );
         router_a.persistence = Some(Arc::new(
-            Persistence::open(&path).expect("persistence should open"),
+            Persistence::open(PersistenceTarget::Sqlite(path.clone()))
+                .await
+                .expect("persistence should open"),
         ));
 
         router_a
@@ -949,7 +1207,9 @@ mod tests {
         let router_b = test_router(vec![], vec![], vec![], vec![], vec![]);
         let router_b = Router {
             persistence: Some(Arc::new(
-                Persistence::open(&path).expect("persistence should reopen"),
+                Persistence::open(PersistenceTarget::Sqlite(path))
+                    .await
+                    .expect("persistence should reopen"),
             )),
             ..router_b
         };

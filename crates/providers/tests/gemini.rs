@@ -257,6 +257,34 @@ async fn chat_sends_image_content_as_inline_data() {
 }
 
 #[tokio::test]
+async fn chat_sends_audio_content_as_inline_data() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "contents": [
+                {"role": "user", "parts": [
+                    {"text": "what's said in this clip?"},
+                    {"inlineData": {"mimeType": "audio/wav", "data": "aGVsbG8="}},
+                ]},
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"parts": [{"text": "hello"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 2, "totalTokenCount": 22}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_audio("gemini-2.0-flash");
+    provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
 async fn chat_stream_parses_text_parts() {
     let server = MockServer::start().await;
     let sse_body = concat!(
