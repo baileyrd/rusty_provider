@@ -1090,6 +1090,7 @@ dependencies = [
  "axum",
  "futures",
  "futures-util",
+ "reqwest",
  "rp-core",
  "rp-providers",
  "rp-router",
@@ -1100,6 +1101,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

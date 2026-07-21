@@ -1,19 +1,11 @@
-mod errors;
-mod routes;
-mod state;
-
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::routing::{get, post};
-use axum::Router as AxumRouter;
 use rp_core::RateLimiter;
 use rp_router::{Config, Router as ProviderRouter};
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
-
-use crate::state::AppState;
+use rp_server::build_app;
+use rp_server::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -70,15 +62,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter: Arc::new(RateLimiter::new()),
     };
 
-    let app = AxumRouter::new()
-        .route("/health", get(routes::health))
-        .route("/v1/models", get(routes::list_models))
-        .route("/v1/usage", get(routes::usage_stats))
-        .route("/metrics", get(routes::metrics))
-        .route("/v1/chat/completions", post(routes::chat_completions))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = build_app(state);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
