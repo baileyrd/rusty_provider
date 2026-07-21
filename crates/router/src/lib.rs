@@ -762,6 +762,37 @@ mod tests {
         }
     }
 
+    // --- from_config ---------------------------------------------------------
+
+    #[test]
+    fn from_config_duplicate_route_alias_keeps_only_the_last_entry() {
+        // Config::routes is a plain Vec (TOML happily accepts two [[routes]]
+        // blocks with the same alias), but Router::from_config folds them
+        // into a HashMap keyed by alias -- the last one parsed silently
+        // wins rather than merging or erroring.
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[routes]]
+            alias = "smart"
+            chain = ["a/m1"]
+
+            [[routes]]
+            alias = "smart"
+            chain = ["b/m2"]
+            "#,
+        )
+        .unwrap();
+        let router = Router::from_config(&config);
+
+        assert_eq!(router.route_aliases().collect::<Vec<_>>(), vec!["smart"]);
+        assert_eq!(
+            router.resolve_chain("smart").unwrap(),
+            chain(&[("b", "m2")])
+        );
+    }
+
     // --- resolve_chain -----------------------------------------------------
 
     #[test]

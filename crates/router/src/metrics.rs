@@ -217,3 +217,233 @@ impl Default for Metrics {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finds the rendered line for `metric_name` whose labels include every
+    /// string in `must_contain`, and parses its trailing value. Matching on
+    /// individual label substrings (rather than a full exact line) avoids
+    /// depending on the prometheus crate's label-ordering in the text
+    /// exposition format.
+    fn metric_value(rendered: &str, metric_name: &str, must_contain: &[&str]) -> f64 {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(metric_name) && must_contain.iter().all(|s| line.contains(s))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no line for metric {metric_name} containing {must_contain:?} in:\n{rendered}"
+                )
+            })
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|e| panic!("failed to parse metric value: {e}"))
+    }
+
+    #[test]
+    fn record_attempt_increments_the_labeled_counter() {
+        let metrics = Metrics::new();
+        metrics.record_attempt("anthropic", "m1", "success");
+        metrics.record_attempt("anthropic", "m1", "success");
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_dispatch_attempts_total",
+                &[
+                    "provider=\"anthropic\"",
+                    "model=\"m1\"",
+                    "outcome=\"success\""
+                ],
+            ),
+            2.0
+        );
+    }
+
+    #[test]
+    fn record_attempt_keeps_different_outcomes_independent() {
+        let metrics = Metrics::new();
+        metrics.record_attempt("anthropic", "m1", "success");
+        metrics.record_attempt("anthropic", "m1", "retryable_error");
+        metrics.record_attempt("anthropic", "m1", "retryable_error");
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_dispatch_attempts_total",
+                &["outcome=\"success\""],
+            ),
+            1.0
+        );
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_dispatch_attempts_total",
+                &["outcome=\"retryable_error\""],
+            ),
+            2.0
+        );
+    }
+
+    #[test]
+    fn observe_latency_seconds_populates_the_histogram_count_and_sum() {
+        let metrics = Metrics::new();
+        metrics.observe_latency_seconds("anthropic", "m1", 1.5);
+        metrics.observe_latency_seconds("anthropic", "m1", 2.5);
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_response_latency_seconds_count",
+                &["provider=\"anthropic\"", "model=\"m1\""],
+            ),
+            2.0
+        );
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_response_latency_seconds_sum",
+                &["provider=\"anthropic\"", "model=\"m1\""],
+            ),
+            4.0
+        );
+    }
+
+    #[test]
+    fn observe_throughput_tps_populates_the_histogram_count_and_sum() {
+        let metrics = Metrics::new();
+        metrics.observe_throughput_tps("anthropic", "m1", 10.0);
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_throughput_tokens_per_second_count",
+                &["provider=\"anthropic\"", "model=\"m1\""],
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn record_tokens_and_cost_increments_prompt_completion_and_cost() {
+        let metrics = Metrics::new();
+        metrics.record_tokens_and_cost("anthropic", "m1", 100, 50, Some(0.5));
+        metrics.record_tokens_and_cost("anthropic", "m1", 200, 25, Some(0.25));
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_prompt_tokens_total",
+                &["provider=\"anthropic\"", "model=\"m1\""],
+            ),
+            300.0
+        );
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_completion_tokens_total",
+                &["provider=\"anthropic\"", "model=\"m1\""],
+            ),
+            75.0
+        );
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_cost_usd_total",
+                &["provider=\"anthropic\"", "model=\"m1\""],
+            ),
+            0.75
+        );
+    }
+
+    #[test]
+    fn record_tokens_and_cost_with_no_cost_still_records_tokens_but_not_cost() {
+        let metrics = Metrics::new();
+        metrics.record_tokens_and_cost("anthropic", "m1", 100, 50, None);
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_prompt_tokens_total",
+                &["provider=\"anthropic\"", "model=\"m1\""],
+            ),
+            100.0
+        );
+        assert!(
+            !rendered.contains("rusty_provider_cost_usd_total"),
+            "an unpriced request should never touch the cost counter"
+        );
+    }
+
+    #[test]
+    fn set_provider_configured_reflects_the_latest_call_not_an_accumulation() {
+        let metrics = Metrics::new();
+        metrics.set_provider_configured("openai", true);
+        assert_eq!(
+            metric_value(
+                &metrics.render(),
+                "rusty_provider_provider_configured",
+                &["provider=\"openai\""],
+            ),
+            1.0
+        );
+
+        metrics.set_provider_configured("openai", false);
+        assert_eq!(
+            metric_value(
+                &metrics.render(),
+                "rusty_provider_provider_configured",
+                &["provider=\"openai\""],
+            ),
+            0.0,
+            "a gauge overwrites its previous value rather than accumulating"
+        );
+    }
+
+    #[test]
+    fn record_inbound_rate_limit_rejection_increments_by_identity() {
+        let metrics = Metrics::new();
+        metrics.record_inbound_rate_limit_rejection("client:acme");
+        metrics.record_inbound_rate_limit_rejection("client:acme");
+        metrics.record_inbound_rate_limit_rejection("ip:127.0.0.1");
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_inbound_rate_limit_rejections_total",
+                &["identity=\"client:acme\""],
+            ),
+            2.0
+        );
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_inbound_rate_limit_rejections_total",
+                &["identity=\"ip:127.0.0.1\""],
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn render_on_a_fresh_registry_does_not_panic_and_has_no_sample_lines() {
+        let metrics = Metrics::new();
+        let rendered = metrics.render();
+        assert!(
+            !rendered.lines().any(|l| !l.starts_with('#')),
+            "no metric has been recorded yet, so there should be no sample lines: {rendered}"
+        );
+    }
+}

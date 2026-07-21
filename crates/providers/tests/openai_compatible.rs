@@ -355,3 +355,105 @@ async fn chat_maps_400_to_non_retryable_invalid_request() {
     assert!(!err.is_retryable());
     assert!(matches!(err, ProviderError::InvalidRequest(_)));
 }
+
+#[tokio::test]
+async fn chat_maps_401_and_403_to_non_retryable_auth_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"error": {"message": "invalid api key"}})),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::simple_request("gpt-4o-mini");
+    let err = provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect_err("should fail");
+
+    assert!(!err.is_retryable());
+    match err {
+        ProviderError::Auth(message) => assert_eq!(message, "invalid api key"),
+        other => panic!("expected Auth, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn chat_maps_404_and_422_to_non_retryable_invalid_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(422)
+                .set_body_json(json!({"error": {"message": "unprocessable entity"}})),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::simple_request("gpt-4o-mini");
+    let err = provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect_err("should fail");
+
+    assert!(!err.is_retryable());
+    assert!(matches!(err, ProviderError::InvalidRequest(_)));
+}
+
+#[tokio::test]
+async fn chat_maps_an_unclassified_5xx_to_a_retryable_upstream_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_json(json!({"error": {"message": "server overloaded"}})),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::simple_request("gpt-4o-mini");
+    let err = provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect_err("should fail");
+
+    assert!(err.is_retryable());
+    match err {
+        ProviderError::Upstream { status, message } => {
+            assert_eq!(status, 503);
+            assert_eq!(message, "server overloaded");
+        }
+        other => panic!("expected Upstream, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn chat_falls_back_to_the_raw_body_when_the_error_response_is_not_json() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_raw("upstream is on fire", "text/plain"))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::simple_request("gpt-4o-mini");
+    let err = provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect_err("should fail");
+
+    match err {
+        ProviderError::Upstream { message, .. } => {
+            assert_eq!(message, "upstream is on fire")
+        }
+        other => panic!("expected Upstream, got {other:?}"),
+    }
+}
