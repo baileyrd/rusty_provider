@@ -923,10 +923,14 @@ pub async fn chat_completions(
 async fn chat_completions_dispatch(
     state: &AppState,
     headers: &HeaderMap,
-    req: ChatRequest,
+    mut req: ChatRequest,
 ) -> Response {
     if req.messages.is_empty() {
         return json_error(400, "\"messages\" must not be empty");
+    }
+
+    if let Err(e) = state.router.apply_guardrails(&mut req) {
+        return router_error_response(e);
     }
 
     let client_name = matched_client_name(state, headers);

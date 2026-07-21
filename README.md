@@ -815,6 +815,45 @@ unset sends no `Authorization` header at all. Delivery is fire-and-forget
 triggered the event, and a delivery failure is only logged, never
 surfaced to the client.
 
+## Guardrails
+
+`[[guardrails]]` entries check every request's message text — before
+it's ever dispatched to a provider — against a regex, and either block
+or redact what matches:
+
+```toml
+[[guardrails]]
+name = "no-ssn"
+pattern = '\d{3}-\d{2}-\d{4}'
+action = "block"
+
+[[guardrails]]
+name = "no-email"
+pattern = '\S+@\S+'
+action = "redact"
+replacement = "<email>"   # optional, defaults to "[redacted]"
+```
+
+`action = "block"` rejects the request with `400` (and the guardrail's
+`name` in the error message) the moment `pattern` matches anywhere in
+its message text. `action = "redact"` replaces every match with
+`replacement` and lets the (now-redacted) request continue — the
+provider never sees the original text. Multiple `[[guardrails]]` apply
+in config order, and a later guardrail sees whatever an earlier
+`"redact"` already rewrote (so a `"block"` guardrail placed after a
+`"redact"` one can catch the redaction marker itself, if that's useful,
+or just check for its own independent pattern). An invalid regex
+`pattern` is skipped at startup with a warning, same as a misconfigured
+provider or client, rather than refusing to start the router over one
+bad pattern.
+
+Only plain text is scanned — a message's own text content, or the text
+parts of a multimodal message; image/audio/file parts are untouched,
+since a regex has nothing meaningful to check there. This is scoped
+globally (every request, regardless of which client sent it), since
+rusty has no workspace/org concept to scope guardrails to individually
+the way OpenRouter's org-level guardrails can be.
+
 ## Admin API
 
 Setting `server.admin_key_env` unlocks a small admin API for inspecting

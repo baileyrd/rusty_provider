@@ -230,3 +230,24 @@ completion_per_million = 0.79
 # [webhook]
 # url = "https://hooks.example.com/rusty-provider"
 # auth_header_env = "WEBHOOK_AUTH_HEADER"  # e.g. set to "Bearer <token>"
+
+# --- Guardrails (optional) ------------------------------------------------------
+# Regex-based content guardrails, checked against every request's message text
+# before it's ever dispatched to a provider. Scoped globally (server-wide) --
+# rusty has no workspace/org concept to scope these to individually. Each entry's
+# `action` is "block" (reject the request with 400 if `pattern` matches anywhere)
+# or "redact" (replace every match with `replacement`, default "[redacted]",
+# before dispatch). Multiple [[guardrails]] apply in order -- a later guardrail
+# sees whatever an earlier "redact" already rewrote. An invalid regex `pattern`
+# is skipped at startup with a warning, same as a misconfigured provider/client.
+
+# [[guardrails]]
+# name = "no-ssn"
+# pattern = '\d{3}-\d{2}-\d{4}'
+# action = "block"
+
+# [[guardrails]]
+# name = "no-email"
+# pattern = '\S+@\S+'
+# action = "redact"
+# replacement = "<email>"
