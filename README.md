@@ -493,14 +493,54 @@ admin_key_env = "RUSTY_PROVIDER_ADMIN_KEY"
   tracked spend for the current period, immediately un-blocking a client
   that's hit `402`. `404` for a client name that doesn't exist or has no
   configured budget.
+- **`POST /v1/admin/clients`** — provisions a new client at runtime, no
+  config-file edit or restart needed. Body:
+  ```jsonc
+  {
+    "name": "acme",
+    "requests_per_minute": 60,
+    "budget_usd": 10.0,       // optional, omit for unrestricted
+    "budget_period": "monthly", // optional, "total" (default) or "monthly"
+    "api_key": "..."          // optional -- omit to have the server generate one
+  }
+  ```
+  Responds `201` with the same shape plus `api_key` — the server-generated
+  key (if you didn't supply one) is only ever shown in this response, the
+  same hygiene as GitHub/Stripe-style API keys, so save it immediately.
+  `400` for an empty `name`, a `requests_per_minute` of `0`, or a negative
+  `budget_usd`; `409` if `name` or `api_key` collides with an existing
+  client.
+- **`PATCH /v1/admin/clients/{name}`** — updates an existing client
+  (config-defined or runtime-provisioned). Every field is optional and
+  independent: omit a field to leave it unchanged, send `"budget_usd":
+  null` to explicitly clear a configured budget (as opposed to omitting
+  `budget_usd` entirely, which leaves it as-is), and set
+  `"rotate_api_key": true` to revoke the client's current key and issue a
+  new one, returned in the response the same one-time way creation does.
+  `404` for an unknown client, `400` for an invalid `requests_per_minute`/
+  `budget_usd`.
+- **`DELETE /v1/admin/clients/{name}`** — removes a client entirely,
+  immediately revoking its key and dropping its budget/spend tracking.
+  `404` for an unknown client.
 
-Requests to either route need `Authorization: Bearer <token>` matching
+Requests to every route above need `Authorization: Bearer <token>` matching
 `admin_key_env`'s resolved value — **not** `server.api_key_env` or any
 `[[clients]]` key, which authenticate chat completions but deliberately
 don't also grant access to every other client's spend data or the ability
-to reset it. Leaving `admin_key_env` unset disables the admin API
-entirely: both routes `404`, as if they didn't exist, rather than
-silently falling open once *any* auth is configured elsewhere.
+to provision/reset/delete clients. Leaving `admin_key_env` unset disables
+the admin API entirely: every route `404`s, as if it didn't exist, rather
+than silently falling open once *any* auth is configured elsewhere.
+
+Runtime-provisioned clients (created/updated/deleted via this API) are
+**in-memory only** — they don't survive a restart, and aren't written to
+`[persistence]`'s database even when one is configured (unlike usage/cost
+tracking and spend, which are). Only `[[clients]]` entries defined in
+`config.toml` come back after a restart; treat the admin API as a way to
+provision short-lived or emergency access without a deploy, not a
+permanent client registry. A config-defined client can still be updated or
+deleted at runtime through this API — the change just doesn't get written
+back to `config.toml`, so a later restart reverts it to what the file
+says.
 
 ## Persistence
 

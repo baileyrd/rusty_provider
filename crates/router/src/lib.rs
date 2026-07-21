@@ -128,9 +128,13 @@ pub struct Router {
     /// Backs `provider_rpm`'s outbound self-throttling — one bucket per
     /// provider name, checked before every dispatch attempt.
     outbound_limiter: RateLimiter,
-    /// `[[clients]]` entries with a configured `budget_usd`. Absent here
-    /// means unrestricted.
-    client_budgets: HashMap<String, ClientBudgetSetting>,
+    /// `[[clients]]` entries with a configured `budget_usd`, plus any
+    /// added/changed at runtime via the admin API
+    /// (`set_client_budget`/`remove_client`). Absent here means
+    /// unrestricted. Lock-protected since the admin API can mutate it
+    /// after startup, unlike the rest of this struct's config-derived
+    /// fields.
+    client_budgets: RwLock<HashMap<String, ClientBudgetSetting>>,
     /// In-memory spend per budgeted client, used when `persistence` is
     /// `None`. When persistence is configured, `persistence`'s
     /// `client_spend` table is the source of truth instead and this map
@@ -346,7 +350,7 @@ impl Router {
             metrics,
             provider_rpm,
             outbound_limiter: RateLimiter::new(),
-            client_budgets,
+            client_budgets: RwLock::new(client_budgets),
             client_spend: Mutex::new(HashMap::new()),
         }
     }
@@ -385,7 +389,13 @@ impl Router {
     /// sharing it, not just this one); without persistence it's this
     /// process's own in-memory view, same as latency/throughput tracking.
     pub async fn check_client_budget(&self, client_name: &str) -> Result<(), ClientBudgetExceeded> {
-        let Some(setting) = self.client_budgets.get(client_name).copied() else {
+        let Some(setting) = self
+            .client_budgets
+            .read()
+            .unwrap()
+            .get(client_name)
+            .copied()
+        else {
             return Ok(());
         };
         let spent_usd = self.spent_usd_for(client_name, &setting).await;
@@ -427,7 +437,7 @@ impl Router {
     /// admin API (`GET /v1/admin/clients`). `None` if `client_name` has no
     /// configured `budget_usd` -- there's nothing to report.
     pub async fn client_spend_status(&self, client_name: &str) -> Option<ClientSpendStatus> {
-        let setting = *self.client_budgets.get(client_name)?;
+        let setting = *self.client_budgets.read().unwrap().get(client_name)?;
         let spent_usd = self.spent_usd_for(client_name, &setting).await;
         Some(ClientSpendStatus {
             spent_usd,
@@ -442,7 +452,13 @@ impl Router {
     /// no-op) for a client with no configured budget -- there's nothing to
     /// reset.
     pub fn reset_client_spend(&self, client_name: &str) -> bool {
-        let Some(setting) = self.client_budgets.get(client_name) else {
+        let Some(setting) = self
+            .client_budgets
+            .read()
+            .unwrap()
+            .get(client_name)
+            .copied()
+        else {
             return false;
         };
         let current_key = client_budget::period_key_at(setting.period, client_budget::now_unix());
@@ -467,7 +483,13 @@ impl Router {
     /// there's nothing to track against. Never blocks the caller on I/O
     /// when `[persistence]` is configured, the same as `record_usage`.
     pub fn record_client_spend(&self, client_name: &str, cost_usd: f64) {
-        let Some(setting) = self.client_budgets.get(client_name) else {
+        let Some(setting) = self
+            .client_budgets
+            .read()
+            .unwrap()
+            .get(client_name)
+            .copied()
+        else {
             return;
         };
         let current_key = client_budget::period_key_at(setting.period, client_budget::now_unix());
@@ -480,6 +502,41 @@ impl Router {
             client_budget::roll_period_if_needed(state, current_key);
             state.spent_usd += cost_usd;
         }
+    }
+
+    /// Adds, updates, or clears `client_name`'s budget setting, for the
+    /// admin API's runtime client provisioning (`POST`/`PATCH
+    /// /v1/admin/clients`). `Some((budget_usd, period))` adds it if new or
+    /// overwrites it if it already existed; `None` clears it, making the
+    /// client unrestricted -- same as a `[[clients]]` entry with no
+    /// `budget_usd` set. Doesn't touch tracked spend either way, so
+    /// re-adding a budget after clearing it picks up wherever the client's
+    /// spend already was.
+    pub fn set_client_budget(&self, client_name: &str, budget: Option<(f64, BudgetPeriod)>) {
+        let mut budgets = self.client_budgets.write().unwrap();
+        match budget {
+            Some((budget_usd, period)) => {
+                budgets.insert(
+                    client_name.to_string(),
+                    ClientBudgetSetting { budget_usd, period },
+                );
+            }
+            None => {
+                budgets.remove(client_name);
+            }
+        }
+    }
+
+    /// Forgets `client_name` entirely, for the admin API's runtime client
+    /// deletion (`DELETE /v1/admin/clients/{name}`) -- drops its budget
+    /// setting and in-memory spend state. Persisted spend rows (if
+    /// `[persistence]` is configured) are left alone, matching
+    /// `reset_client_spend`'s existing behavior of never deleting rows;
+    /// they simply go unread once nothing references this client by name
+    /// again.
+    pub fn remove_client(&self, client_name: &str) {
+        self.client_budgets.write().unwrap().remove(client_name);
+        self.client_spend.lock().unwrap().remove(client_name);
     }
 
     /// Every registered metric rendered in the Prometheus text exposition
@@ -857,7 +914,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
             outbound_limiter: RateLimiter::new(),
-            client_budgets: HashMap::new(),
+            client_budgets: RwLock::new(HashMap::new()),
             client_spend: Mutex::new(HashMap::new()),
         }
     }
@@ -1197,8 +1254,8 @@ mod tests {
     // --- client_spend_status / reset_client_spend (admin API) --------------------
 
     fn router_with_budgeted_client(budget_usd: f64, period: BudgetPeriod) -> Router {
-        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
-        router.client_budgets.insert(
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.client_budgets.write().unwrap().insert(
             "acme".to_string(),
             ClientBudgetSetting { budget_usd, period },
         );
@@ -1271,7 +1328,11 @@ mod tests {
                 .await
                 .unwrap(),
         ));
-        router_a.client_budgets.insert("acme".to_string(), setting);
+        router_a
+            .client_budgets
+            .write()
+            .unwrap()
+            .insert("acme".to_string(), setting);
         router_a.record_client_spend("acme", 12.0);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -1281,7 +1342,11 @@ mod tests {
                 .await
                 .unwrap(),
         ));
-        router_b.client_budgets.insert("acme".to_string(), setting);
+        router_b
+            .client_budgets
+            .write()
+            .unwrap()
+            .insert("acme".to_string(), setting);
 
         assert!(router_b.check_client_budget("acme").await.is_err());
     }
@@ -1315,7 +1380,11 @@ mod tests {
             .await
             .unwrap(),
         ));
-        router_a.client_budgets.insert(client_name.clone(), setting);
+        router_a
+            .client_budgets
+            .write()
+            .unwrap()
+            .insert(client_name.clone(), setting);
         router_a.record_client_spend(&client_name, 12.0);
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -1328,7 +1397,11 @@ mod tests {
             .await
             .unwrap(),
         ));
-        router_b.client_budgets.insert(client_name.clone(), setting);
+        router_b
+            .client_budgets
+            .write()
+            .unwrap()
+            .insert(client_name.clone(), setting);
 
         assert!(router_b.check_client_budget(&client_name).await.is_err());
     }

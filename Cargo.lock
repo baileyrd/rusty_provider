@@ -1362,6 +1362,7 @@ dependencies = [
  "futures",
  "futures-util",
  "reqwest",
+ "ring",
  "rp-core",
  "rp-providers",
  "rp-router",

@@ -160,6 +160,13 @@ completion_per_million = 0.79
 # api_key_env = "CLIENT_OPENCLAW_API_KEY"
 # requests_per_minute = 120
 
+# Clients can also be created, updated, or deleted at runtime -- with no
+# config-file edit or restart -- via the admin API (POST/PATCH/DELETE
+# /v1/admin/clients, see the README's "Admin API" section), once
+# server.admin_key_env above is set. Runtime-provisioned clients are
+# in-memory only: they don't survive a restart and aren't written back to
+# this file, unlike the [[clients]] entries above.
+
 # --- Persistence (optional) ---------------------------------------------------
 # By default, GET /v1/usage's cumulative request/token/cost totals and each
 # client's budget_usd spend tracking both live only in memory: they reset on
