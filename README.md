@@ -82,7 +82,7 @@ A request can also constrain and order the resolved fallback chain with a
     "only": ["anthropic", "openai"],   // drop every other candidate in the chain
     "ignore": ["openai"],              // and then drop these too
     "zdr": true,                       // then drop any provider not marked zdr in config
-    "sort": "price"                    // or "latency" — stable-sort what's left
+    "sort": "price"                    // or "latency" / "throughput" — sort what's left
   },
   "messages": [{"role": "user", "content": "..."}]
 }
@@ -107,6 +107,14 @@ A request can also constrain and order the resolved fallback chain with a
   it's built up automatically from real traffic — but it's in-memory only
   (resets on restart) and per-process, not a shared/global feed; a
   "provider/model" this router hasn't successfully called yet sorts last.
+- `sort: "throughput"` sorts descending (fastest generation first) by a
+  running average (EWMA) of observed completion tokens/sec. For streaming
+  requests this is measured from when the request was sent to whichever
+  chunk carries the final `usage.completion_tokens` — the router
+  instruments the stream in flight rather than reading it itself, since it
+  hands streamed responses straight to the HTTP layer. Same caveats as
+  `"latency"`: no config needed, in-memory only, per-process; an
+  unobserved "provider/model" sorts last.
 
 ### `GET /v1/models`
 
@@ -152,7 +160,5 @@ rather than fail loudly.
 
 ## Not yet implemented
 
-- Throughput-based routing (price- and latency-based sort are supported —
-  see `provider.sort` above; there's no tokens/sec telemetry to sort by yet)
 - Usage metering / billing
 - Multi-turn image or audio content
