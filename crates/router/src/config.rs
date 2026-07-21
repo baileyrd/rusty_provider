@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use rp_core::ProviderPreferences;
 use serde::{Deserialize, Serialize};
 
 fn default_host() -> String {
@@ -254,6 +255,53 @@ pub struct Config {
     pub webhook: Option<WebhookConfig>,
     #[serde(default)]
     pub guardrails: Vec<GuardrailConfig>,
+    #[serde(default)]
+    pub presets: Vec<PresetConfig>,
+}
+
+/// A named, reusable bundle of request defaults (`[[presets]]`), applied
+/// when a request sets `"preset": "<name>"`. Every field here is a
+/// per-field *default* -- whatever the request itself already set always
+/// wins, so a preset only ever fills in what the caller left unset --
+/// except `model`, which overrides the request outright when set, since
+/// centralizing model selection is the point of a preset.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PresetConfig {
+    /// The slug clients reference via `"preset": "<name>"`.
+    pub name: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Prepended as a new `role = "system"` message, but only if the
+    /// request has no system message of its own -- never appended
+    /// alongside or merged with one the caller already provided.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub provider: Option<ProviderPreferences>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub stop: Option<Vec<String>>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub top_a: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub logit_bias: Option<HashMap<String, f32>>,
+    #[serde(default)]
+    pub seed: Option<i64>,
 }
 
 /// A regex-based content guardrail, checked against every request's
@@ -745,6 +793,79 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("action"));
+    }
+
+    // --- presets ---------------------------------------------------------------
+
+    #[test]
+    fn presets_defaults_to_empty_when_absent() {
+        let config = Config::from_toml_str("providers = {}").unwrap();
+        assert!(config.presets.is_empty());
+    }
+
+    #[test]
+    fn preset_parses_model_system_prompt_and_sampling_params() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[presets]]
+            name = "support-bot"
+            model = "smart"
+            system_prompt = "You are a support agent."
+            temperature = 0.2
+            max_tokens = 500
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.presets.len(), 1);
+        let preset = &config.presets[0];
+        assert_eq!(preset.name, "support-bot");
+        assert_eq!(preset.model, Some("smart".to_string()));
+        assert_eq!(
+            preset.system_prompt,
+            Some("You are a support agent.".to_string())
+        );
+        assert_eq!(preset.temperature, Some(0.2));
+        assert_eq!(preset.max_tokens, Some(500));
+    }
+
+    #[test]
+    fn preset_parses_provider_prefs() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[presets]]
+            name = "cheap"
+
+            [presets.provider]
+            sort = "price"
+            "#,
+        )
+        .unwrap();
+        let preset = &config.presets[0];
+        assert_eq!(
+            preset.provider.as_ref().unwrap().sort,
+            Some("price".to_string())
+        );
+    }
+
+    #[test]
+    fn preset_only_requires_a_name() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[presets]]
+            name = "minimal"
+            "#,
+        )
+        .unwrap();
+        let preset = &config.presets[0];
+        assert_eq!(preset.model, None);
+        assert_eq!(preset.system_prompt, None);
+        assert!(preset.provider.is_none());
     }
 
     // --- persistence backend -----------------------------------------------------

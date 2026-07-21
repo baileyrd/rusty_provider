@@ -4,6 +4,7 @@ mod error;
 mod guardrails;
 mod metrics;
 mod persistence;
+mod presets;
 mod webhook;
 
 use std::collections::{HashMap, HashSet};
@@ -13,8 +14,8 @@ use std::time::Instant;
 use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
     BudgetPeriod, ClientConfig, Config, GuardrailAction, GuardrailConfig, PersistenceBackend,
-    PersistenceConfig, PostgresTlsMode, PricingEntry, ProviderConfig, ProviderKind, RouteAlias,
-    ServerConfig, WebhookConfig,
+    PersistenceConfig, PostgresTlsMode, PresetConfig, PricingEntry, ProviderConfig, ProviderKind,
+    RouteAlias, ServerConfig, WebhookConfig,
 };
 pub use error::RouterError;
 use guardrails::Guardrail;
@@ -404,6 +405,10 @@ pub struct Router {
     /// Compiled `[[guardrails]]` entries, in config order. Empty means no
     /// guardrails configured -- every request passes through unchanged.
     guardrails: Vec<Guardrail>,
+    /// `[[presets]]` entries by `name`. Duplicate names keep only the
+    /// last entry, same "last one wins" convention as `[[routes]]`
+    /// aliases.
+    presets: HashMap<String, PresetConfig>,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -640,6 +645,12 @@ impl Router {
             })
             .collect();
 
+        let presets = config
+            .presets
+            .iter()
+            .map(|cfg| (cfg.name.clone(), cfg.clone()))
+            .collect();
+
         Self {
             providers,
             provider_kinds,
@@ -660,6 +671,7 @@ impl Router {
             client_spend: Mutex::new(HashMap::new()),
             webhook,
             guardrails,
+            presets,
         }
     }
 
@@ -1119,6 +1131,23 @@ impl Router {
         guardrails::apply(&self.guardrails, req).map_err(RouterError::GuardrailBlocked)
     }
 
+    /// If `req.preset` is set, looks up that `[[presets]]` entry and
+    /// folds its defaults into `req` (see `presets::apply` for exactly
+    /// what that means per field). A no-op when `req.preset` is unset;
+    /// `Err(RouterError::UnknownPreset)` when it names a preset this
+    /// router has no config entry for.
+    pub fn apply_preset(&self, req: &mut ChatRequest) -> Result<(), RouterError> {
+        let Some(name) = req.preset.clone() else {
+            return Ok(());
+        };
+        let preset = self
+            .presets
+            .get(&name)
+            .ok_or_else(|| RouterError::UnknownPreset(name.clone()))?;
+        presets::apply(preset, req);
+        Ok(())
+    }
+
     /// When `req.provider.require_parameters` is `true`, drops every
     /// candidate whose provider kind doesn't actually give an effect to
     /// every field `req` sets (see `active_params`/`supported_params`) --
@@ -1481,6 +1510,7 @@ mod tests {
             client_spend: Mutex::new(HashMap::new()),
             webhook: None,
             guardrails: Vec::new(),
+            presets: HashMap::new(),
         }
     }
 
@@ -1495,6 +1525,7 @@ mod tests {
         ChatRequest {
             model: model.to_string(),
             models: None,
+            preset: None,
             messages: vec![ChatMessage::user("hi")],
             temperature: None,
             top_p: None,
@@ -2351,6 +2382,60 @@ mod tests {
         cache.insert(generation_record("id-a"));
         assert!(cache.get("id-a").is_some());
         assert!(cache.get("id-b").is_some());
+    }
+
+    // --- apply_preset --------------------------------------------------------
+
+    fn preset_config(name: &str) -> PresetConfig {
+        PresetConfig {
+            name: name.to_string(),
+            model: None,
+            system_prompt: None,
+            provider: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: None,
+            top_k: None,
+            min_p: None,
+            top_a: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            logit_bias: None,
+            seed: None,
+        }
+    }
+
+    #[test]
+    fn apply_preset_is_a_noop_when_unset() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let mut req = test_request("smart");
+        req.preset = None;
+        router.apply_preset(&mut req).unwrap();
+        assert_eq!(req.model, "smart");
+    }
+
+    #[test]
+    fn apply_preset_errors_for_an_unknown_name() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let mut req = test_request("smart");
+        req.preset = Some("nope".to_string());
+        let err = router.apply_preset(&mut req).unwrap_err();
+        assert!(matches!(err, RouterError::UnknownPreset(name) if name == "nope"));
+    }
+
+    #[test]
+    fn apply_preset_overrides_the_model_when_configured() {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let mut cfg = preset_config("support-bot");
+        cfg.model = Some("anthropic/claude-sonnet-5".to_string());
+        router.presets.insert("support-bot".to_string(), cfg);
+
+        let mut req = test_request("smart");
+        req.preset = Some("support-bot".to_string());
+        router.apply_preset(&mut req).unwrap();
+        assert_eq!(req.model, "anthropic/claude-sonnet-5");
     }
 
     // --- resolve_chain -----------------------------------------------------

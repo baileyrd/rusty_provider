@@ -9,6 +9,7 @@ pub fn simple_request(model: &str) -> ChatRequest {
     ChatRequest {
         model: model.to_string(),
         models: None,
+        preset: None,
         messages: vec![ChatMessage::user("hi")],
         temperature: None,
         top_p: None,

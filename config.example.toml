@@ -251,3 +251,22 @@ completion_per_million = 0.79
 # pattern = '\S+@\S+'
 # action = "redact"
 # replacement = "<email>"
+
+# --- Presets (optional) ----------------------------------------------------------
+# A named, reusable bundle of request defaults, referenced from a request via
+# `"preset": "<name>"`. Every field here is a per-field default -- whatever the
+# request itself already sets always wins -- except `model`, which overrides the
+# request's `model` outright when set, since centralizing model selection is the
+# point of a preset. `model` can itself be a [[routes]] alias, so presets pair
+# naturally with route aliases. `system_prompt` is prepended as a new system
+# message, but only if the request has no system message of its own.
+
+# [[presets]]
+# name = "support-bot"
+# model = "smart"
+# system_prompt = "You are a helpful, concise support agent."
+# temperature = 0.2
+# max_tokens = 500
+#
+# [presets.provider]
+# only = ["anthropic", "openai"]
