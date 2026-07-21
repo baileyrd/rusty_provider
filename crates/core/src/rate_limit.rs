@@ -73,3 +73,63 @@ impl RateLimiter {
         bucket.try_acquire()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    #[test]
+    fn allows_up_to_capacity_then_rejects() {
+        let limiter = RateLimiter::new();
+        assert!(limiter.check("a", 3).is_ok());
+        assert!(limiter.check("a", 3).is_ok());
+        assert!(limiter.check("a", 3).is_ok());
+
+        let retry_after = limiter.check("a", 3).unwrap_err();
+        assert!(
+            retry_after > 0.0 && retry_after <= 60.0,
+            "unexpected retry_after: {retry_after}"
+        );
+    }
+
+    #[test]
+    fn independent_keys_have_independent_buckets() {
+        let limiter = RateLimiter::new();
+        assert!(limiter.check("a", 1).is_ok());
+        assert!(limiter.check("a", 1).is_err());
+        // "b" has never been touched, so it starts with a full bucket
+        // regardless of "a" being exhausted.
+        assert!(limiter.check("b", 1).is_ok());
+    }
+
+    #[test]
+    fn refills_over_time() {
+        let limiter = RateLimiter::new();
+        // 6000 requests/minute = 100 tokens/sec, so a short sleep refills
+        // meaningfully without slowing the test suite down.
+        for _ in 0..6000 {
+            limiter.check("fast", 6000).unwrap();
+        }
+        assert!(limiter.check("fast", 6000).is_err());
+
+        sleep(Duration::from_millis(50));
+        assert!(limiter.check("fast", 6000).is_ok());
+    }
+
+    #[test]
+    fn zero_capacity_always_rejects_with_fixed_cooldown() {
+        let limiter = RateLimiter::new();
+        assert_eq!(limiter.check("none", 0), Err(60.0));
+        assert!(limiter.check("none", 0).is_err());
+    }
+
+    #[test]
+    fn first_use_of_a_key_seeds_a_full_bucket() {
+        let limiter = RateLimiter::new();
+        // The very first check for a key should succeed even though no
+        // time has passed to "earn" a token -- new buckets start full.
+        assert!(limiter.check("fresh", 5).is_ok());
+    }
+}

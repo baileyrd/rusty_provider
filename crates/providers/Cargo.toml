@@ -16,3 +16,7 @@ thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 eventsource-stream.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+wiremock.workspace = true
