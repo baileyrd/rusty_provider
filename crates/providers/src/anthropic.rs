@@ -11,8 +11,9 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     CacheControl, ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream,
-    Choice, ChunkChoice, ContentPart, FunctionCallDelta, MessageContent, Provider, ProviderError,
-    ReasoningConfig, ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
+    Choice, ChunkChoice, ContentPart, EmbeddingsRequest, EmbeddingsResponse, FunctionCallDelta,
+    MessageContent, Provider, ProviderError, ReasoningConfig, ResponseFormat, Role, Tool, ToolCall,
+    ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -831,6 +832,20 @@ impl Provider for AnthropicProvider {
 
         Ok(Box::pin(stream))
     }
+
+    /// Anthropic has no embeddings API of its own -- unlike audio content
+    /// or schema-less JSON mode, there's no partial/best-effort mapping
+    /// possible here, so every call rejects outright.
+    async fn embeddings(
+        &self,
+        _req: &EmbeddingsRequest,
+        _model: &str,
+        _api_key_override: Option<&str>,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::UnsupportedFeature(
+            "Anthropic has no embeddings endpoint".to_string(),
+        ))
+    }
 }
 
 fn empty_chunk(model: &str, delta: ChatMessageDelta, finish_reason: Option<String>) -> ChatChunk {
@@ -1405,5 +1420,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedContent(_)));
+    }
+
+    #[tokio::test]
+    async fn embeddings_always_errs_with_unsupportedfeature_without_making_any_http_request() {
+        // No mock server started -- proves this rejects locally rather
+        // than attempting (and failing to reach) a nonexistent endpoint.
+        let provider = AnthropicProvider::new("http://127.0.0.1:1", "test-key");
+        let req = rp_core::EmbeddingsRequest {
+            model: "anthropic/claude-sonnet-5".to_string(),
+            input: rp_core::EmbeddingsInput::Single("hello".to_string()),
+            encoding_format: None,
+            dimensions: None,
+        };
+        let err = provider
+            .embeddings(&req, "claude-sonnet-5", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::UnsupportedFeature(_)));
+        assert!(
+            err.is_retryable(),
+            "a fallback chain should move on to a provider that does support embeddings"
+        );
     }
 }

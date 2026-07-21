@@ -695,6 +695,83 @@ pub struct ModelPricing {
     pub cache_write: f64,
 }
 
+/// `POST /v1/embeddings` request body -- OpenAI's own shape, so an
+/// OpenAI SDK/client can point `embeddings.create()` at this router
+/// unchanged. `model` is "provider/model" or a `[[routes]]` alias,
+/// exactly like `ChatRequest.model`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsRequest {
+    pub model: String,
+    pub input: EmbeddingsInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
+}
+
+/// OpenAI's `input: string | string[]` -- a single text to embed, or a
+/// batch embedded in one call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingsInput {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl EmbeddingsInput {
+    /// Every input string, in order -- `[text]` for `Single`, so callers
+    /// never need to match on the variant themselves.
+    pub fn as_slice(&self) -> Vec<&str> {
+        match self {
+            EmbeddingsInput::Single(text) => vec![text.as_str()],
+            EmbeddingsInput::Multiple(texts) => texts.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingData {
+    #[serde(skip_deserializing, default = "embedding_object")]
+    pub object: &'static str,
+    pub embedding: Vec<f32>,
+    /// This entry's position in `EmbeddingsRequest.input`, so a batched
+    /// request's results can be matched back up to their inputs even if
+    /// a provider ever returned them out of order.
+    pub index: usize,
+}
+
+/// No `completion_tokens` -- embedding a text has no generated output to
+/// count, unlike a chat completion.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct EmbeddingsUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsResponse {
+    #[serde(skip_deserializing, default = "embeddings_list_object")]
+    pub object: &'static str,
+    pub data: Vec<EmbeddingData>,
+    /// The fully-qualified "provider/model" that actually served the
+    /// request, same convention as `ChatResponse.model`.
+    pub model: String,
+    /// `None` when the provider's embeddings response carries no token
+    /// count at all (Gemini's `embedContent`/`batchEmbedContents` don't),
+    /// same "absent means the provider didn't report it" convention as
+    /// `ChatResponse.usage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<EmbeddingsUsage>,
+}
+
+fn embedding_object() -> &'static str {
+    "embedding"
+}
+
+fn embeddings_list_object() -> &'static str {
+    "list"
+}
+
 fn chat_completion_object() -> &'static str {
     "chat.completion"
 }
@@ -948,5 +1025,132 @@ mod tests {
     fn user_constructor_wraps_content_as_text() {
         let msg = ChatMessage::user("hi");
         assert_eq!(msg.content, Some(MessageContent::text("hi")));
+    }
+
+    // --- EmbeddingsInput (de)serialization -------------------------------------
+
+    #[test]
+    fn embeddings_input_deserializes_a_plain_string_as_single() {
+        let input: EmbeddingsInput = serde_json::from_str(r#""hello""#).unwrap();
+        assert_eq!(input, EmbeddingsInput::Single("hello".to_string()));
+    }
+
+    #[test]
+    fn embeddings_input_deserializes_an_array_as_multiple() {
+        let input: EmbeddingsInput = serde_json::from_str(r#"["hello", "world"]"#).unwrap();
+        assert_eq!(
+            input,
+            EmbeddingsInput::Multiple(vec!["hello".to_string(), "world".to_string()])
+        );
+    }
+
+    #[test]
+    fn embeddings_input_single_serializes_as_a_plain_string() {
+        let json = serde_json::to_value(EmbeddingsInput::Single("hi".to_string())).unwrap();
+        assert_eq!(json, serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn embeddings_input_multiple_serializes_as_an_array() {
+        let json = serde_json::to_value(EmbeddingsInput::Multiple(vec![
+            "hi".to_string(),
+            "there".to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(json, serde_json::json!(["hi", "there"]));
+    }
+
+    #[test]
+    fn embeddings_input_as_slice_wraps_a_single_value_in_a_one_element_vec() {
+        let input = EmbeddingsInput::Single("hi".to_string());
+        assert_eq!(input.as_slice(), vec!["hi"]);
+    }
+
+    #[test]
+    fn embeddings_input_as_slice_preserves_multiple_values_in_order() {
+        let input = EmbeddingsInput::Multiple(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(input.as_slice(), vec!["a", "b"]);
+    }
+
+    // --- EmbeddingsRequest/Response (de)serialization --------------------------
+
+    #[test]
+    fn embeddings_request_deserializes_optional_fields_as_none_when_absent() {
+        let req: EmbeddingsRequest = serde_json::from_value(serde_json::json!({
+            "model": "openai/text-embedding-3-small",
+            "input": "hello"
+        }))
+        .unwrap();
+        assert_eq!(req.model, "openai/text-embedding-3-small");
+        assert_eq!(req.input, EmbeddingsInput::Single("hello".to_string()));
+        assert_eq!(req.encoding_format, None);
+        assert_eq!(req.dimensions, None);
+    }
+
+    #[test]
+    fn embeddings_response_object_defaults_to_list_and_ignores_a_deserialized_value() {
+        let resp: EmbeddingsResponse = serde_json::from_value(serde_json::json!({
+            "object": "something-else",
+            "data": [],
+            "model": "openai/text-embedding-3-small",
+            "usage": {"prompt_tokens": 3, "total_tokens": 3}
+        }))
+        .unwrap();
+        assert_eq!(resp.object, "list");
+    }
+
+    #[test]
+    fn embedding_data_object_defaults_to_embedding() {
+        let data: EmbeddingData = serde_json::from_value(serde_json::json!({
+            "embedding": [0.1, 0.2],
+            "index": 0
+        }))
+        .unwrap();
+        assert_eq!(data.object, "embedding");
+    }
+
+    #[test]
+    fn embeddings_response_serializes_with_expected_shape() {
+        let resp = EmbeddingsResponse {
+            object: "list",
+            data: vec![EmbeddingData {
+                object: "embedding",
+                // Exactly representable in binary floating point, so this
+                // round-trips f32 -> JSON -> f64 without the precision
+                // drift a value like 0.1 would show up as.
+                embedding: vec![0.5, 0.25, 0.125],
+                index: 0,
+            }],
+            model: "openai/text-embedding-3-small".to_string(),
+            usage: Some(EmbeddingsUsage {
+                prompt_tokens: 2,
+                total_tokens: 2,
+            }),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "object": "list",
+                "data": [{"object": "embedding", "embedding": [0.5, 0.25, 0.125], "index": 0}],
+                "model": "openai/text-embedding-3-small",
+                "usage": {"prompt_tokens": 2, "total_tokens": 2}
+            })
+        );
+    }
+
+    #[test]
+    fn embeddings_response_omits_usage_entirely_when_none() {
+        let resp = EmbeddingsResponse {
+            object: "list",
+            data: vec![],
+            model: "gemini/text-embedding-004".to_string(),
+            usage: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(
+            json.get("usage").is_none(),
+            "expected no \"usage\" key at all, got {json}"
+        );
     }
 }

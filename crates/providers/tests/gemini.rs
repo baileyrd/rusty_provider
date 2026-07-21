@@ -1,7 +1,10 @@
 mod common;
 
 use futures_util::StreamExt;
-use rp_core::{ChatMessage, Provider, ProviderError, ReasoningConfig, Role, ToolCall};
+use rp_core::{
+    ChatMessage, EmbeddingsInput, EmbeddingsRequest, Provider, ProviderError, ReasoningConfig,
+    Role, ToolCall,
+};
 use rp_providers::GeminiProvider;
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, method, path, query_param};
@@ -886,4 +889,143 @@ async fn chat_leaves_cached_tokens_none_without_any_cache_hit() {
         .expect("chat should succeed");
 
     assert_eq!(resp.usage.unwrap().cached_tokens, None);
+}
+
+// --- embeddings ------------------------------------------------------------
+
+fn embeddings_request(input: EmbeddingsInput) -> EmbeddingsRequest {
+    EmbeddingsRequest {
+        model: "gemini/text-embedding-004".to_string(),
+        input,
+        encoding_format: None,
+        dimensions: None,
+    }
+}
+
+#[tokio::test]
+async fn embeddings_single_input_uses_batchembedcontents_with_one_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/text-embedding-004:batchEmbedContents"))
+        .and(query_param("key", "test-key"))
+        .and(body_partial_json(json!({
+            "requests": [{
+                "model": "models/text-embedding-004",
+                "content": {"parts": [{"text": "hello"}]}
+            }]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": [{"values": [0.5, 0.25]}]
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = embeddings_request(EmbeddingsInput::Single("hello".to_string()));
+    let resp = provider
+        .embeddings(&req, "text-embedding-004", None)
+        .await
+        .expect("embeddings should succeed");
+
+    assert_eq!(resp.model, "gemini/text-embedding-004");
+    assert_eq!(resp.data.len(), 1);
+    assert_eq!(resp.data[0].embedding, vec![0.5, 0.25]);
+    assert_eq!(resp.data[0].index, 0);
+}
+
+#[tokio::test]
+async fn embeddings_batch_input_sends_one_request_per_text_and_preserves_order() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/text-embedding-004:batchEmbedContents"))
+        .and(body_partial_json(json!({
+            "requests": [
+                {"model": "models/text-embedding-004", "content": {"parts": [{"text": "a"}]}},
+                {"model": "models/text-embedding-004", "content": {"parts": [{"text": "b"}]}}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": [{"values": [0.1]}, {"values": [0.2]}]
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = embeddings_request(EmbeddingsInput::Multiple(vec![
+        "a".to_string(),
+        "b".to_string(),
+    ]));
+    let resp = provider
+        .embeddings(&req, "text-embedding-004", None)
+        .await
+        .expect("embeddings should succeed");
+
+    assert_eq!(resp.data.len(), 2);
+    assert_eq!(resp.data[0].index, 0);
+    assert_eq!(resp.data[1].index, 1);
+    assert_eq!(resp.data[1].embedding, vec![0.2]);
+}
+
+#[tokio::test]
+async fn embeddings_response_reports_no_usage_at_all() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/text-embedding-004:batchEmbedContents"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": [{"values": [0.1]}]
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = embeddings_request(EmbeddingsInput::Single("hello".to_string()));
+    let resp = provider
+        .embeddings(&req, "text-embedding-004", None)
+        .await
+        .expect("embeddings should succeed");
+
+    assert_eq!(resp.usage, None);
+}
+
+#[tokio::test]
+async fn embeddings_maps_a_non_success_status_to_a_classified_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/text-embedding-004:batchEmbedContents"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "bad request"}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = embeddings_request(EmbeddingsInput::Single("hello".to_string()));
+    let err = provider
+        .embeddings(&req, "text-embedding-004", None)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProviderError::InvalidRequest(_)));
+}
+
+#[tokio::test]
+async fn embeddings_uses_the_byok_override_key_instead_of_the_configured_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/text-embedding-004:batchEmbedContents"))
+        .and(query_param("key", "byok-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": [{"values": [0.1]}]
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "configured-key");
+    let req = embeddings_request(EmbeddingsInput::Single("hello".to_string()));
+    let resp = provider
+        .embeddings(&req, "text-embedding-004", Some("byok-key"))
+        .await
+        .expect("embeddings should succeed");
+
+    assert_eq!(resp.data.len(), 1);
 }

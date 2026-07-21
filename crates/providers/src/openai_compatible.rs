@@ -8,7 +8,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, MessageContent, Provider, ProviderError, ResponseFormat, Role, Tool, ToolCall,
+    ChunkChoice, EmbeddingData, EmbeddingsInput, EmbeddingsRequest, EmbeddingsResponse,
+    EmbeddingsUsage, MessageContent, Provider, ProviderError, ResponseFormat, Role, Tool, ToolCall,
     ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,38 @@ impl OpenAiCompatibleProvider {
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url)
     }
+
+    fn embeddings_endpoint(&self) -> String {
+        format!("{}/embeddings", self.base_url)
+    }
+}
+
+#[derive(Serialize)]
+struct WireEmbeddingsRequest<'a> {
+    model: &'a str,
+    input: &'a EmbeddingsInput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_format: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct WireEmbeddingsResponse {
+    data: Vec<WireEmbeddingDatum>,
+    usage: WireEmbeddingsUsage,
+}
+
+#[derive(Deserialize)]
+struct WireEmbeddingDatum {
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Deserialize)]
+struct WireEmbeddingsUsage {
+    prompt_tokens: u32,
+    total_tokens: u32,
 }
 
 #[derive(Serialize)]
@@ -374,5 +407,54 @@ impl Provider for OpenAiCompatibleProvider {
         });
 
         Ok(Box::pin(stream))
+    }
+
+    async fn embeddings(
+        &self,
+        req: &EmbeddingsRequest,
+        model: &str,
+        api_key_override: Option<&str>,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        let body = WireEmbeddingsRequest {
+            model,
+            input: &req.input,
+            encoding_format: req.encoding_format.as_deref(),
+            dimensions: req.dimensions,
+        };
+        let resp = self
+            .client
+            .post(self.embeddings_endpoint())
+            .bearer_auth(api_key_override.unwrap_or(&self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            return Err(map_error_response(resp).await);
+        }
+
+        let wire: WireEmbeddingsResponse = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+
+        Ok(EmbeddingsResponse {
+            object: "list",
+            data: wire
+                .data
+                .into_iter()
+                .map(|d| EmbeddingData {
+                    object: "embedding",
+                    embedding: d.embedding,
+                    index: d.index,
+                })
+                .collect(),
+            model: format!("{}/{}", self.name, model),
+            usage: Some(EmbeddingsUsage {
+                prompt_tokens: wire.usage.prompt_tokens,
+                total_tokens: wire.usage.total_tokens,
+            }),
+        })
     }
 }
