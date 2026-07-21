@@ -101,11 +101,14 @@ or more images or audio clips alongside text:
   "messages": [{
     "role": "user",
     "content": [
-      {"type": "text", "text": "What's in this image, and what's said in this clip?"},
+      {"type": "text", "text": "What's in this image, what's said in this clip, and what does this document say?"},
       {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}},
       // or a base64-encoded image inline:
       // {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KG..."}}
-      {"type": "input_audio", "input_audio": {"data": "UklGRi4...", "format": "wav"}}
+      {"type": "input_audio", "input_audio": {"data": "UklGRi4...", "format": "wav"}},
+      {"type": "file", "file": {"file_data": "data:application/pdf;base64,JVBERi0...", "filename": "report.pdf"}}
+      // or a remote PDF, same as image_url:
+      // {"type": "file", "file": {"file_data": "https://example.com/report.pdf"}}
     ]
   }]
 }
@@ -128,13 +131,22 @@ The router translates these into each provider's own format for
   audio — if it's part of a `[[routes]]` fallback chain, the router moves
   on to the next candidate rather than failing the whole request; if
   Anthropic is the only (or last) candidate, the request fails with `400`.
+- `file` (PDF ingestion): Anthropic's native `document` content block,
+  Gemini's `inlineData`/`fileData` parts — the exact same
+  base64-vs-remote-reference split as `image_url` (Gemini's MIME guess
+  here defaults to `application/pdf` instead of an image type). `filename`
+  is carried through to OpenAI-compatible verbatim but has no equivalent
+  on Anthropic/Gemini's native document/file parts, so it's dropped in
+  translation there. There's no parsing-engine selection (native-text vs.
+  OCR) — every provider uses whatever its own API defaults to; this
+  router has no PDF-processing pipeline of its own to pick one.
 
 System, assistant, and tool messages only ever send their plain text to a
-provider — image and audio parts in a non-user role are silently dropped
-rather than translated, since none of the three providers accept either
-modality there. `OpenAiCompatibleProvider` needs no translation for
-either content type — both pass straight through, since this router's
-wire shape already matches OpenAI's.
+provider — image, audio, and file parts in a non-user role are silently
+dropped rather than translated, since none of the three providers accept
+any of those modalities there. `OpenAiCompatibleProvider` needs no
+translation for any of the three content types — all pass straight
+through, since this router's wire shape already matches OpenAI's.
 
 A request can constrain the model's output shape with `response_format`,
 matching the OpenAI convention:

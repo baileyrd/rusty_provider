@@ -8,7 +8,7 @@ pub use provider::{ChatStream, Provider};
 pub use rate_limit::RateLimiter;
 pub use types::{
     CacheControl, ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, Choice,
-    ChunkChoice, ContentPart, FunctionCall, FunctionCallDelta, FunctionDef, ImageUrl, InputAudio,
-    JsonSchemaFormat, MessageContent, ModelInfo, ModelPricing, ProviderPreferences,
+    ChunkChoice, ContentPart, FileData, FunctionCall, FunctionCallDelta, FunctionDef, ImageUrl,
+    InputAudio, JsonSchemaFormat, MessageContent, ModelInfo, ModelPricing, ProviderPreferences,
     ReasoningConfig, ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };

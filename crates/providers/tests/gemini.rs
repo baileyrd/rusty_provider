@@ -391,6 +391,62 @@ async fn chat_sends_audio_content_as_inline_data() {
 }
 
 #[tokio::test]
+async fn chat_sends_inline_file_content_as_inline_data() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "contents": [
+                {"role": "user", "parts": [
+                    {"text": "summarize this document"},
+                    {"inlineData": {"mimeType": "application/pdf", "data": "aGVsbG8="}},
+                ]},
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"parts": [{"text": "a summary"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 5, "totalTokenCount": 25}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_file("gemini-2.0-flash");
+    provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_sends_remote_file_content_as_file_data() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "contents": [
+                {"role": "user", "parts": [
+                    {"text": "summarize this document"},
+                    {"fileData": {"mimeType": "application/pdf", "fileUri": "https://example.com/doc.pdf"}},
+                ]},
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"parts": [{"text": "a summary"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 5, "totalTokenCount": 25}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_remote_file("gemini-2.0-flash");
+    provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
 async fn chat_stream_parses_text_parts() {
     let server = MockServer::start().await;
     let sse_body = concat!(

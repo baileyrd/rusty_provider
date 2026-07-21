@@ -216,10 +216,11 @@ fn build_messages(
 }
 
 /// Translates a message's content into Anthropic content blocks, turning
-/// `image_url` parts into `image` blocks: a `data:<mime>;base64,<data>`
-/// URI becomes a `base64` source, anything else (an `https://` URL) an
-/// `url` source. Errs on `input_audio` parts -- Anthropic's Messages API
-/// has no audio-input support to translate them into.
+/// `image_url` parts into `image` blocks and `file` parts into `document`
+/// blocks: a `data:<mime>;base64,<data>` URI becomes a `base64` source,
+/// anything else (an `https://` URL) a `url` source. Errs on `input_audio`
+/// parts -- Anthropic's Messages API has no audio-input support to
+/// translate them into.
 fn content_to_blocks(content: &MessageContent) -> Result<Vec<Value>, ProviderError> {
     match content {
         MessageContent::Text(text) => Ok(vec![json!({"type": "text", "text": text})]),
@@ -228,6 +229,7 @@ fn content_to_blocks(content: &MessageContent) -> Result<Vec<Value>, ProviderErr
             .map(|part| match part {
                 ContentPart::Text { text } => Ok(json!({"type": "text", "text": text})),
                 ContentPart::ImageUrl { image_url } => Ok(image_block(&image_url.url)),
+                ContentPart::File { file } => Ok(document_block(&file.file_data)),
                 ContentPart::InputAudio { .. } => Err(ProviderError::UnsupportedContent(
                     "Anthropic's Messages API does not support audio input content".to_string(),
                 )),
@@ -245,6 +247,21 @@ fn image_block(url: &str) -> Value {
         None => json!({
             "type": "image",
             "source": {"type": "url", "url": url},
+        }),
+    }
+}
+
+/// Anthropic's native PDF support: a `document` block, using the same
+/// `base64`-vs-`url` source split as `image_block`.
+fn document_block(file_data: &str) -> Value {
+    match parse_data_uri(file_data) {
+        Some((media_type, data)) => json!({
+            "type": "document",
+            "source": {"type": "base64", "media_type": media_type, "data": data},
+        }),
+        None => json!({
+            "type": "document",
+            "source": {"type": "url", "url": file_data},
         }),
     }
 }

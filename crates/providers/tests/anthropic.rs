@@ -266,6 +266,64 @@ async fn chat_sends_image_content_as_a_base64_image_block() {
 }
 
 #[tokio::test]
+async fn chat_sends_inline_file_content_as_a_base64_document_block() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "summarize this document"},
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "aGVsbG8="}},
+                ]},
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "a summary"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 5}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::request_with_file("claude-sonnet-5");
+    provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_sends_remote_file_content_as_a_url_document_block() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "summarize this document"},
+                    {"type": "document", "source": {"type": "url", "url": "https://example.com/doc.pdf"}},
+                ]},
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "a summary"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 5}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::request_with_remote_file("claude-sonnet-5");
+    provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
 async fn chat_rejects_audio_content_without_contacting_the_server() {
     // No Mock is registered on this server at all -- if the adapter tried
     // to make an HTTP request it would get a 404 from wiremock's default
