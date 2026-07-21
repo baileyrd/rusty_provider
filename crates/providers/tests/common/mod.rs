@@ -8,6 +8,7 @@ use rp_core::{
 pub fn simple_request(model: &str) -> ChatRequest {
     ChatRequest {
         model: model.to_string(),
+        models: None,
         messages: vec![ChatMessage::user("hi")],
         temperature: None,
         top_p: None,

@@ -560,12 +560,25 @@ impl Router {
     }
 
     /// Resolve a client-supplied `model` string into an ordered chain of
-    /// (provider, model) pairs: either a configured alias's fallback chain,
-    /// or a single "provider/model" entry.
-    fn resolve_chain(&self, model: &str) -> Result<Vec<(String, String)>, RouterError> {
-        let entries: Vec<String> = match self.routes.get(model) {
-            Some(chain) => chain.clone(),
-            None => vec![model.to_string()],
+    /// (provider, model) pairs. With `fallbacks` non-empty, the chain is an
+    /// ad-hoc `model` followed by each of `fallbacks`, entirely bypassing
+    /// `[[routes]]` alias lookup -- a client-supplied chain for this one
+    /// request rather than an operator-predefined one. Otherwise, the chain
+    /// is either a configured alias's fallback chain, or a single
+    /// "provider/model" entry.
+    fn resolve_chain(
+        &self,
+        model: &str,
+        fallbacks: Option<&[String]>,
+    ) -> Result<Vec<(String, String)>, RouterError> {
+        let entries: Vec<String> = match fallbacks {
+            Some(models) if !models.is_empty() => std::iter::once(model.to_string())
+                .chain(models.iter().cloned())
+                .collect(),
+            _ => match self.routes.get(model) {
+                Some(chain) => chain.clone(),
+                None => vec![model.to_string()],
+            },
         };
 
         entries
@@ -708,7 +721,7 @@ impl Router {
     }
 
     pub async fn dispatch(&self, req: &ChatRequest) -> Result<ChatResponse, RouterError> {
-        let chain = self.resolve_chain(&req.model)?;
+        let chain = self.resolve_chain(&req.model, req.models.as_deref())?;
         let chain = self.apply_preferences(&req.model, chain, req.provider.as_ref())?;
         let mut last_err: Option<RouterError> = None;
 
@@ -797,7 +810,7 @@ impl Router {
     }
 
     pub async fn dispatch_stream(&self, req: &ChatRequest) -> Result<ChatStream, RouterError> {
-        let chain = self.resolve_chain(&req.model)?;
+        let chain = self.resolve_chain(&req.model, req.models.as_deref())?;
         let chain = self.apply_preferences(&req.model, chain, req.provider.as_ref())?;
         let mut last_err: Option<RouterError> = None;
 
@@ -936,6 +949,7 @@ mod tests {
     fn test_request(model: &str) -> ChatRequest {
         ChatRequest {
             model: model.to_string(),
+            models: None,
             messages: vec![ChatMessage::user("hi")],
             temperature: None,
             top_p: None,
@@ -1159,7 +1173,7 @@ mod tests {
 
         assert_eq!(router.route_aliases().collect::<Vec<_>>(), vec!["smart"]);
         assert_eq!(
-            router.resolve_chain("smart").unwrap(),
+            router.resolve_chain("smart", None).unwrap(),
             chain(&[("b", "m2")])
         );
     }
@@ -1479,7 +1493,9 @@ mod tests {
     #[test]
     fn resolve_chain_direct_model_string() {
         let router = test_router(vec![], vec![], vec![], vec![], vec![]);
-        let result = router.resolve_chain("anthropic/claude-sonnet-5").unwrap();
+        let result = router
+            .resolve_chain("anthropic/claude-sonnet-5", None)
+            .unwrap();
         assert_eq!(result, chain(&[("anthropic", "claude-sonnet-5")]));
     }
 
@@ -1492,15 +1508,59 @@ mod tests {
             vec![],
             vec![],
         );
-        let result = router.resolve_chain("smart").unwrap();
+        let result = router.resolve_chain("smart", None).unwrap();
         assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
     }
 
     #[test]
     fn resolve_chain_rejects_model_without_a_slash() {
         let router = test_router(vec![], vec![], vec![], vec![], vec![]);
-        let err = router.resolve_chain("not-a-valid-model").unwrap_err();
+        let err = router.resolve_chain("not-a-valid-model", None).unwrap_err();
         assert!(matches!(err, RouterError::InvalidModel(_)));
+    }
+
+    #[test]
+    fn resolve_chain_with_fallbacks_builds_an_ad_hoc_chain_from_model_plus_fallbacks() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let fallbacks = vec!["openai/m2".to_string(), "gemini/m3".to_string()];
+        let result = router
+            .resolve_chain("anthropic/m1", Some(&fallbacks))
+            .unwrap();
+        assert_eq!(
+            result,
+            chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")])
+        );
+    }
+
+    #[test]
+    fn resolve_chain_with_fallbacks_bypasses_route_alias_lookup_for_model() {
+        // "smart" is a configured alias, but a non-empty `fallbacks` takes
+        // over entirely -- it's treated as a literal "provider/model", not
+        // resolved through `[[routes]]`.
+        let router = test_router(
+            vec![],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let fallbacks = vec!["gemini/m3".to_string()];
+        let err = router.resolve_chain("smart", Some(&fallbacks)).unwrap_err();
+        assert!(matches!(err, RouterError::InvalidModel(_)));
+    }
+
+    #[test]
+    fn resolve_chain_with_empty_fallbacks_falls_back_to_route_alias_lookup() {
+        let router = test_router(
+            vec![],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let empty: Vec<String> = vec![];
+        let result = router.resolve_chain("smart", Some(&empty)).unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
     }
 
     // --- apply_preferences ---------------------------------------------------
@@ -3228,6 +3288,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_falls_back_across_an_ad_hoc_models_list_with_no_configured_route() {
+        // No `[[routes]]` alias at all -- the chain comes entirely from
+        // `model` + `req.models`, proving the ad-hoc list is honored even
+        // when the operator never predefined a fallback chain for it.
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let failing = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: calls_a.clone(),
+        });
+        let succeeding = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_b.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", failing), ("openai", succeeding)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.models = Some(vec!["openai/m2".to_string()]);
+
+        let resp = router
+            .dispatch(&req)
+            .await
+            .expect("should fall through to openai");
+
+        assert_eq!(resp.model, "openai/m2");
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn dispatch_aborts_immediately_on_fatal_error() {
         let calls_a = Arc::new(AtomicUsize::new(0));
         let calls_b = Arc::new(AtomicUsize::new(0));
@@ -3459,7 +3556,7 @@ mod tests {
         // apply_preferences passes the empty chain straight through. Only
         // dispatch's loop-then-fallback-to-InvalidModel actually catches it.
         let router = test_router(vec![], vec![("smart", vec![])], vec![], vec![], vec![]);
-        let chain = router.resolve_chain("smart").unwrap();
+        let chain = router.resolve_chain("smart", None).unwrap();
         assert!(chain.is_empty());
         let chain = router.apply_preferences("smart", chain, None).unwrap();
         assert!(chain.is_empty());
