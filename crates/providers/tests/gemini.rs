@@ -228,6 +228,35 @@ async fn chat_forwards_its_native_sampling_params_camel_cased_but_has_no_field_f
 }
 
 #[tokio::test]
+async fn chat_has_no_wire_field_for_logprobs_and_never_returns_any() {
+    // Gemini's generateContent API has no logprobs equivalent wired up in
+    // this adapter -- no field on GenerationConfig to serialize
+    // `logprobs`/`top_logprobs` into, and the response never populates
+    // `logprobs`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "ok"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_logprobs("gemini-2.0-flash");
+
+    let resp = provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+    assert!(resp.choices[0].logprobs.is_none());
+}
+
+#[tokio::test]
 async fn chat_stream_parses_function_call_delta() {
     let server = MockServer::start().await;
     let sse_body = concat!(

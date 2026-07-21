@@ -89,6 +89,12 @@ struct WireRequest<'a> {
     logit_bias: Option<&'a std::collections::HashMap<String, f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<i64>,
+    /// Matches the OpenAI wire format exactly -- direct passthrough, same
+    /// as `response_format`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_logprobs: Option<u32>,
 }
 
 impl<'a> WireRequest<'a> {
@@ -113,6 +119,8 @@ impl<'a> WireRequest<'a> {
             repetition_penalty: req.repetition_penalty,
             logit_bias: req.logit_bias.as_ref(),
             seed: req.seed,
+            logprobs: req.logprobs,
+            top_logprobs: req.top_logprobs,
         }
     }
 }
@@ -180,6 +188,10 @@ struct WireChoice {
     index: u32,
     message: WireMessage,
     finish_reason: Option<String>,
+    /// Already matches `rp_core::ChoiceLogprobs`'s shape exactly -- direct
+    /// passthrough, same as `response_format` on the request side.
+    #[serde(default)]
+    logprobs: Option<rp_core::ChoiceLogprobs>,
 }
 
 #[derive(Deserialize)]
@@ -204,6 +216,8 @@ struct WireChunkChoice {
     #[serde(default)]
     delta: WireDelta,
     finish_reason: Option<String>,
+    #[serde(default)]
+    logprobs: Option<rp_core::ChoiceLogprobs>,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +282,7 @@ impl Provider for OpenAiCompatibleProvider {
                         cache_control: None,
                     },
                     finish_reason: c.finish_reason,
+                    logprobs: c.logprobs,
                 })
                 .collect(),
             usage: wire.usage.map(Into::into),
@@ -335,6 +350,7 @@ impl Provider for OpenAiCompatibleProvider {
                                 },
                             },
                             finish_reason: c.finish_reason,
+                            logprobs: c.logprobs,
                         })
                         .collect(),
                     usage: wire.usage.map(Into::into),

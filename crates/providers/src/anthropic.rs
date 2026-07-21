@@ -580,6 +580,7 @@ impl Provider for AnthropicProvider {
                     cache_control: None,
                 },
                 finish_reason,
+                logprobs: None,
             }],
             usage: Some(usage_from_wire(&wire.usage)),
             cost_usd: None,
@@ -828,6 +829,7 @@ fn empty_chunk(model: &str, delta: ChatMessageDelta, finish_reason: Option<Strin
             index: 0,
             delta,
             finish_reason,
+            logprobs: None,
         }],
         usage: None,
         cost_usd: None,
@@ -913,6 +915,8 @@ mod tests {
             logit_bias: None,
             seed: None,
             transforms: None,
+            logprobs: None,
+            top_logprobs: None,
         }
     }
 
@@ -1375,6 +1379,8 @@ mod tests {
             logit_bias: None,
             seed: None,
             transforms: None,
+            logprobs: None,
+            top_logprobs: None,
         };
         let err = provider.chat(&req, "claude-sonnet-5").await.unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedContent(_)));

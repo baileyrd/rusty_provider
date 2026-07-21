@@ -113,6 +113,7 @@ fn supported_params(kind: ProviderKind) -> Vec<&'static str> {
             "repetition_penalty",
             "logit_bias",
             "seed",
+            "logprobs",
         ]),
         ProviderKind::Anthropic => params.push("cache_control"),
         ProviderKind::Gemini => params.extend(["frequency_penalty", "presence_penalty", "seed"]),
@@ -163,6 +164,9 @@ fn active_params(req: &ChatRequest) -> Vec<&'static str> {
     }
     if req.seed.is_some() {
         params.push("seed");
+    }
+    if req.logprobs.is_some() {
+        params.push("logprobs");
     }
     if req.messages.iter().any(|m| m.cache_control.is_some()) {
         params.push("cache_control");
@@ -1317,6 +1321,8 @@ mod tests {
             logit_bias: None,
             seed: None,
             transforms: None,
+            logprobs: None,
+            top_logprobs: None,
         }
     }
 
@@ -1374,6 +1380,7 @@ mod tests {
                         index: 0,
                         message: ChatMessage::assistant("ok"),
                         finish_reason: Some("stop".to_string()),
+                        logprobs: None,
                     }],
                     usage: Some(Usage {
                         prompt_tokens: 1,
@@ -1410,6 +1417,7 @@ mod tests {
                                 reasoning: None,
                             },
                             finish_reason: Some("stop".to_string()),
+                            logprobs: None,
                         }],
                         usage: Some(Usage {
                             prompt_tokens: 1,
@@ -1475,6 +1483,7 @@ mod tests {
                     reasoning: None,
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
             usage: Some(Usage {
                 prompt_tokens,
@@ -1999,6 +2008,10 @@ mod tests {
         assert!(openai.contains(&"logit_bias"));
         assert!(!anthropic.contains(&"logit_bias"));
         assert!(!gemini.contains(&"logit_bias"));
+
+        assert!(openai.contains(&"logprobs"));
+        assert!(!anthropic.contains(&"logprobs"));
+        assert!(!gemini.contains(&"logprobs"));
     }
 
     // --- priced_models ---------------------------------------------------
@@ -3481,6 +3494,7 @@ mod tests {
         req.repetition_penalty = Some(1.1);
         req.logit_bias = Some(HashMap::from([("1".to_string(), -1.0)]));
         req.seed = Some(1);
+        req.logprobs = Some(true);
         let params = active_params(&req);
         for expected in [
             "tools",
@@ -3494,6 +3508,7 @@ mod tests {
             "repetition_penalty",
             "logit_bias",
             "seed",
+            "logprobs",
         ] {
             assert!(params.contains(&expected), "missing {expected}");
         }

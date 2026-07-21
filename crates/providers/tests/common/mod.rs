@@ -30,6 +30,8 @@ pub fn simple_request(model: &str) -> ChatRequest {
         logit_bias: None,
         seed: None,
         transforms: None,
+        logprobs: None,
+        top_logprobs: None,
     }
 }
 
@@ -138,6 +140,15 @@ pub fn request_with_remote_file(model: &str) -> ChatRequest {
         reasoning: None,
         cache_control: None,
     }];
+    req
+}
+
+/// Same as [`simple_request`], but with `logprobs`/`top_logprobs` set, for
+/// tests exercising logprobs request/response translation.
+pub fn request_with_logprobs(model: &str) -> ChatRequest {
+    let mut req = simple_request(model);
+    req.logprobs = Some(true);
+    req.top_logprobs = Some(2);
     req
 }
 
