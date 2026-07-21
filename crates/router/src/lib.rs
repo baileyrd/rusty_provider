@@ -31,8 +31,8 @@ use webhook::WebhookNotifier;
 
 use futures::stream::StreamExt;
 use rp_core::{
-    ChatMessage, ChatRequest, ChatResponse, ChatStream, ModelInfo, ModelPricing, Provider,
-    ProviderError, ProviderPreferences, RateLimiter, Usage,
+    ChatMessage, ChatRequest, ChatResponse, ChatStream, EmbeddingsRequest, EmbeddingsResponse,
+    ModelInfo, ModelPricing, Provider, ProviderError, ProviderPreferences, RateLimiter, Usage,
 };
 use rp_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatibleProvider};
 
@@ -1600,6 +1600,64 @@ impl Router {
 
         Err(last_err.unwrap_or_else(|| RouterError::InvalidModel(target_model.clone())))
     }
+
+    /// Resolves `req.model` to a provider chain and dispatches, falling
+    /// back on a retryable error exactly like `dispatch` -- but without
+    /// `dispatch`'s cost/latency/throughput/generation-cache bookkeeping,
+    /// none of which has an established meaning for an embeddings call
+    /// yet (no completion tokens, no `[[pricing]]` entry shape for a
+    /// prompt-only request). Every candidate's outcome is still counted
+    /// via the same `dispatch_attempts_total` metric as `dispatch`, so a
+    /// failing/misconfigured provider is still observable.
+    pub async fn embeddings(
+        &self,
+        req: &EmbeddingsRequest,
+    ) -> Result<EmbeddingsResponse, RouterError> {
+        let chain = self.resolve_chain(&req.model, None)?;
+        let mut last_err: Option<RouterError> = None;
+
+        for (provider_name, model_name) in &chain {
+            let provider = match self.get_provider(provider_name) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(provider = %provider_name, "skipping candidate: {e}");
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "not_configured");
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            if let Err(e) = self.check_outbound_rate_limit(provider_name) {
+                tracing::warn!(provider = %provider_name, model = %model_name, "outbound rate limit hit, falling back: {e}");
+                self.metrics
+                    .record_attempt(provider_name, model_name, "rate_limited");
+                last_err = Some(RouterError::Provider(e));
+                continue;
+            }
+
+            match provider.embeddings(req, model_name, None).await {
+                Ok(resp) => {
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "success");
+                    return Ok(resp);
+                }
+                Err(e) if e.is_retryable() => {
+                    tracing::warn!(provider = %provider_name, model = %model_name, "provider failed, falling back: {e}");
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "retryable_error");
+                    last_err = Some(RouterError::Provider(e));
+                }
+                Err(e) => {
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "error");
+                    return Err(RouterError::Provider(e));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| RouterError::InvalidModel(req.model.clone())))
+    }
 }
 
 #[cfg(test)]
@@ -1609,7 +1667,8 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream;
     use rp_core::{
-        ChatChunk, ChatMessage, ChatMessageDelta, Choice, ChunkChoice, MessageContent, Role,
+        ChatChunk, ChatMessage, ChatMessageDelta, Choice, ChunkChoice, EmbeddingData,
+        EmbeddingsUsage, MessageContent, Role,
     };
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path};
@@ -1828,6 +1887,37 @@ mod tests {
                 _ => Err(self.canned_error()),
             }
         }
+
+        async fn embeddings(
+            &self,
+            req: &EmbeddingsRequest,
+            model: &str,
+            _api_key_override: Option<&str>,
+        ) -> Result<EmbeddingsResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                MockBehavior::Succeed => Ok(EmbeddingsResponse {
+                    object: "list",
+                    data: req
+                        .input
+                        .as_slice()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, _)| EmbeddingData {
+                            object: "embedding",
+                            embedding: vec![0.1, 0.2],
+                            index,
+                        })
+                        .collect(),
+                    model: format!("{}/{model}", self.name),
+                    usage: Some(EmbeddingsUsage {
+                        prompt_tokens: 1,
+                        total_tokens: 1,
+                    }),
+                }),
+                _ => Err(self.canned_error()),
+            }
+        }
     }
 
     /// A `Provider` whose `chat_stream` replays an exact, caller-supplied
@@ -1862,6 +1952,15 @@ mod tests {
         ) -> Result<ChatStream, ProviderError> {
             let chunks = self.chunks.clone();
             Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        }
+
+        async fn embeddings(
+            &self,
+            _req: &EmbeddingsRequest,
+            _model: &str,
+            _api_key_override: Option<&str>,
+        ) -> Result<EmbeddingsResponse, ProviderError> {
+            unreachable!("ScriptedStreamProvider only implements chat_stream")
         }
     }
 
@@ -1946,6 +2045,25 @@ mod tests {
         ) -> Result<ChatStream, ProviderError> {
             *self.seen_key.lock().unwrap() = api_key_override.map(str::to_string);
             Ok(Box::pin(stream::empty::<Result<ChatChunk, ProviderError>>()))
+        }
+
+        async fn embeddings(
+            &self,
+            _req: &EmbeddingsRequest,
+            model: &str,
+            api_key_override: Option<&str>,
+        ) -> Result<EmbeddingsResponse, ProviderError> {
+            *self.seen_key.lock().unwrap() = api_key_override.map(str::to_string);
+            Ok(EmbeddingsResponse {
+                object: "list",
+                data: vec![EmbeddingData {
+                    object: "embedding",
+                    embedding: vec![0.1],
+                    index: 0,
+                }],
+                model: format!("{}/{model}", self.name),
+                usage: None,
+            })
         }
     }
 
@@ -5235,6 +5353,165 @@ mod tests {
             provider.seen_key.lock().unwrap().as_deref(),
             Some("sk-byok-key")
         );
+    }
+
+    // --- embeddings ------------------------------------------------------------
+
+    fn embeddings_request(model: &str, text: &str) -> EmbeddingsRequest {
+        EmbeddingsRequest {
+            model: model.to_string(),
+            input: rp_core::EmbeddingsInput::Single(text.to_string()),
+            encoding_format: None,
+            dimensions: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn embeddings_returns_success_from_the_first_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = test_router(vec![("openai", mock)], vec![], vec![], vec![], vec![]);
+
+        let resp = router
+            .embeddings(&embeddings_request("openai/text-embedding-3-small", "hi"))
+            .await
+            .expect("embeddings should succeed");
+
+        assert_eq!(resp.model, "openai/text-embedding-3-small");
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn embeddings_resolves_a_configured_route_alias_like_dispatch_does() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = test_router(
+            vec![("openai", mock)],
+            vec![("embed", vec!["openai/text-embedding-3-small"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let resp = router
+            .embeddings(&embeddings_request("embed", "hi"))
+            .await
+            .expect("embeddings should succeed");
+
+        assert_eq!(resp.model, "openai/text-embedding-3-small");
+    }
+
+    #[tokio::test]
+    async fn embeddings_falls_back_to_the_next_candidate_on_a_retryable_error() {
+        // Anthropic has no embeddings API -- UnsupportedFeature is
+        // retryable, so a chain naming it alongside a real embeddings
+        // provider should fall through rather than failing outright.
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let unsupported = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: calls_a.clone(),
+        });
+        let succeeding = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_b.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", unsupported), ("openai", succeeding)],
+            vec![(
+                "embed",
+                vec!["anthropic/claude-sonnet-5", "openai/text-embedding-3-small"],
+            )],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let resp = router
+            .embeddings(&embeddings_request("embed", "hi"))
+            .await
+            .expect("should fall through to openai");
+
+        assert_eq!(resp.model, "openai/text-embedding-3-small");
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn embeddings_aborts_immediately_on_a_fatal_error() {
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let failing = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::FailFatal,
+            calls: calls_a.clone(),
+        });
+        let never_called = Arc::new(MockProvider {
+            name: "gemini".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_b.clone(),
+        });
+        let router = test_router(
+            vec![("openai", failing), ("gemini", never_called)],
+            vec![(
+                "embed",
+                vec!["openai/text-embedding-3-small", "gemini/text-embedding-004"],
+            )],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let err = router
+            .embeddings(&embeddings_request("embed", "hi"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RouterError::Provider(ProviderError::InvalidRequest(_))
+        ));
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn embeddings_skips_a_chain_entry_with_no_registered_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let configured = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = test_router(
+            vec![("openai", configured)],
+            vec![(
+                "embed",
+                vec!["anthropic/m1", "openai/text-embedding-3-small"],
+            )],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let resp = router
+            .embeddings(&embeddings_request("embed", "hi"))
+            .await
+            .expect("should fall through to the configured provider");
+
+        assert_eq!(resp.model, "openai/text-embedding-3-small");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     // --- dispatch_stream usage instrumentation ------------------------------

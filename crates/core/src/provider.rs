@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use crate::error::ProviderError;
-use crate::types::{ChatChunk, ChatRequest, ChatResponse};
+use crate::types::{ChatChunk, ChatRequest, ChatResponse, EmbeddingsRequest, EmbeddingsResponse};
 
 pub type ChatStream = BoxStream<'static, Result<ChatChunk, ProviderError>>;
 
@@ -33,4 +33,16 @@ pub trait Provider: Send + Sync {
         model: &str,
         api_key_override: Option<&str>,
     ) -> Result<ChatStream, ProviderError>;
+
+    /// Embeds `req.input` into vector(s). A provider with no embeddings
+    /// API at all (Anthropic) returns
+    /// `Err(ProviderError::UnsupportedFeature(_))` -- retryable, so a
+    /// fallback chain moves on to a candidate that does support it,
+    /// rather than failing the whole request outright.
+    async fn embeddings(
+        &self,
+        req: &EmbeddingsRequest,
+        model: &str,
+        api_key_override: Option<&str>,
+    ) -> Result<EmbeddingsResponse, ProviderError>;
 }

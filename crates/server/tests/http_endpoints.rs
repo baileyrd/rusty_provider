@@ -2220,3 +2220,150 @@ async fn admin_delete_client_is_404_for_an_unknown_client() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+// --- embeddings --------------------------------------------------------------
+
+#[tokio::test]
+async fn embeddings_success_roundtrips_through_a_mocked_provider() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"object": "embedding", "embedding": [0.5, 0.25], "index": 0}],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 2, "total_tokens": 2}
+        })))
+        .mount(&server)
+        .await;
+
+    let key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&key_var, "test-key");
+    let config = format!(
+        r#"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{key_var}"
+        "#,
+        server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/embeddings"))
+        .json(&json!({
+            "model": "openai/text-embedding-3-small",
+            "input": "hello"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["model"], "openai/text-embedding-3-small");
+    assert_eq!(body["data"][0]["embedding"], json!([0.5, 0.25]));
+    assert_eq!(body["usage"]["prompt_tokens"], 2);
+}
+
+#[tokio::test]
+async fn embeddings_falls_back_past_a_provider_with_no_embeddings_support() {
+    // Anthropic has no embeddings API at all -- its adapter always
+    // returns UnsupportedFeature (retryable), so a chain naming it ahead
+    // of a real embeddings provider should still succeed via fallback.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"object": "embedding", "embedding": [0.1], "index": 0}],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 1, "total_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let anthropic_key_var = unique_env_var("ANTHROPIC_KEY");
+    std::env::set_var(&anthropic_key_var, "test-key");
+    let openai_key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&openai_key_var, "test-key");
+    let config = format!(
+        r#"
+        [providers.anthropic]
+        kind = "anthropic"
+        base_url = "http://127.0.0.1:1"
+        api_key_env = "{anthropic_key_var}"
+
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{openai_key_var}"
+
+        [[routes]]
+        alias = "embed"
+        chain = ["anthropic/claude-sonnet-5", "openai/text-embedding-3-small"]
+        "#,
+        server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/embeddings"))
+        .json(&json!({"model": "embed", "input": "hello"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["model"], "openai/text-embedding-3-small");
+}
+
+#[tokio::test]
+async fn embeddings_rejects_missing_or_wrong_key_and_accepts_correct_one() {
+    let key_var = unique_env_var("SERVER_API_KEY");
+    std::env::set_var(&key_var, "s3cret");
+    let config = format!(
+        r#"
+        providers = {{}}
+
+        [server]
+        api_key_env = "{key_var}"
+        "#
+    );
+    let base_url = spawn_app(&config).await;
+    let client = reqwest::Client::new();
+    let body = json!({"model": "openai/text-embedding-3-small", "input": "hi"});
+
+    let no_auth = client
+        .post(format!("{base_url}/v1/embeddings"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_auth.status(), 401);
+
+    let wrong_key = client
+        .post(format!("{base_url}/v1/embeddings"))
+        .bearer_auth("nope")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_key.status(), 401);
+}
+
+#[tokio::test]
+async fn embeddings_maps_an_unconfigured_provider_to_424() {
+    let base_url = spawn_app("providers = {}").await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/embeddings"))
+        .json(&json!({"model": "openai/text-embedding-3-small", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 424);
+}

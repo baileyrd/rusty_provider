@@ -11,8 +11,9 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, ContentPart, FunctionCallDelta, InputAudio, MessageContent, Provider,
-    ProviderError, ReasoningConfig, ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
+    ChunkChoice, ContentPart, EmbeddingData, EmbeddingsRequest, EmbeddingsResponse,
+    FunctionCallDelta, InputAudio, MessageContent, Provider, ProviderError, ReasoningConfig,
+    ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -663,6 +664,98 @@ impl Provider for GeminiProvider {
 
         Ok(Box::pin(stream))
     }
+
+    /// Uses `batchEmbedContents` unconditionally, even for a single input
+    /// -- Gemini accepts a one-element `requests` array there just as
+    /// well as `embedContent` would, so this avoids a second wire shape
+    /// and branch for what would otherwise be the `EmbeddingsInput::Single`
+    /// case.
+    async fn embeddings(
+        &self,
+        req: &EmbeddingsRequest,
+        model: &str,
+        api_key_override: Option<&str>,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        let model_path = format!("models/{model}");
+        let requests: Vec<WireEmbedRequestItem> = req
+            .input
+            .as_slice()
+            .into_iter()
+            .map(|text| WireEmbedRequestItem {
+                model: &model_path,
+                content: WireEmbedContent {
+                    parts: vec![WireEmbedPart { text }],
+                },
+            })
+            .collect();
+
+        let resp = self
+            .client
+            .post(self.endpoint(model, "batchEmbedContents"))
+            .query(&[("key", api_key_override.unwrap_or(self.api_key.as_str()))])
+            .json(&WireBatchEmbedRequest { requests })
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            return Err(crate::http::map_error_response(resp).await);
+        }
+
+        let wire: WireBatchEmbedResponse = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+
+        Ok(EmbeddingsResponse {
+            object: "list",
+            data: wire
+                .embeddings
+                .into_iter()
+                .enumerate()
+                .map(|(index, e)| EmbeddingData {
+                    object: "embedding",
+                    embedding: e.values,
+                    index,
+                })
+                .collect(),
+            model: format!("gemini/{model}"),
+            // batchEmbedContents/embedContent report no token count at
+            // all, unlike generateContent's usageMetadata.
+            usage: None,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct WireEmbedRequestItem<'a> {
+    model: &'a str,
+    content: WireEmbedContent<'a>,
+}
+
+#[derive(Serialize)]
+struct WireEmbedContent<'a> {
+    parts: Vec<WireEmbedPart<'a>>,
+}
+
+#[derive(Serialize)]
+struct WireEmbedPart<'a> {
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct WireBatchEmbedRequest<'a> {
+    requests: Vec<WireEmbedRequestItem<'a>>,
+}
+
+#[derive(Deserialize)]
+struct WireBatchEmbedResponse {
+    embeddings: Vec<WireEmbedding>,
+}
+
+#[derive(Deserialize)]
+struct WireEmbedding {
+    values: Vec<f32>,
 }
 
 #[cfg(test)]

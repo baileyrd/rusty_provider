@@ -7,7 +7,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::{stream, StreamExt};
-use rp_core::{ChatRequest, ModelInfo, RateLimitStatus};
+use rp_core::{ChatRequest, EmbeddingsRequest, ModelInfo, RateLimitStatus};
 use rp_router::{BudgetPeriod, ClientConfig, ClientRole, ProviderStats, UsageStats};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1165,6 +1165,39 @@ pub async fn chat_completions(
     }
 
     let mut resp = chat_completions_dispatch(&state, &headers, req).await;
+    if let Some(status) = &rate_limit_status {
+        apply_rate_limit_headers(&mut resp, status);
+    }
+    resp
+}
+
+/// `POST /v1/embeddings` -- same auth and inbound rate-limiting as
+/// `chat_completions`, but dispatches straight to `Router::embeddings`
+/// rather than the chat pipeline: no preset/guardrails/moderation/
+/// web-search/budget stages apply here, since none of those have an
+/// established meaning for an embeddings call yet.
+pub async fn embeddings(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<EmbeddingsRequest>,
+) -> Response {
+    if let Some(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+
+    let mut rate_limit_status = None;
+    if let Some((identity, rpm)) = resolve_rate_limit(&state, &headers, addr) {
+        match state.rate_limiter.check(&identity, rpm) {
+            Ok(status) => rate_limit_status = Some(status),
+            Err(status) => return rate_limited_response(&state, &identity, &status),
+        }
+    }
+
+    let mut resp = match state.router.embeddings(&req).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => router_error_response(e),
+    };
     if let Some(status) = &rate_limit_status {
         apply_rate_limit_headers(&mut resp, status);
     }

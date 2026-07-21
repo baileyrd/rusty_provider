@@ -21,6 +21,7 @@ pub fn build_app(state: AppState) -> AxumRouter {
         .route("/v1/generation", get(routes::generation))
         .route("/metrics", get(routes::metrics))
         .route("/v1/chat/completions", post(routes::chat_completions))
+        .route("/v1/embeddings", post(routes::embeddings))
         .route(
             "/v1/admin/clients",
             get(routes::admin_list_clients).post(routes::admin_create_client),

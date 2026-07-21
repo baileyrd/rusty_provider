@@ -510,6 +510,36 @@ sets `logprobs` and also sets `provider.require_parameters: true` will
 correctly drop Anthropic/Gemini candidates from the chain, same as any
 other field they don't support.
 
+### `POST /v1/embeddings`
+
+Same request/response shape as OpenAI's embeddings endpoint — `model` is
+"provider/model" or a `[[routes]]` alias, exactly like
+`/v1/chat/completions`, and `input` accepts either a single string or a
+batch (`string[]`):
+
+```sh
+curl http://localhost:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/text-embedding-3-small",
+    "input": "Say hi in one word."
+  }'
+```
+
+Only OpenAI-compatible backends and Gemini (via `batchEmbedContents`)
+support embeddings — Anthropic has no embeddings API at all, so an
+Anthropic candidate in a fallback chain always fails over to the next
+entry rather than erroring the whole request, the same
+`ProviderError::UnsupportedFeature` pattern used elsewhere for a
+provider that can't represent part of a request. Unlike
+`/v1/chat/completions`, this endpoint dispatches straight to the
+resolved provider chain with plain auth and inbound rate-limiting —
+none of `[[presets]]`, `[[guardrails]]`, `[moderation]`, `[web_search]`,
+or spend budgets apply here, since none of those have an established
+meaning for a prompt-only, no-completion-tokens request yet. `usage` is
+`null` for Gemini, which reports no token count for embeddings calls at
+all.
+
 ### `GET /v1/models`
 
 Lists configured route aliases, `provider/*` for every provider with a

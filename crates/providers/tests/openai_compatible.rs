@@ -1,7 +1,7 @@
 mod common;
 
 use futures_util::StreamExt;
-use rp_core::{Provider, ProviderError, ReasoningConfig};
+use rp_core::{EmbeddingsInput, EmbeddingsRequest, Provider, ProviderError, ReasoningConfig};
 use rp_providers::OpenAiCompatibleProvider;
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path};
@@ -1011,4 +1011,134 @@ async fn chat_leaves_cached_tokens_none_without_prompt_tokens_details() {
         .expect("chat should succeed");
 
     assert_eq!(resp.usage.unwrap().cached_tokens, None);
+}
+
+// --- embeddings ------------------------------------------------------------
+
+fn embeddings_request(input: EmbeddingsInput) -> EmbeddingsRequest {
+    EmbeddingsRequest {
+        model: "openai/text-embedding-3-small".to_string(),
+        input,
+        encoding_format: None,
+        dimensions: None,
+    }
+}
+
+#[tokio::test]
+async fn embeddings_success_sends_correct_request_and_parses_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("Authorization", "Bearer test-key"))
+        .and(body_partial_json(
+            json!({"model": "text-embedding-3-small", "input": "hello"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"object": "embedding", "embedding": [0.5, 0.25], "index": 0}],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 3, "total_tokens": 3}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = embeddings_request(EmbeddingsInput::Single("hello".to_string()));
+    let resp = provider
+        .embeddings(&req, "text-embedding-3-small", None)
+        .await
+        .expect("embeddings should succeed");
+
+    // "provider/model", not the raw model the mock echoed back.
+    assert_eq!(resp.model, "openai/text-embedding-3-small");
+    assert_eq!(resp.data.len(), 1);
+    assert_eq!(resp.data[0].embedding, vec![0.5, 0.25]);
+    assert_eq!(resp.data[0].index, 0);
+    let usage = resp.usage.expect("usage should be present");
+    assert_eq!(usage.prompt_tokens, 3);
+    assert_eq!(usage.total_tokens, 3);
+}
+
+#[tokio::test]
+async fn embeddings_forwards_a_batch_input_and_encoding_format_dimensions_verbatim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(body_partial_json(json!({
+            "input": ["a", "b"],
+            "encoding_format": "float",
+            "dimensions": 256
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {"object": "embedding", "embedding": [0.1], "index": 0},
+                {"object": "embedding", "embedding": [0.2], "index": 1}
+            ],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 2, "total_tokens": 2}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = EmbeddingsRequest {
+        model: "openai/text-embedding-3-small".to_string(),
+        input: EmbeddingsInput::Multiple(vec!["a".to_string(), "b".to_string()]),
+        encoding_format: Some("float".to_string()),
+        dimensions: Some(256),
+    };
+    let resp = provider
+        .embeddings(&req, "text-embedding-3-small", None)
+        .await
+        .expect("embeddings should succeed");
+
+    assert_eq!(resp.data.len(), 2);
+    assert_eq!(resp.data[1].index, 1);
+}
+
+#[tokio::test]
+async fn embeddings_maps_a_non_success_status_to_a_classified_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": {"message": "invalid api key"}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = embeddings_request(EmbeddingsInput::Single("hello".to_string()));
+    let err = provider
+        .embeddings(&req, "text-embedding-3-small", None)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProviderError::Auth(_)));
+}
+
+#[tokio::test]
+async fn embeddings_uses_the_byok_override_key_instead_of_the_configured_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("Authorization", "Bearer byok-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"object": "embedding", "embedding": [0.1], "index": 0}],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 1, "total_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "configured-key");
+    let req = embeddings_request(EmbeddingsInput::Single("hello".to_string()));
+    let resp = provider
+        .embeddings(&req, "text-embedding-3-small", Some("byok-key"))
+        .await
+        .expect("embeddings should succeed");
+
+    assert_eq!(resp.data.len(), 1);
 }
