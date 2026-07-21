@@ -65,3 +65,31 @@ chain = [
     "together/meta-llama/Llama-3.3-70B-Instruct-Turbo",
     "fireworks/accounts/fireworks/models/llama-v3p3-70b-instruct",
 ]
+
+# --- Pricing (optional) ------------------------------------------------------
+# Static, operator-maintained prompt-token pricing (USD per million tokens),
+# keyed by "provider/model" to match `[[routes]]` chain entries. This is only
+# consulted when a request sets `"provider": {"sort": "price"}` — it's not a
+# live pricing feed, so keep these numbers current yourself. Entries with no
+# pricing row sort last. Figures below are illustrative, not guaranteed
+# current — check each provider's own pricing page.
+
+[[pricing]]
+model = "anthropic/claude-sonnet-5"
+prompt_per_million = 3.0
+completion_per_million = 15.0
+
+[[pricing]]
+model = "openai/gpt-4o"
+prompt_per_million = 2.5
+completion_per_million = 10.0
+
+[[pricing]]
+model = "gemini/gemini-2.0-flash"
+prompt_per_million = 0.1
+completion_per_million = 0.4
+
+[[pricing]]
+model = "groq/llama-3.3-70b-versatile"
+prompt_per_million = 0.59
+completion_per_million = 0.79

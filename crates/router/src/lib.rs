@@ -4,19 +4,23 @@ mod error;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub use config::{Config, ProviderConfig, ProviderKind, RouteAlias, ServerConfig};
+pub use config::{Config, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig};
 pub use error::RouterError;
 
-use rp_core::{ChatRequest, ChatResponse, ChatStream, Provider};
+use rp_core::{ChatRequest, ChatResponse, ChatStream, Provider, ProviderPreferences};
 use rp_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatibleProvider};
 
 /// Holds every provider adapter that could be built from config (i.e. its
-/// API key env var was set), plus the named fallback-chain aliases. Model
-/// strings are resolved to a chain of (provider, model) pairs and tried in
-/// order, falling back on retryable errors (rate limits, timeouts, 5xxs).
+/// API key env var was set), the named fallback-chain aliases, and static
+/// per-model pricing (used only for `provider.sort: "price"` requests).
+/// Model strings are resolved to a chain of (provider, model) pairs and
+/// tried in order, falling back on retryable errors (rate limits,
+/// timeouts, 5xxs).
 pub struct Router {
     providers: HashMap<String, Arc<dyn Provider>>,
     routes: HashMap<String, Vec<String>>,
+    /// "provider/model" -> prompt price per million tokens.
+    pricing: HashMap<String, f64>,
 }
 
 impl Router {
@@ -52,7 +56,17 @@ impl Router {
             .map(|r| (r.alias.clone(), r.chain.clone()))
             .collect();
 
-        Self { providers, routes }
+        let pricing = config
+            .pricing
+            .iter()
+            .map(|p| (p.model.clone(), p.prompt_per_million))
+            .collect();
+
+        Self {
+            providers,
+            routes,
+            pricing,
+        }
     }
 
     pub fn configured_providers(&self) -> impl Iterator<Item = &str> {
@@ -83,6 +97,41 @@ impl Router {
             .collect()
     }
 
+    /// Apply a request's `provider.only`/`provider.ignore`/`provider.sort`
+    /// constraints to a resolved chain, in that order: filter, then sort.
+    fn apply_preferences(
+        &self,
+        model: &str,
+        mut chain: Vec<(String, String)>,
+        prefs: Option<&ProviderPreferences>,
+    ) -> Result<Vec<(String, String)>, RouterError> {
+        let Some(prefs) = prefs else { return Ok(chain) };
+
+        if let Some(only) = &prefs.only {
+            chain.retain(|(provider, _)| only.iter().any(|p| p == provider));
+        }
+        if let Some(ignore) = &prefs.ignore {
+            chain.retain(|(provider, _)| !ignore.iter().any(|p| p == provider));
+        }
+        if chain.is_empty() {
+            return Err(RouterError::NoEligibleProvider(model.to_string()));
+        }
+
+        if prefs.sort.as_deref() == Some("price") {
+            chain.sort_by(|a, b| {
+                let price_of = |entry: &(String, String)| {
+                    self.pricing
+                        .get(&format!("{}/{}", entry.0, entry.1))
+                        .copied()
+                        .unwrap_or(f64::MAX)
+                };
+                price_of(a).total_cmp(&price_of(b))
+            });
+        }
+
+        Ok(chain)
+    }
+
     fn get_provider(&self, name: &str) -> Result<&Arc<dyn Provider>, RouterError> {
         self.providers
             .get(name)
@@ -91,6 +140,7 @@ impl Router {
 
     pub async fn dispatch(&self, req: &ChatRequest) -> Result<ChatResponse, RouterError> {
         let chain = self.resolve_chain(&req.model)?;
+        let chain = self.apply_preferences(&req.model, chain, req.provider.as_ref())?;
         let mut last_err: Option<RouterError> = None;
 
         for (provider_name, model_name) in &chain {
@@ -118,6 +168,7 @@ impl Router {
 
     pub async fn dispatch_stream(&self, req: &ChatRequest) -> Result<ChatStream, RouterError> {
         let chain = self.resolve_chain(&req.model)?;
+        let chain = self.apply_preferences(&req.model, chain, req.provider.as_ref())?;
         let mut last_err: Option<RouterError> = None;
 
         for (provider_name, model_name) in &chain {

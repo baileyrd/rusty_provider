@@ -9,6 +9,9 @@ pub enum RouterError {
     #[error("provider \"{0}\" is unknown or not configured (missing API key?)")]
     ProviderNotConfigured(String),
 
+    #[error("no provider for \"{0}\" survives the request's provider.only/ignore filter")]
+    NoEligibleProvider(String),
+
     #[error(transparent)]
     Provider(#[from] ProviderError),
 }
@@ -18,6 +21,7 @@ impl RouterError {
         match self {
             RouterError::InvalidModel(_) => 400,
             RouterError::ProviderNotConfigured(_) => 424,
+            RouterError::NoEligibleProvider(_) => 400,
             RouterError::Provider(e) => e.status_code(),
         }
     }

@@ -139,6 +139,31 @@ pub struct ChatRequest {
     /// have a slightly different vocabulary here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// Constrains/orders which providers in a resolved fallback chain the
+    /// router is allowed to try, à la OpenRouter's `provider` request field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderPreferences>,
+}
+
+/// Per-request routing constraints, applied to a resolved "provider/model"
+/// chain (whether that came from a direct `"provider/model"` request or a
+/// config route alias) before the router tries any of it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderPreferences {
+    /// If set, only these provider names (matching config keys, e.g.
+    /// `"anthropic"`) are eligible; everything else is dropped from the
+    /// chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<String>>,
+    /// Provider names to drop from the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<Vec<String>>,
+    /// `"price"` stable-sorts the remaining chain ascending by the
+    /// prompt-token price configured for each "provider/model" entry in
+    /// `[[pricing]]`; entries with no configured price sort last. Any
+    /// other value (or unset) leaves the chain in its configured order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
 }
 
 impl ChatRequest {
