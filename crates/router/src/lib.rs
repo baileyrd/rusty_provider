@@ -827,6 +827,154 @@ mod tests {
     }
 
     #[test]
+    fn apply_preferences_price_sort_orders_three_or_more_entries_correctly() {
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![
+                ("anthropic/m1", 3.0, 15.0),
+                ("openai/m2", 1.0, 5.0),
+                ("gemini/m3", 2.0, 4.0),
+            ],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            chain(&[("openai", "m2"), ("gemini", "m3"), ("anthropic", "m1")])
+        );
+    }
+
+    #[test]
+    fn apply_preferences_price_sort_puts_unpriced_entries_last() {
+        // Only "openai/m2" has a configured price; "anthropic/m1" and
+        // "gemini/m3" have none and should sort after it, in their
+        // original relative order (stable sort, both tied at f64::MAX).
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![("openai/m2", 1.0, 5.0)],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            chain(&[("openai", "m2"), ("anthropic", "m1"), ("gemini", "m3")])
+        );
+    }
+
+    #[test]
+    fn apply_preferences_price_sort_with_all_unpriced_preserves_original_order() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn apply_preferences_price_sort_ranks_by_prompt_price_only_ignoring_completion_price() {
+        // "anthropic/m1" has a far higher completion price but a lower
+        // prompt price -- sort:"price" only ever consults prompt_per_million.
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![("anthropic/m1", 1.0, 100.0), ("openai/m2", 2.0, 1.0)],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("openai", "m2"), ("anthropic", "m1")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
+    }
+
+    #[test]
+    fn apply_preferences_price_sort_is_stable_for_equal_prices() {
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![("anthropic/m1", 1.0, 1.0), ("openai/m2", 1.0, 1.0)],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(result, input, "tied prices should preserve original order");
+    }
+
+    #[test]
+    fn apply_preferences_price_sort_applies_after_only_filter() {
+        // A denied-by-filter provider must not influence the sorted output,
+        // even if it would otherwise be the cheapest.
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![
+                ("anthropic/m1", 3.0, 15.0),
+                ("openai/m2", 1.0, 5.0),
+                ("gemini/m3", 0.1, 0.4),
+            ],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            only: Some(vec!["anthropic".to_string(), "openai".to_string()]),
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
     fn apply_preferences_sorts_ascending_by_latency() {
         let router = test_router(vec![], vec![], vec![], vec![], vec![]);
         router
