@@ -166,6 +166,15 @@ pub enum BudgetPeriod {
     /// Never resets — a lifetime cap on this client's total tracked spend.
     #[default]
     Total,
+    /// Resets to zero at the start of each calendar day (UTC midnight).
+    Daily,
+    /// Resets to zero every 7 days, counted from the Unix epoch
+    /// (1970-01-01T00:00:00Z, a Thursday) -- not aligned to any particular
+    /// weekday like a calendar Monday/Sunday week. A fixed 7-day cadence
+    /// rather than calendar-week alignment, since the latter would need an
+    /// operator-configurable "which day does the week start on" that
+    /// nothing else here has a reason to need.
+    Weekly,
     /// Resets to zero at the start of each calendar month (server wall
     /// clock, UTC).
     Monthly,
@@ -594,6 +603,30 @@ mod tests {
         .unwrap();
         assert_eq!(config.clients[0].budget_usd, Some(25.0));
         assert_eq!(config.clients[0].budget_period, BudgetPeriod::Monthly);
+    }
+
+    #[test]
+    fn client_budget_period_accepts_daily_and_weekly() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[clients]]
+            name = "acme"
+            api_key_env = "ACME_KEY"
+            requests_per_minute = 60
+            budget_period = "daily"
+
+            [[clients]]
+            name = "beta"
+            api_key_env = "BETA_KEY"
+            requests_per_minute = 60
+            budget_period = "weekly"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.clients[0].budget_period, BudgetPeriod::Daily);
+        assert_eq!(config.clients[1].budget_period, BudgetPeriod::Weekly);
     }
 
     #[test]

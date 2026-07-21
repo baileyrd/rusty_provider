@@ -703,7 +703,7 @@ name = "hermes"
 api_key_env = "CLIENT_HERMES_API_KEY"
 requests_per_minute = 60
 budget_usd = 50.0
-budget_period = "monthly"   # or "total" (the default) for a lifetime cap
+budget_period = "monthly"   # or "total" (default) / "daily" / "weekly"
 ```
 
 Spend is tracked from the same `cost_usd` this router already computes for
@@ -719,6 +719,12 @@ its budget is still allowed to complete — the check happens before
 dispatch, using spend as of the *start* of the request, not a mid-flight
 cutoff — so the client's actual spend can end up somewhat over
 `budget_usd` by the time it's cut off, not capped exactly at it.
+
+`"daily"` resets at each UTC calendar-day boundary (midnight UTC).
+`"weekly"` resets every 7 days counted from the Unix epoch
+(1970-01-01T00:00:00Z, a Thursday) — a fixed 7-day cadence, not aligned to
+any particular weekday like a calendar Monday-start or Sunday-start week.
+`"monthly"` resets at each UTC calendar-month boundary, same as before.
 
 This only applies to named `[[clients]]`, the same as the rate-limiting
 client bucket — there's no budget for the IP-bucketed fallback used by
@@ -795,7 +801,7 @@ admin_key_env = "RUSTY_PROVIDER_ADMIN_KEY"
     "name": "acme",
     "requests_per_minute": 60,
     "budget_usd": 10.0,       // optional, omit for unrestricted
-    "budget_period": "monthly", // optional, "total" (default) or "monthly"
+    "budget_period": "monthly", // optional, "total" (default) / "daily" / "weekly" / "monthly"
     "api_key": "..."          // optional -- omit to have the server generate one
   }
   ```
