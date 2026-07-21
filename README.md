@@ -81,6 +81,7 @@ A request can also constrain and order the resolved fallback chain with a
   "provider": {
     "only": ["anthropic", "openai"],   // drop every other candidate in the chain
     "ignore": ["openai"],              // and then drop these too
+    "zdr": true,                       // then drop any provider not marked zdr in config
     "sort": "price"                    // stable-sort what's left, cheapest prompt price first
   },
   "messages": [{"role": "user", "content": "..."}]
@@ -91,6 +92,10 @@ A request can also constrain and order the resolved fallback chain with a
   keys (e.g. `"anthropic"`, `"groq"`) — `only` is applied first, then
   `ignore`. If nothing survives, the request fails fast with `400` rather
   than silently falling through to an unfiltered chain.
+- `zdr: true` drops any provider not marked `zdr = true` in
+  `[providers.*]` config. That flag is self-declared by the operator —
+  the router trusts it and never verifies it against the provider, so it's
+  only as accurate as your own config.
 - `sort: "price"` stable-sorts the remaining candidates ascending by the
   prompt-token price configured in `[[pricing]]` (see `config.example.toml`)
   — entries with no configured price sort last, keeping their relative
@@ -110,7 +115,9 @@ Liveness check.
 See `config.example.toml`. Provider API keys are always read from
 environment variables (named by `api_key_env`) — never stored in the
 config file itself. `[[pricing]]` entries are optional and only affect
-requests that opt into `"provider": {"sort": "price"}`.
+requests that opt into `"provider": {"sort": "price"}`; a provider's `zdr`
+flag is optional and only affects requests that opt into
+`"provider": {"zdr": true}`.
 
 ## Using with local agent tools (Hermes, OpenClaw, etc.)
 

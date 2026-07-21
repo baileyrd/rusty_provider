@@ -50,6 +50,12 @@ pub struct ProviderConfig {
     /// Name of the environment variable holding the API key for this
     /// provider (not the key itself — keeps secrets out of the config file).
     pub api_key_env: String,
+    /// Whether the operator has a Zero Data Retention agreement with this
+    /// provider. Self-declared — the router trusts this flag and never
+    /// verifies it against the provider itself. Only consulted for
+    /// requests that set `"provider": {"zdr": true}`.
+    #[serde(default)]
+    pub zdr: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
