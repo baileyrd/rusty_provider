@@ -851,6 +851,175 @@ mod tests {
     }
 
     #[test]
+    fn apply_preferences_ignore_alone_can_empty_the_chain_and_errors() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            ignore: Some(vec!["anthropic".to_string()]),
+            ..Default::default()
+        };
+        let err = router
+            .apply_preferences("smart", chain(&[("anthropic", "m1")]), Some(&prefs))
+            .unwrap_err();
+        assert!(matches!(err, RouterError::NoEligibleProvider(_)));
+    }
+
+    #[test]
+    fn apply_preferences_only_and_ignore_naming_the_same_provider_empties_the_chain() {
+        // "openai" survives `only` but is then dropped by `ignore` --
+        // ignore is applied after only, so it wins even when they name the
+        // exact same provider.
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            only: Some(vec!["openai".to_string()]),
+            ignore: Some(vec!["openai".to_string()]),
+            ..Default::default()
+        };
+        let err = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap_err();
+        assert!(matches!(err, RouterError::NoEligibleProvider(_)));
+    }
+
+    #[test]
+    fn apply_preferences_only_and_ignore_combine_as_independent_successive_filters() {
+        // `only` keeps {anthropic, openai}; `ignore` then separately drops
+        // "openai". "gemini" was never eligible in the first place.
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            only: Some(vec!["anthropic".to_string(), "openai".to_string()]),
+            ignore: Some(vec!["openai".to_string()]),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_ignore_sort_price_applies_the_filter_before_sorting() {
+        // "gemini" is the cheapest of the three but is dropped by `ignore`
+        // before sort:"price" ever sees it.
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![
+                ("anthropic/m1", 3.0, 15.0),
+                ("openai/m2", 1.0, 5.0),
+                ("gemini/m3", 0.1, 0.4),
+            ],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            ignore: Some(vec!["gemini".to_string()]),
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_ignore_sort_latency_applies_the_filter_before_sorting() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        {
+            let mut latency = router.latency.write().unwrap();
+            latency.insert("anthropic/m1".to_string(), 2000.0);
+            latency.insert("openai/m2".to_string(), 500.0);
+            // Fastest of all three, but dropped by `ignore` first.
+            latency.insert("gemini/m3".to_string(), 10.0);
+        }
+        let prefs = ProviderPreferences {
+            ignore: Some(vec!["gemini".to_string()]),
+            sort: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_ignore_sort_throughput_applies_the_filter_before_sorting() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        {
+            let mut throughput = router.throughput.write().unwrap();
+            throughput.insert("anthropic/m1".to_string(), 20.0);
+            throughput.insert("openai/m2".to_string(), 80.0);
+            // Fastest of all three, but dropped by `ignore` first.
+            throughput.insert("gemini/m3".to_string(), 500.0);
+        }
+        let prefs = ProviderPreferences {
+            ignore: Some(vec!["gemini".to_string()]),
+            sort: Some("throughput".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_only_and_ignore_together_then_sort_by_price() {
+        // `only` narrows to {anthropic, openai, gemini}; `ignore` then
+        // drops "gemini" (the cheapest) before price sort runs on the rest.
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![
+                ("anthropic/m1", 3.0, 15.0),
+                ("openai/m2", 1.0, 5.0),
+                ("gemini/m3", 0.1, 0.4),
+            ],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            only: Some(vec![
+                "anthropic".to_string(),
+                "openai".to_string(),
+                "gemini".to_string(),
+            ]),
+            ignore: Some(vec!["gemini".to_string()]),
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
     fn apply_preferences_zdr_filters_to_flagged_providers_only() {
         let router = test_router(vec![], vec![], vec![], vec!["anthropic"], vec![]);
         let prefs = ProviderPreferences {
