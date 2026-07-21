@@ -582,6 +582,35 @@ accumulates for models with a `[[pricing]]` entry; it stays `0.0` for
 everything else (which means "unpriced," not "free" — `requests` and
 `*_tokens` still count normally regardless of pricing).
 
+### `GET /v1/generation?id=`
+
+`GET /v1/usage` is aggregate-only; this looks up one specific completed
+request's own token/cost breakdown by the `id` from its
+`/v1/chat/completions` response (or, for a streamed request, the `id` on
+its chunks):
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "model": "anthropic/claude-sonnet-5",
+  "created": 1700000000,
+  "prompt_tokens": 8190,
+  "completion_tokens": 3110,
+  "total_tokens": 11300,
+  "cost_usd": 0.071
+}
+```
+
+`404` if `id` doesn't match a request this process has actually served.
+This is a recent-history lookup, not a durable audit log: it's backed by
+an in-memory, per-process cache of the last 1000 requests (oldest evicted
+first once full), with no `[persistence]` backing regardless of whether
+`[persistence]` is configured for `GET /v1/usage` — unlike that endpoint,
+this one always resets on restart and never reflects another process's
+traffic. `cost_usd` is omitted (not `0.0`) for a request to a model with
+no `[[pricing]]` entry, same unpriced-means-absent convention as
+`ChatResponse.cost_usd`.
+
 ### `GET /v1/providers/stats`
 
 The same per-"provider/model" EWMA figures `sort: "latency"`/
