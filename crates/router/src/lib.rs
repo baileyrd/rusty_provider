@@ -698,6 +698,70 @@ mod tests {
         }
     }
 
+    /// A `Provider` whose `chat_stream` replays an exact, caller-supplied
+    /// sequence of chunks, so `instrument_stream`'s per-chunk usage/cost
+    /// bookkeeping can be exercised with precise control over which chunks
+    /// carry usage and how many completion tokens each one reports.
+    struct ScriptedStreamProvider {
+        name: String,
+        chunks: Vec<ChatChunk>,
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedStreamProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn chat(
+            &self,
+            _req: &ChatRequest,
+            _model: &str,
+        ) -> Result<ChatResponse, ProviderError> {
+            unreachable!("ScriptedStreamProvider only implements chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: &ChatRequest,
+            _model: &str,
+        ) -> Result<ChatStream, ProviderError> {
+            let chunks = self.chunks.clone();
+            Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    fn scripted_chunk(prompt_tokens: u32, completion_tokens: u32) -> ChatChunk {
+        ChatChunk {
+            id: "test-id".to_string(),
+            object: "chat.completion.chunk",
+            created: 0,
+            model: "anthropic/m1".to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChatMessageDelta {
+                    role: Some(Role::Assistant),
+                    content: Some("ok".to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: Some(Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            }),
+            cost_usd: None,
+        }
+    }
+
+    fn scripted_chunk_without_usage() -> ChatChunk {
+        ChatChunk {
+            usage: None,
+            ..scripted_chunk(0, 0)
+        }
+    }
+
     // --- resolve_chain -----------------------------------------------------
 
     #[test]
@@ -1717,6 +1781,166 @@ mod tests {
         let stats = &snapshot["anthropic/m1"];
         assert_eq!(stats.requests, 1);
         assert!((stats.cost_usd - expected_cost).abs() < 1e-12);
+    }
+
+    // --- dispatch_stream usage instrumentation ------------------------------
+
+    #[tokio::test]
+    async fn dispatch_stream_skips_usage_and_cost_for_a_chunk_with_zero_completion_tokens() {
+        let provider = Arc::new(ScriptedStreamProvider {
+            name: "anthropic".to_string(),
+            // prompt_tokens carried, but completion_tokens is 0 -- the
+            // instrumentation gate is on completion_tokens, not on usage
+            // simply being present.
+            chunks: vec![scripted_chunk(10, 0)],
+        });
+        let router = test_router(
+            vec![("anthropic", provider)],
+            vec![],
+            vec![("anthropic/m1", 5.0, 5.0)],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.stream = Some(true);
+
+        let mut stream = router
+            .dispatch_stream(&req)
+            .await
+            .expect("dispatch_stream should succeed");
+        let chunk = stream.next().await.unwrap().unwrap();
+
+        assert!(
+            chunk.cost_usd.is_none(),
+            "a chunk with 0 completion tokens must not be cost-stamped"
+        );
+        assert!(
+            !router.usage_snapshot().contains_key("anthropic/m1"),
+            "0-completion-token chunks must not create a usage_snapshot entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_accumulates_usage_across_multiple_usage_bearing_chunks() {
+        let provider = Arc::new(ScriptedStreamProvider {
+            name: "anthropic".to_string(),
+            chunks: vec![scripted_chunk(10, 5), scripted_chunk(20, 3)],
+        });
+        let router = test_router(
+            vec![("anthropic", provider)],
+            vec![],
+            vec![("anthropic/m1", 1.0, 1.0)],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.stream = Some(true);
+
+        let stream = router
+            .dispatch_stream(&req)
+            .await
+            .expect("dispatch_stream should succeed");
+        let chunks: Vec<_> = stream.map(|c| c.unwrap()).collect().await;
+
+        assert_eq!(chunks.len(), 2);
+        // Each chunk is cost-stamped from its own usage, not a running total.
+        assert!((chunks[0].cost_usd.unwrap() - 15.0 / 1_000_000.0).abs() < 1e-12);
+        assert!((chunks[1].cost_usd.unwrap() - 23.0 / 1_000_000.0).abs() < 1e-12);
+
+        let snapshot = router.usage_snapshot();
+        let stats = &snapshot["anthropic/m1"];
+        assert_eq!(
+            stats.requests, 2,
+            "each usage-bearing chunk is one record_usage call"
+        );
+        assert_eq!(stats.prompt_tokens, 30);
+        assert_eq!(stats.completion_tokens, 8);
+        assert!((stats.cost_usd - 38.0 / 1_000_000.0).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_leaves_a_chunk_without_usage_untouched() {
+        let provider = Arc::new(ScriptedStreamProvider {
+            name: "anthropic".to_string(),
+            chunks: vec![scripted_chunk_without_usage()],
+        });
+        let router = test_router(
+            vec![("anthropic", provider)],
+            vec![],
+            vec![("anthropic/m1", 1.0, 1.0)],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.stream = Some(true);
+
+        let mut stream = router
+            .dispatch_stream(&req)
+            .await
+            .expect("dispatch_stream should succeed");
+        let chunk = stream.next().await.unwrap().unwrap();
+
+        assert!(chunk.cost_usd.is_none());
+        assert!(chunk.usage.is_none());
+        assert!(!router.usage_snapshot().contains_key("anthropic/m1"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_records_throughput_ewma_when_completion_tokens_positive() {
+        let provider = Arc::new(ScriptedStreamProvider {
+            name: "anthropic".to_string(),
+            chunks: vec![scripted_chunk(10, 5)],
+        });
+        let router = test_router(
+            vec![("anthropic", provider)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.stream = Some(true);
+
+        let mut stream = router
+            .dispatch_stream(&req)
+            .await
+            .expect("dispatch_stream should succeed");
+        stream.next().await.unwrap().unwrap();
+
+        let throughput = router.throughput.read().unwrap();
+        assert!(
+            throughput.contains_key("anthropic/m1"),
+            "a completion-bearing chunk should record a throughput sample"
+        );
+        assert!(throughput["anthropic/m1"] > 0.0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_updates_prometheus_metrics_from_streamed_usage() {
+        let provider = Arc::new(ScriptedStreamProvider {
+            name: "anthropic".to_string(),
+            chunks: vec![scripted_chunk(10, 5)],
+        });
+        let router = test_router(
+            vec![("anthropic", provider)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.stream = Some(true);
+
+        let mut stream = router
+            .dispatch_stream(&req)
+            .await
+            .expect("dispatch_stream should succeed");
+        stream.next().await.unwrap().unwrap();
+
+        let metrics = router.render_prometheus_metrics();
+        assert!(metrics.contains("rusty_provider_completion_tokens_total"));
+        assert!(metrics.contains(r#"provider="anthropic""#));
+        assert!(metrics.contains(r#"model="m1""#));
     }
 
     #[tokio::test]
