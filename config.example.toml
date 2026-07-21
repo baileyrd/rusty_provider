@@ -291,6 +291,24 @@ completion_per_million = 0.79
 # base_url = "https://api.openai.com/v1"  # optional, this is the default
 # model = "omni-moderation-latest"        # optional, this is the default
 
+# --- Web search (optional) --------------------------------------------------------
+# A request setting `"web_search": true` triggers a live search (via Brave
+# Search's API, or a compatible one -- base_url is configurable), using the
+# latest user message's own text as the query. The top results are prepended
+# as plain-text context onto that same message before dispatch -- and before
+# [[guardrails]]/[moderation] above run, so both see whatever the search
+# actually returned. Silently a no-op (request goes out unmodified) when
+# web_search isn't requested, [web_search] isn't configured, there's no
+# user-message text to search with, or results come back empty. A
+# search-backend failure (unreachable, non-2xx, bad body) is the same fail
+# open as an unreachable moderation backend -- logged, request proceeds
+# unmodified.
+
+# [web_search]
+# api_key_env = "BRAVE_SEARCH_API_KEY"
+# base_url = "https://api.search.brave.com/res/v1/web/search"  # optional, this is the default
+# max_results = 5                                                # optional, this is the default
+
 # --- Presets (optional) ----------------------------------------------------------
 # A named, reusable bundle of request defaults, referenced from a request via
 # `"preset": "<name>"`. Every field here is a per-field default -- whatever the

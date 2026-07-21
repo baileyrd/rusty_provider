@@ -581,6 +581,81 @@ async fn chat_completions_allows_the_request_through_when_the_moderation_backend
 }
 
 #[tokio::test]
+async fn chat_completions_weaves_web_search_results_into_the_request_before_dispatch() {
+    let search_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "web": {
+                "results": [
+                    {"title": "Rust 1.80", "url": "https://blog.rust-lang.org", "description": "Release notes"}
+                ]
+            }
+        })))
+        .mount(&search_server)
+        .await;
+
+    let provider_server = MockServer::start().await;
+    // The mock only matches if the request body's content already
+    // contains the search result -- proves web search ran and augmented
+    // the message before the provider ever saw it.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("blog.rust-lang.org"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Rust 1.80 shipped recently"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}
+        })))
+        .mount(&provider_server)
+        .await;
+
+    let openai_key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&openai_key_var, "test-key");
+    let web_search_key_var = unique_env_var("WEB_SEARCH_KEY");
+    std::env::set_var(&web_search_key_var, "search-key");
+    let config = format!(
+        r#"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{openai_key_var}"
+
+        [web_search]
+        api_key_env = "{web_search_key_var}"
+        base_url = "{}"
+        "#,
+        provider_server.uri(),
+        search_server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "what's new in Rust"}],
+            "web_search": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "Rust 1.80 shipped recently"
+    );
+}
+
+#[tokio::test]
 async fn chat_completions_redacts_a_request_matching_a_redact_guardrail_before_dispatch() {
     let server = MockServer::start().await;
     // The mock only matches if the request body's content has already

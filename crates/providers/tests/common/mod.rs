@@ -33,6 +33,7 @@ pub fn simple_request(model: &str) -> ChatRequest {
         transforms: None,
         logprobs: None,
         top_logprobs: None,
+        web_search: None,
     }
 }
 

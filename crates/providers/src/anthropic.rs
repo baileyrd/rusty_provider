@@ -924,6 +924,7 @@ mod tests {
             transforms: None,
             logprobs: None,
             top_logprobs: None,
+            web_search: None,
         }
     }
 
@@ -1389,6 +1390,7 @@ mod tests {
             transforms: None,
             logprobs: None,
             top_logprobs: None,
+            web_search: None,
         };
         let err = provider
             .chat(&req, "claude-sonnet-5", None)

@@ -1028,6 +1028,52 @@ request. The outbound self-throttle (`[providers.X].requests_per_minute`)
 still applies too, since that protects this router process's own call
 pattern to the provider's endpoint, independent of which key is paying.
 
+## Web search
+
+`[web_search]` lets a request trigger a live web search whose results get
+woven into the conversation before dispatch, so the model can ground its
+answer in information beyond its training data:
+
+```toml
+[web_search]
+api_key_env = "BRAVE_SEARCH_API_KEY"
+base_url = "https://api.search.brave.com/res/v1/web/search"  # optional, this is the default
+max_results = 5                                                # optional, this is the default
+```
+
+```jsonc
+{
+  "model": "smart",
+  "messages": [{"role": "user", "content": "what's new in Rust"}],
+  "web_search": true
+}
+```
+
+Loosely mirrors OpenRouter's `:online` model suffix / `web` plugin,
+scoped down considerably: only [Brave Search's API](https://brave.com/search/api/)
+(or a compatible one — `base_url` is configurable) is supported, and
+results are woven in as plain text rather than surfaced as a structured
+citations/annotations response field. When `web_search: true` and
+`[web_search]` is configured, the router searches using the latest
+`user`-role message's own text as the query, then prepends a numbered
+block of results (title, snippet, URL) onto that same message before
+[Guardrails](#guardrails) and [Moderation](#moderation) run — so both see
+whatever the search actually returned, not just the original question.
+`web_search` is silently a no-op — the request goes out completely
+unmodified — when it's unset/`false`, `[web_search]` isn't configured,
+there's no user-message text to search with (an image-only turn), or the
+search comes back with zero results.
+
+A search-backend failure (network error, non-2xx, an unparseable body)
+never blocks or errors the request either — it's logged and the request
+proceeds unmodified, the same fail-open resilience
+[Moderation](#moderation) gives an unreachable classifier. Every outcome
+(`results`, `no_results`, `error`) increments the
+`rusty_provider_web_search_total` Prometheus counter, labeled by outcome,
+so an operator can tell a quiet backend from a genuinely idle feature.
+`web_search.api_key_env` set but unresolvable at startup disables web
+search the same way a misconfigured provider is skipped, with a warning.
+
 ## Admin API
 
 Setting `server.admin_key_env` unlocks a small admin API for inspecting

@@ -371,6 +371,17 @@ pub struct ChatRequest {
     /// `logprobs` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<u32>,
+    /// `true` triggers a live web search (see the top-level `[web_search]`
+    /// config), using the latest `user`-role message's text as the query,
+    /// whose top results are woven into that same message as extra
+    /// context before dispatch -- loosely mirrors OpenRouter's `:online`
+    /// model suffix / `web` plugin, scoped down to one search backend and
+    /// plain-text injection instead of a structured citations field.
+    /// Unset/`false`, `[web_search]` not configured, or no user-message
+    /// text to search for are all silent no-ops -- this never blocks or
+    /// errors the request, only enriches it when it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<bool>,
 }
 
 /// A response's per-token log probabilities, per the OpenAI convention.
