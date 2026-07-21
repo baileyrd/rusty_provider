@@ -11,8 +11,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, ContentPart, FunctionCallDelta, MessageContent, Provider, ProviderError, Role,
-    Tool, ToolCall, ToolCallDelta, Usage,
+    ChunkChoice, ContentPart, FunctionCallDelta, MessageContent, Provider, ProviderError,
+    ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -50,7 +50,7 @@ struct WireMessage {
     content: Vec<Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct WireTool<'a> {
     name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,6 +76,13 @@ struct WireRequest<'a> {
     tools: Option<Vec<WireTool<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    /// Set when `response_format` asked for schema-constrained output: the
+    /// name of the synthetic tool `tools`/`tool_choice` above were built
+    /// from, so `chat`/`chat_stream` can recognize that tool's `tool_use`
+    /// block in the response and unwrap it into plain content instead of
+    /// surfacing it as a real tool call. Never sent on the wire.
+    #[serde(skip)]
+    forced_output_tool_name: Option<String>,
 }
 
 /// Split messages into Anthropic's shape: a single top-level `system`
@@ -231,6 +238,34 @@ fn to_wire_tool_choice(choice: &Value) -> Value {
     }
 }
 
+/// Anthropic's Messages API has no native `response_format` -- so
+/// schema-constrained output (`ResponseFormat::JsonSchema`) is faked by
+/// defining a single synthetic tool whose `input_schema` is the requested
+/// schema, then forcing the model to call it (`tool_choice: {"type":"tool",
+/// "name": ...}}`). The caller unwraps that forced tool_use block back into
+/// plain JSON content instead of surfacing it as a real tool call -- see
+/// `chat`/`chat_stream`.
+///
+/// `ResponseFormat::JsonObject` (loose, schema-less JSON mode) has no
+/// equivalent trick: there's no schema to build a tool from, and nothing in
+/// Anthropic's API reliably constrains output to "valid JSON, any shape".
+/// That's rejected with `UnsupportedFeature` so a fallback chain can move on
+/// to a provider (OpenAI-compatible, Gemini) that actually supports it,
+/// rather than silently ignoring the request.
+fn forced_structured_output_tool(req: &ChatRequest) -> Result<Option<WireTool<'_>>, ProviderError> {
+    match &req.response_format {
+        None | Some(ResponseFormat::Text) => Ok(None),
+        Some(ResponseFormat::JsonObject) => Err(ProviderError::UnsupportedFeature(
+            "Anthropic's Messages API has no schema-less JSON response mode".to_string(),
+        )),
+        Some(ResponseFormat::JsonSchema { json_schema }) => Ok(Some(WireTool {
+            name: &json_schema.name,
+            description: json_schema.description.as_deref(),
+            input_schema: json_schema.schema.clone(),
+        })),
+    }
+}
+
 fn map_stop_reason(reason: &str) -> &'static str {
     match reason {
         "end_turn" | "stop_sequence" => "stop",
@@ -247,6 +282,24 @@ impl<'a> WireRequest<'a> {
         stream: bool,
     ) -> Result<Self, ProviderError> {
         let (system, messages) = build_messages(&req.messages)?;
+
+        let (tools, tool_choice, forced_output_tool_name) =
+            match forced_structured_output_tool(req)? {
+                Some(tool) => {
+                    let name = tool.name.to_string();
+                    (
+                        Some(vec![tool]),
+                        Some(json!({"type": "tool", "name": name})),
+                        Some(name),
+                    )
+                }
+                None => (
+                    req.tools.as_deref().map(to_wire_tools),
+                    req.tool_choice.as_ref().map(to_wire_tool_choice),
+                    None,
+                ),
+            };
+
         Ok(Self {
             model,
             max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -256,8 +309,9 @@ impl<'a> WireRequest<'a> {
             top_p: req.top_p,
             stop_sequences: req.stop.as_deref(),
             stream,
-            tools: req.tools.as_deref().map(to_wire_tools),
-            tool_choice: req.tool_choice.as_ref().map(to_wire_tool_choice),
+            tools,
+            tool_choice,
+            forced_output_tool_name,
         })
     }
 }
@@ -298,6 +352,7 @@ impl Provider for AnthropicProvider {
 
     async fn chat(&self, req: &ChatRequest, model: &str) -> Result<ChatResponse, ProviderError> {
         let body = WireRequest::from_core(req, model, false)?;
+        let forced_output_tool_name = body.forced_output_tool_name.clone();
 
         let resp = self
             .client
@@ -327,11 +382,34 @@ impl Provider for AnthropicProvider {
                     let id = b.id.clone().unwrap_or_default();
                     let tool_name = b.name.clone().unwrap_or_default();
                     let arguments = b.input.clone().unwrap_or_else(|| json!({})).to_string();
-                    tool_calls.push(ToolCall::function(id, tool_name, arguments));
+                    // The forced structured-output tool's call is the
+                    // client's actual JSON answer, not a real tool call --
+                    // fold its arguments into `text` instead of surfacing
+                    // it as a `tool_calls` entry the client would have to
+                    // answer with a follow-up `role: "tool"` message.
+                    if forced_output_tool_name.as_deref() == Some(tool_name.as_str()) {
+                        text.push_str(&arguments);
+                    } else {
+                        tool_calls.push(ToolCall::function(id, tool_name, arguments));
+                    }
                 }
                 _ => {}
             }
         }
+
+        let finish_reason = if forced_output_tool_name.is_some() {
+            // Anthropic reports `stop_reason: "tool_use"` for the forced
+            // call, which `map_stop_reason` would turn into `"tool_calls"`
+            // -- wrong here, since from the client's perspective this
+            // completed normally with a JSON answer, not a tool call it
+            // needs to act on.
+            Some("stop".to_string())
+        } else {
+            wire.stop_reason
+                .as_deref()
+                .map(map_stop_reason)
+                .map(str::to_string)
+        };
 
         Ok(ChatResponse {
             id: gen_id("chatcmpl"),
@@ -355,11 +433,7 @@ impl Provider for AnthropicProvider {
                     },
                     tool_call_id: None,
                 },
-                finish_reason: wire
-                    .stop_reason
-                    .as_deref()
-                    .map(map_stop_reason)
-                    .map(str::to_string),
+                finish_reason,
             }],
             usage: Some(Usage {
                 prompt_tokens: wire.usage.input_tokens,
@@ -376,6 +450,7 @@ impl Provider for AnthropicProvider {
         model: &str,
     ) -> Result<ChatStream, ProviderError> {
         let body = WireRequest::from_core(req, model, true)?;
+        let is_forced_structured_output = body.forced_output_tool_name.is_some();
 
         let resp = self
             .client
@@ -429,6 +504,13 @@ impl Provider for AnthropicProvider {
                         {
                             return None;
                         }
+                        // The forced structured-output tool's call streams
+                        // as plain content (see `content_block_delta`
+                        // below), not a tool call the client has to
+                        // recognize the start of.
+                        if is_forced_structured_output {
+                            return None;
+                        }
                         let id = value
                             .pointer("/content_block/id")
                             .and_then(Value::as_str)
@@ -479,8 +561,18 @@ impl Provider for AnthropicProvider {
                                     .and_then(Value::as_str)
                                     .unwrap_or("")
                                     .to_string();
-                                Some(Ok(empty_chunk(
-                                    &full_model,
+                                // The forced structured-output tool's
+                                // streamed input *is* the JSON the client
+                                // asked for -- deliver it as accumulating
+                                // `content`, the same shape every other
+                                // provider streams a JSON-mode answer in,
+                                // rather than a tool-call argument delta.
+                                let delta = if is_forced_structured_output {
+                                    ChatMessageDelta {
+                                        content: Some(partial),
+                                        ..Default::default()
+                                    }
+                                } else {
                                     ChatMessageDelta {
                                         tool_calls: Some(vec![ToolCallDelta {
                                             index,
@@ -492,19 +584,27 @@ impl Provider for AnthropicProvider {
                                             }),
                                         }]),
                                         ..Default::default()
-                                    },
-                                    None,
-                                )))
+                                    }
+                                };
+                                Some(Ok(empty_chunk(&full_model, delta, None)))
                             }
                             _ => None,
                         }
                     }
                     "message_delta" => {
-                        let stop_reason = value
-                            .pointer("/delta/stop_reason")
-                            .and_then(Value::as_str)
-                            .map(map_stop_reason)
-                            .map(str::to_string);
+                        let stop_reason = if is_forced_structured_output {
+                            // See the `chat` (non-streaming) method for why
+                            // this is always "stop" rather than whatever
+                            // `map_stop_reason` would make of Anthropic's
+                            // "tool_use" here.
+                            Some("stop".to_string())
+                        } else {
+                            value
+                                .pointer("/delta/stop_reason")
+                                .and_then(Value::as_str)
+                                .map(map_stop_reason)
+                                .map(str::to_string)
+                        };
                         let output_tokens = value
                             .pointer("/usage/output_tokens")
                             .and_then(Value::as_u64)
@@ -606,6 +706,98 @@ mod tests {
         let wire = to_wire_tools(&tools);
         assert_eq!(wire[0].name, "first");
         assert_eq!(wire[1].name, "second");
+    }
+
+    // --- forced_structured_output_tool ----------------------------------------
+
+    fn request_with_response_format(response_format: Option<ResponseFormat>) -> ChatRequest {
+        ChatRequest {
+            model: "anthropic/claude-sonnet-5".to_string(),
+            messages: vec![ChatMessage::user("hi")],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: None,
+            stream: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            provider: None,
+            response_format,
+        }
+    }
+
+    #[test]
+    fn forced_structured_output_tool_is_none_without_a_response_format() {
+        let req = request_with_response_format(None);
+        assert!(forced_structured_output_tool(&req).unwrap().is_none());
+    }
+
+    #[test]
+    fn forced_structured_output_tool_is_none_for_text() {
+        let req = request_with_response_format(Some(ResponseFormat::Text));
+        assert!(forced_structured_output_tool(&req).unwrap().is_none());
+    }
+
+    #[test]
+    fn forced_structured_output_tool_errs_as_unsupported_for_json_object() {
+        let req = request_with_response_format(Some(ResponseFormat::JsonObject));
+        let err = forced_structured_output_tool(&req).unwrap_err();
+        assert!(matches!(err, ProviderError::UnsupportedFeature(_)));
+        assert!(
+            err.is_retryable(),
+            "a fallback chain should move on to a provider with schema-less JSON mode"
+        );
+    }
+
+    #[test]
+    fn forced_structured_output_tool_builds_a_tool_from_the_schema() {
+        let schema = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let req = request_with_response_format(Some(ResponseFormat::JsonSchema {
+            json_schema: rp_core::JsonSchemaFormat {
+                name: "weather_report".to_string(),
+                description: Some("A weather report".to_string()),
+                schema: schema.clone(),
+                strict: Some(true),
+            },
+        }));
+        let tool = forced_structured_output_tool(&req).unwrap().unwrap();
+        assert_eq!(tool.name, "weather_report");
+        assert_eq!(tool.description, Some("A weather report"));
+        assert_eq!(tool.input_schema, schema);
+    }
+
+    // --- WireRequest::from_core: structured output wiring ----------------------
+
+    #[test]
+    fn from_core_forces_tool_choice_to_the_schema_tool_and_records_its_name() {
+        let req = request_with_response_format(Some(ResponseFormat::JsonSchema {
+            json_schema: rp_core::JsonSchemaFormat {
+                name: "weather_report".to_string(),
+                description: None,
+                schema: json!({"type": "object"}),
+                strict: None,
+            },
+        }));
+        let wire = WireRequest::from_core(&req, "claude-sonnet-5", false).unwrap();
+        assert_eq!(
+            wire.forced_output_tool_name.as_deref(),
+            Some("weather_report")
+        );
+        assert_eq!(wire.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            wire.tool_choice,
+            Some(json!({"type": "tool", "name": "weather_report"}))
+        );
+    }
+
+    #[test]
+    fn from_core_leaves_tools_and_forced_name_alone_without_a_response_format() {
+        let req = request_with_response_format(None);
+        let wire = WireRequest::from_core(&req, "claude-sonnet-5", false).unwrap();
+        assert!(wire.forced_output_tool_name.is_none());
+        assert!(wire.tools.is_none());
+        assert!(wire.tool_choice.is_none());
     }
 
     // --- to_wire_tool_choice -------------------------------------------------
@@ -862,6 +1054,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             provider: None,
+            response_format: None,
         };
         let err = provider.chat(&req, "claude-sonnet-5").await.unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedContent(_)));

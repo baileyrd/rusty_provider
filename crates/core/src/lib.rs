@@ -9,5 +9,6 @@ pub use rate_limit::RateLimiter;
 pub use types::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, Choice, ChunkChoice,
     ContentPart, FunctionCall, FunctionCallDelta, FunctionDef, ImageUrl, InputAudio,
-    MessageContent, ModelInfo, ProviderPreferences, Role, Tool, ToolCall, ToolCallDelta, Usage,
+    JsonSchemaFormat, MessageContent, ModelInfo, ProviderPreferences, ResponseFormat, Role, Tool,
+    ToolCall, ToolCallDelta, Usage,
 };

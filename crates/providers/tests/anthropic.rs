@@ -117,6 +117,75 @@ async fn chat_parses_tool_use_block_and_maps_finish_reason() {
 }
 
 #[tokio::test]
+async fn chat_sends_json_schema_response_format_as_a_forced_tool_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({
+            "tools": [{
+                "name": "weather_report",
+                "description": "A weather report for one city",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "temperature_f": {"type": "number"},
+                    },
+                    "required": ["city", "temperature_f"],
+                }
+            }],
+            "tool_choice": {"type": "tool", "name": "weather_report"},
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_01abc",
+                "name": "weather_report",
+                "input": {"city": "Boston", "temperature_f": 72}
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 20, "output_tokens": 8}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::request_with_json_schema("claude-sonnet-5");
+    let resp = provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+
+    // The forced tool call is unwrapped into plain JSON content, not
+    // surfaced as a `tool_calls` entry the client would have to answer.
+    assert!(resp.choices[0].message.tool_calls.is_none());
+    let content = resp.choices[0]
+        .message
+        .content
+        .as_ref()
+        .expect("content should be present");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&content.as_plain_text()).expect("content should be valid JSON");
+    assert_eq!(parsed["city"], "Boston");
+    assert_eq!(parsed["temperature_f"], 72);
+    // Not "tool_calls" -- from the client's perspective this is a normal
+    // completion with a JSON answer.
+    assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+}
+
+#[tokio::test]
+async fn chat_rejects_json_object_response_format_without_contacting_the_server() {
+    // No mock server is started -- if this somehow tried to make a real
+    // HTTP call it would fail with a connection error, not
+    // UnsupportedFeature, proving the check happens before any request.
+    let provider = AnthropicProvider::new("http://127.0.0.1:1", "test-key");
+    let req = common::request_with_json_object("claude-sonnet-5");
+    let err = provider.chat(&req, "claude-sonnet-5").await.unwrap_err();
+    assert!(matches!(err, ProviderError::UnsupportedFeature(_)));
+    assert!(err.is_retryable());
+}
+
+#[tokio::test]
 async fn chat_maps_tool_call_request_into_tool_use_and_tool_result_blocks() {
     let server = MockServer::start().await;
     // A prior assistant tool call plus its result, as a real multi-turn
@@ -356,6 +425,56 @@ async fn chat_stream_parses_tool_call_deltas_by_index() {
         chunks[4].choices[0].finish_reason.as_deref(),
         Some("tool_calls")
     );
+}
+
+#[tokio::test]
+async fn chat_stream_unwraps_a_forced_structured_output_tool_call_into_content_deltas() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"weather_report\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"Boston\\\"}\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":6}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::request_with_json_schema("claude-sonnet-5");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "claude-sonnet-5")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse"));
+    }
+
+    // No chunk should ever carry a `tool_calls` delta -- everything streams
+    // as plain `content`, the same shape a JSON-mode answer takes on every
+    // other provider.
+    assert!(chunks
+        .iter()
+        .all(|c| c.choices[0].delta.tool_calls.is_none()));
+
+    let assembled: String = chunks
+        .iter()
+        .filter_map(|c| c.choices[0].delta.content.clone())
+        .collect();
+    let parsed: serde_json::Value = serde_json::from_str(&assembled).unwrap();
+    assert_eq!(parsed["city"], "Boston");
+
+    let finish_reason = chunks
+        .iter()
+        .find_map(|c| c.choices[0].finish_reason.clone());
+    assert_eq!(finish_reason.as_deref(), Some("stop"));
 }
 
 #[tokio::test]

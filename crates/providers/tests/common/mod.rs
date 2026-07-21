@@ -1,5 +1,6 @@
 use rp_core::{
-    ChatMessage, ChatRequest, ContentPart, ImageUrl, InputAudio, MessageContent, Role, Tool,
+    ChatMessage, ChatRequest, ContentPart, ImageUrl, InputAudio, JsonSchemaFormat, MessageContent,
+    ResponseFormat, Role, Tool,
 };
 
 /// A minimal single-user-turn request, for tests that don't care about the
@@ -17,6 +18,7 @@ pub fn simple_request(model: &str) -> ChatRequest {
         tools: None,
         tool_choice: None,
         provider: None,
+        response_format: None,
     }
 }
 
@@ -67,6 +69,36 @@ pub fn request_with_audio(model: &str) -> ChatRequest {
         tool_calls: None,
         tool_call_id: None,
     }];
+    req
+}
+
+/// Same as [`simple_request`], but with a schema-constrained
+/// `response_format`, for tests exercising structured-output translation.
+pub fn request_with_json_schema(model: &str) -> ChatRequest {
+    let mut req = simple_request(model);
+    req.response_format = Some(ResponseFormat::JsonSchema {
+        json_schema: JsonSchemaFormat {
+            name: "weather_report".to_string(),
+            description: Some("A weather report for one city".to_string()),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "temperature_f": {"type": "number"},
+                },
+                "required": ["city", "temperature_f"],
+            }),
+            strict: Some(true),
+        },
+    });
+    req
+}
+
+/// Same as [`simple_request`], but with a schema-less `response_format`,
+/// for tests exercising loose JSON-mode translation.
+pub fn request_with_json_object(model: &str) -> ChatRequest {
+    let mut req = simple_request(model);
+    req.response_format = Some(ResponseFormat::JsonObject);
     req
 }
 
