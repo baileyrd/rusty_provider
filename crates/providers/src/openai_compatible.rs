@@ -8,7 +8,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, Provider, ProviderError, Role, Tool, ToolCall, ToolCallDelta, Usage,
+    ChunkChoice, MessageContent, Provider, ProviderError, Role, Tool, ToolCall, ToolCallDelta,
+    Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -184,7 +185,7 @@ impl Provider for OpenAiCompatibleProvider {
                     index: c.index,
                     message: ChatMessage {
                         role: parse_role(&c.message.role),
-                        content: c.message.content,
+                        content: c.message.content.map(MessageContent::Text),
                         name: None,
                         tool_calls: c.message.tool_calls,
                         tool_call_id: None,

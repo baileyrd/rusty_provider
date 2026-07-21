@@ -32,8 +32,8 @@ async fn chat_success_sends_api_key_as_query_param() {
 
     assert_eq!(resp.model, "gemini/gemini-2.0-flash");
     assert_eq!(
-        resp.choices[0].message.content.as_deref(),
-        Some("hello there")
+        resp.choices[0].message.content,
+        Some(rp_core::MessageContent::text("hello there"))
     );
     assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
     let usage = resp.usage.expect("usage should be present");
@@ -222,6 +222,34 @@ async fn chat_tracks_call_id_to_function_name_across_turns_for_tool_result() {
         },
     ];
 
+    provider
+        .chat(&req, "gemini-2.0-flash")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_sends_image_content_as_inline_data() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(body_partial_json(json!({
+            "contents": [
+                {"role": "user", "parts": [
+                    {"text": "what's in this image?"},
+                    {"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}},
+                ]},
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"parts": [{"text": "a hello image"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 5, "totalTokenCount": 25}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::request_with_image("gemini-2.0-flash");
     provider
         .chat(&req, "gemini-2.0-flash")
         .await

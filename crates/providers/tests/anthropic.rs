@@ -39,8 +39,8 @@ async fn chat_success_sends_correct_headers_and_body() {
 
     assert_eq!(resp.model, "anthropic/claude-sonnet-5");
     assert_eq!(
-        resp.choices[0].message.content.as_deref(),
-        Some("hello there")
+        resp.choices[0].message.content,
+        Some(rp_core::MessageContent::text("hello there"))
     );
     assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
     let usage = resp.usage.expect("usage should be present");
@@ -161,6 +161,35 @@ async fn chat_maps_tool_call_request_into_tool_use_and_tool_result_blocks() {
         },
     ];
 
+    provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_sends_image_content_as_a_base64_image_block() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what's in this image?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+                ]},
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "a hello image"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 5}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::request_with_image("claude-sonnet-5");
     provider
         .chat(&req, "claude-sonnet-5")
         .await

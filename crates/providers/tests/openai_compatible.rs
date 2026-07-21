@@ -42,8 +42,8 @@ async fn chat_success_parses_response_and_sends_correct_request() {
     assert_eq!(resp.model, "openai/gpt-4o-mini");
     assert_eq!(resp.choices.len(), 1);
     assert_eq!(
-        resp.choices[0].message.content.as_deref(),
-        Some("hello there")
+        resp.choices[0].message.content,
+        Some(rp_core::MessageContent::text("hello there"))
     );
     assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
     let usage = resp.usage.expect("usage should be present");
@@ -268,6 +268,46 @@ async fn chat_forwards_tools_and_tool_choice_verbatim_in_request_body() {
     let mut req = common::request_with_tool("gpt-4o-mini");
     req.tool_choice = Some(json!({"type": "function", "function": {"name": "get_weather"}}));
 
+    provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
+async fn chat_forwards_image_content_verbatim_in_request_body() {
+    // Since this adapter's WireRequest holds `&[ChatMessage]` directly,
+    // MessageContent's untagged serialization should pass a parts array
+    // through byte-for-byte with no translation.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what's in this image?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                ],
+            }],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "a hello image"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::request_with_image("gpt-4o-mini");
     provider
         .chat(&req, "gpt-4o-mini")
         .await

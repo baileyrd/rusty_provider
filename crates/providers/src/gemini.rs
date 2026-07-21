@@ -11,8 +11,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, FunctionCallDelta, Provider, ProviderError, Role, Tool, ToolCall, ToolCallDelta,
-    Usage,
+    ChunkChoice, ContentPart, FunctionCallDelta, MessageContent, Provider, ProviderError, Role,
+    Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -95,7 +95,7 @@ fn build_contents(messages: &[ChatMessage]) -> (Option<String>, Vec<Content>) {
         match m.role {
             Role::System => {
                 if let Some(c) = &m.content {
-                    system_parts.push(c.clone());
+                    system_parts.push(c.as_plain_text());
                 }
             }
             Role::Tool => {
@@ -105,25 +105,36 @@ fn build_contents(messages: &[ChatMessage]) -> (Option<String>, Vec<Content>) {
                     .and_then(|id| call_names.get(id))
                     .cloned()
                     .unwrap_or_default();
+                let text = m
+                    .content
+                    .as_ref()
+                    .map(MessageContent::as_plain_text)
+                    .unwrap_or_default();
                 contents.push(Content {
                     role: "user",
                     parts: vec![json!({
                         "functionResponse": {
                             "name": name,
-                            "response": {"content": m.content.clone().unwrap_or_default()},
+                            "response": {"content": text},
                         }
                     })],
                 });
             }
             Role::User => {
+                let parts = m
+                    .content
+                    .as_ref()
+                    .map(content_to_parts)
+                    .unwrap_or_else(|| vec![json!({"text": ""})]);
                 contents.push(Content {
                     role: gemini_role(&m.role),
-                    parts: vec![json!({"text": m.content.clone().unwrap_or_default()})],
+                    parts,
                 });
             }
             Role::Assistant => {
                 let mut parts = Vec::new();
-                if let Some(text) = &m.content {
+                if let Some(content) = &m.content {
+                    let text = content.as_plain_text();
                     if !text.is_empty() {
                         parts.push(json!({"text": text}));
                     }
@@ -151,6 +162,56 @@ fn build_contents(messages: &[ChatMessage]) -> (Option<String>, Vec<Content>) {
         Some(system_parts.join("\n\n"))
     };
     (system, contents)
+}
+
+/// Translates a message's content into Gemini `parts`, turning
+/// `image_url` parts into `inlineData` (for a `data:<mime>;base64,<data>`
+/// URI) or `fileData` (for an `https://` URL, whose MIME type is guessed
+/// from the URL's extension since Gemini requires one).
+fn content_to_parts(content: &MessageContent) -> Vec<Value> {
+    match content {
+        MessageContent::Text(text) => vec![json!({"text": text})],
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => json!({"text": text}),
+                ContentPart::ImageUrl { image_url } => image_part(&image_url.url),
+            })
+            .collect(),
+    }
+}
+
+fn image_part(url: &str) -> Value {
+    match parse_data_uri(url) {
+        Some((mime_type, data)) => json!({
+            "inlineData": {"mimeType": mime_type, "data": data},
+        }),
+        None => json!({
+            "fileData": {"mimeType": guess_mime_type(url), "fileUri": url},
+        }),
+    }
+}
+
+/// Parses a `data:<mime>;base64,<data>` URI into its `(mime, data)` parts.
+/// Returns `None` for anything else (e.g. a plain `https://` URL).
+fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let mime_type = meta.strip_suffix(";base64")?;
+    Some((mime_type, data))
+}
+
+/// Best-effort MIME type guess from a URL's extension, since Gemini's
+/// `fileData` requires one and a plain image URL doesn't carry it.
+fn guess_mime_type(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    }
 }
 
 fn to_wire_tools(tools: &[Tool]) -> Value {
@@ -344,7 +405,11 @@ impl Provider for GeminiProvider {
                 index: 0,
                 message: ChatMessage {
                     role: Role::Assistant,
-                    content: if text.is_empty() { None } else { Some(text) },
+                    content: if text.is_empty() {
+                        None
+                    } else {
+                        Some(MessageContent::Text(text))
+                    },
                     name: None,
                     tool_calls: if tool_calls.is_empty() {
                         None
@@ -638,5 +703,137 @@ mod tests {
         );
         assert_eq!(deltas[1].index, 1);
         assert_eq!(deltas[1].id.as_deref(), Some("call_2"));
+    }
+
+    // --- parse_data_uri --------------------------------------------------------
+
+    #[test]
+    fn parse_data_uri_extracts_mime_type_and_data() {
+        assert_eq!(
+            parse_data_uri("data:image/png;base64,aGVsbG8="),
+            Some(("image/png", "aGVsbG8="))
+        );
+    }
+
+    #[test]
+    fn parse_data_uri_rejects_a_plain_url() {
+        assert_eq!(parse_data_uri("https://example.com/a.png"), None);
+    }
+
+    // --- guess_mime_type ---------------------------------------------------------
+
+    #[test]
+    fn guess_mime_type_recognizes_common_extensions() {
+        assert_eq!(guess_mime_type("https://example.com/a.png"), "image/png");
+        assert_eq!(guess_mime_type("https://example.com/a.gif"), "image/gif");
+        assert_eq!(guess_mime_type("https://example.com/a.webp"), "image/webp");
+        assert_eq!(guess_mime_type("https://example.com/a.jpg"), "image/jpeg");
+    }
+
+    #[test]
+    fn guess_mime_type_ignores_query_and_fragment_when_choosing_the_extension() {
+        assert_eq!(
+            guess_mime_type("https://example.com/a.png?w=100#frag"),
+            "image/png"
+        );
+    }
+
+    #[test]
+    fn guess_mime_type_defaults_to_jpeg_for_an_unknown_extension() {
+        assert_eq!(guess_mime_type("https://example.com/a.bmp"), "image/jpeg");
+        assert_eq!(guess_mime_type("https://example.com/a"), "image/jpeg");
+    }
+
+    // --- image_part --------------------------------------------------------------
+
+    #[test]
+    fn image_part_uses_inline_data_for_a_data_uri() {
+        assert_eq!(
+            image_part("data:image/jpeg;base64,aGVsbG8="),
+            json!({"inlineData": {"mimeType": "image/jpeg", "data": "aGVsbG8="}})
+        );
+    }
+
+    #[test]
+    fn image_part_uses_file_data_for_an_https_url() {
+        assert_eq!(
+            image_part("https://example.com/a.png"),
+            json!({"fileData": {"mimeType": "image/png", "fileUri": "https://example.com/a.png"}})
+        );
+    }
+
+    // --- content_to_parts ---------------------------------------------------------
+
+    #[test]
+    fn content_to_parts_wraps_plain_text_as_a_single_text_part() {
+        let content = MessageContent::text("hi");
+        assert_eq!(content_to_parts(&content), vec![json!({"text": "hi"})]);
+    }
+
+    #[test]
+    fn content_to_parts_translates_mixed_text_and_image_parts() {
+        let content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "what's this?".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: rp_core::ImageUrl {
+                    url: "data:image/png;base64,aGVsbG8=".to_string(),
+                    detail: None,
+                },
+            },
+        ]);
+        assert_eq!(
+            content_to_parts(&content),
+            vec![
+                json!({"text": "what's this?"}),
+                json!({"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}}),
+            ]
+        );
+    }
+
+    // --- build_contents: image content ----------------------------------------------
+
+    #[test]
+    fn build_contents_translates_a_user_image_content_part() {
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: rp_core::ImageUrl {
+                    url: "https://example.com/a.png".to_string(),
+                    detail: None,
+                },
+            }])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let (_, contents) = build_contents(&messages);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(
+            contents[0].parts,
+            vec![
+                json!({"fileData": {"mimeType": "image/png", "fileUri": "https://example.com/a.png"}})
+            ]
+        );
+    }
+
+    #[test]
+    fn build_contents_collapses_assistant_and_system_image_parts_to_plain_text() {
+        let messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: Some(MessageContent::Parts(vec![ContentPart::Text {
+                    text: "be concise".to_string(),
+                }])),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage::assistant("ok"),
+        ];
+        let (system, contents) = build_contents(&messages);
+        assert_eq!(system, Some("be concise".to_string()));
+        assert_eq!(contents[0].parts, vec![json!({"text": "ok"})]);
     }
 }
