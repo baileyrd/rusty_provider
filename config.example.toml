@@ -183,6 +183,23 @@ completion_per_million = 0.79
 # in-memory only: they don't survive a restart and aren't written back to
 # this file, unlike the [[clients]] entries above.
 
+# `organization` and `workspace` group clients for the admin API's
+# GET /v1/admin/organizations rollup -- purely labels otherwise, with no
+# effect on chat completions. `role = "admin"` additionally lets a
+# client's own API key authenticate to /v1/admin/* itself, scoped to
+# clients sharing its `organization` (it can't see or manage any other
+# organization's clients, unlike server.admin_key_env above, which always
+# sees every client). See the README's "Organizations, workspaces &
+# roles" section.
+
+# [[clients]]
+# name = "acme-admin"
+# api_key_env = "CLIENT_ACME_ADMIN_API_KEY"
+# requests_per_minute = 60
+# organization = "acme-corp"
+# workspace = "prod"
+# role = "admin"
+
 # --- Persistence (optional) ---------------------------------------------------
 # By default, GET /v1/usage's cumulative request/token/cost totals and each
 # client's budget_usd spend tracking both live only in memory: they reset on

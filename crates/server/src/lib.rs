@@ -26,6 +26,10 @@ pub fn build_app(state: AppState) -> AxumRouter {
             get(routes::admin_list_clients).post(routes::admin_create_client),
         )
         .route(
+            "/v1/admin/organizations",
+            get(routes::admin_list_organizations),
+        )
+        .route(
             "/v1/admin/clients/:name",
             patch(routes::admin_update_client).delete(routes::admin_delete_client),
         )

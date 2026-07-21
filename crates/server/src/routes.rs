@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::{stream, StreamExt};
 use rp_core::{ChatRequest, ModelInfo, RateLimitStatus};
-use rp_router::{BudgetPeriod, ClientConfig, ProviderStats, UsageStats};
+use rp_router::{BudgetPeriod, ClientConfig, ClientRole, ProviderStats, UsageStats};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -45,21 +45,89 @@ pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> {
     }
 }
 
-/// Gates `/v1/admin/*`. Requires `server.admin_key_env` to be configured
-/// and resolved -- unlike `check_auth`, there's no "auth disabled" fallback
-/// and no cross-recognition of `api_key`/`client_keys` tokens, since those
-/// grant access to chat completions, not to every client's spend data.
-/// Reports `404` (not `401`) when the admin API isn't configured at all,
-/// so an operator who never set it up doesn't leak that these routes
+/// Who a `/v1/admin/*` request is authorized as, once `check_admin_auth`
+/// succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminIdentity {
+    /// Authenticated with `server.admin_key_env` -- sees and manages every
+    /// client, regardless of organization.
+    Global,
+    /// Authenticated with an admin-role client's own API key -- scoped to
+    /// clients sharing this same `organization` (`None` is its own bucket,
+    /// matching only other organization-less clients, not every client).
+    Scoped { organization: Option<String> },
+}
+
+/// True if `/v1/admin/*` is reachable at all: `server.admin_key_env`
+/// resolved, or at least one configured/provisioned client has
+/// `role = "admin"`.
+fn admin_api_enabled(state: &AppState) -> bool {
+    state.admin_key.is_some()
+        || state
+            .clients
+            .read()
+            .unwrap()
+            .iter()
+            .any(|c| c.role == ClientRole::Admin)
+}
+
+/// Gates `/v1/admin/*`. Two ways in: the global `server.admin_key_env`
+/// token (unscoped), or an admin-role client's own API key (scoped to its
+/// `organization` -- see `AdminIdentity::Scoped`). A plain client key, or
+/// any token at all when neither is configured, is rejected -- those grant
+/// access to chat completions, not to other clients' spend data. Reports
+/// `404` (not `401`) when the admin API isn't reachable by either path, so
+/// an operator who never set either up doesn't leak that these routes
 /// exist.
-pub fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let Some(admin_key) = &state.admin_key else {
-        return Some(json_error(404, "not found"));
+pub fn check_admin_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AdminIdentity, Box<Response>> {
+    if !admin_api_enabled(state) {
+        return Err(Box::new(json_error(404, "not found")));
+    }
+
+    let Some(token) = bearer_token(headers) else {
+        return Err(Box::new(json_error(
+            401,
+            "missing or invalid admin API key",
+        )));
     };
 
-    match bearer_token(headers) {
-        Some(token) if token == admin_key => None,
-        _ => Some(json_error(401, "missing or invalid admin API key")),
+    if state.admin_key.as_deref() == Some(token) {
+        return Ok(AdminIdentity::Global);
+    }
+
+    let scoped_client_name = state
+        .client_keys
+        .read()
+        .unwrap()
+        .get(token)
+        .map(|(name, _)| name.clone());
+    if let Some(name) = scoped_client_name {
+        let clients = state.clients.read().unwrap();
+        if let Some(client) = clients
+            .iter()
+            .find(|c| c.name == name && c.role == ClientRole::Admin)
+        {
+            return Ok(AdminIdentity::Scoped {
+                organization: client.organization.clone(),
+            });
+        }
+    }
+
+    Err(Box::new(json_error(
+        401,
+        "missing or invalid admin API key",
+    )))
+}
+
+/// `true` if `client` is visible to `identity` -- every client for
+/// `Global`, only those sharing the same `organization` for `Scoped`.
+fn in_admin_scope(identity: &AdminIdentity, client: &ClientConfig) -> bool {
+    match identity {
+        AdminIdentity::Global => true,
+        AdminIdentity::Scoped { organization } => &client.organization == organization,
     }
 }
 
@@ -361,12 +429,25 @@ mod tests {
         );
     }
 
+    fn client_config(name: &str, organization: Option<&str>, role: ClientRole) -> ClientConfig {
+        ClientConfig {
+            name: name.to_string(),
+            api_key_env: String::new(),
+            requests_per_minute: 30,
+            budget_usd: None,
+            budget_period: BudgetPeriod::default(),
+            organization: organization.map(str::to_string),
+            workspace: None,
+            role,
+        }
+    }
+
     // --- check_admin_auth ------------------------------------------------------
 
     #[tokio::test]
     async fn check_admin_auth_is_404_when_admin_key_is_not_configured() {
         let state = test_state(vec![], None).await;
-        let resp = check_admin_auth(&state, &HeaderMap::new()).unwrap();
+        let resp = check_admin_auth(&state, &HeaderMap::new()).unwrap_err();
         assert_eq!(resp.status(), 404);
     }
 
@@ -376,7 +457,7 @@ mod tests {
             admin_key: Some("admin-secret".to_string()),
             ..test_state(vec![], None).await
         };
-        let resp = check_admin_auth(&state, &HeaderMap::new()).unwrap();
+        let resp = check_admin_auth(&state, &HeaderMap::new()).unwrap_err();
         assert_eq!(resp.status(), 401);
     }
 
@@ -386,7 +467,7 @@ mod tests {
             admin_key: Some("admin-secret".to_string()),
             ..test_state(vec![], None).await
         };
-        let resp = check_admin_auth(&state, &bearer_headers("wrong")).unwrap();
+        let resp = check_admin_auth(&state, &bearer_headers("wrong")).unwrap_err();
         assert_eq!(resp.status(), 401);
     }
 
@@ -394,13 +475,54 @@ mod tests {
     async fn check_admin_auth_rejects_a_regular_client_key() {
         // A client key that authenticates chat completions must not also
         // unlock the admin API -- they're deliberately separate trust
-        // levels.
+        // levels, unless the client is explicitly given `role = "admin"`.
         let state = AppState {
             admin_key: Some("admin-secret".to_string()),
+            clients: Arc::new(std::sync::RwLock::new(vec![client_config(
+                "acme",
+                None,
+                ClientRole::Member,
+            )])),
             ..test_state(vec![("client-key", "acme", 30)], None).await
         };
-        let resp = check_admin_auth(&state, &bearer_headers("client-key")).unwrap();
+        let resp = check_admin_auth(&state, &bearer_headers("client-key")).unwrap_err();
         assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn check_admin_auth_accepts_an_admin_role_clients_own_key_as_scoped() {
+        let state = AppState {
+            clients: Arc::new(std::sync::RwLock::new(vec![client_config(
+                "acme",
+                Some("acme-corp"),
+                ClientRole::Admin,
+            )])),
+            ..test_state(vec![("client-key", "acme", 30)], None).await
+        };
+        let identity = check_admin_auth(&state, &bearer_headers("client-key")).unwrap();
+        assert_eq!(
+            identity,
+            AdminIdentity::Scoped {
+                organization: Some("acme-corp".to_string())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn check_admin_auth_is_reachable_via_an_admin_role_client_with_no_global_key_configured()
+    {
+        // admin_api_enabled must consider role="admin" clients even when
+        // server.admin_key_env was never set -- otherwise this would 404
+        // instead of authenticating.
+        let state = AppState {
+            clients: Arc::new(std::sync::RwLock::new(vec![client_config(
+                "acme",
+                None,
+                ClientRole::Admin,
+            )])),
+            ..test_state(vec![("client-key", "acme", 30)], None).await
+        };
+        assert!(check_admin_auth(&state, &bearer_headers("client-key")).is_ok());
     }
 
     #[tokio::test]
@@ -409,7 +531,7 @@ mod tests {
             admin_key: Some("admin-secret".to_string()),
             ..test_state(vec![], None).await
         };
-        assert!(check_admin_auth(&state, &bearer_headers("admin-secret")).is_none());
+        assert!(check_admin_auth(&state, &bearer_headers("admin-secret")).is_ok());
     }
 
     // --- budget_exceeded_response ----------------------------------------------
@@ -584,6 +706,9 @@ pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Respo
 #[derive(Serialize)]
 struct AdminClientEntry {
     name: String,
+    organization: Option<String>,
+    workspace: Option<String>,
+    role: ClientRole,
     requests_per_minute: u32,
     budget_usd: Option<f64>,
     budget_period: Option<rp_router::BudgetPeriod>,
@@ -594,23 +719,107 @@ struct AdminClientEntry {
 }
 
 pub async fn admin_list_clients(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(resp) = check_admin_auth(&state, &headers) {
-        return resp;
-    }
+    let identity = match check_admin_auth(&state, &headers) {
+        Ok(identity) => identity,
+        Err(resp) => return *resp,
+    };
 
     // Clone out of the lock before the `.await` loop below -- a std
     // `RwLockReadGuard` held across an await point would make this
     // future non-`Send`, which axum handlers must be.
-    let clients = state.clients.read().unwrap().clone();
+    let clients: Vec<_> = state
+        .clients
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|c| in_admin_scope(&identity, c))
+        .cloned()
+        .collect();
     let mut data = Vec::with_capacity(clients.len());
     for client in &clients {
         let status = state.router.client_spend_status(&client.name).await;
         data.push(AdminClientEntry {
             name: client.name.clone(),
+            organization: client.organization.clone(),
+            workspace: client.workspace.clone(),
+            role: client.role,
             requests_per_minute: client.requests_per_minute,
             budget_usd: client.budget_usd,
             budget_period: status.map(|s| s.period),
             spent_usd: status.map(|s| s.spent_usd),
+        });
+    }
+
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+#[derive(Serialize)]
+struct OrganizationClientEntry {
+    name: String,
+    workspace: Option<String>,
+    role: ClientRole,
+    requests_per_minute: u32,
+    budget_usd: Option<f64>,
+    spent_usd: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct OrganizationEntry {
+    organization: Option<String>,
+    clients: Vec<OrganizationClientEntry>,
+}
+
+/// Rolls up every client `identity` can see into `(organization,
+/// [workspace-tagged clients])` groups -- a `Global` caller gets one group
+/// per distinct `organization` value (including `null` for organization-
+/// less clients); a `Scoped` caller only ever gets its own single group,
+/// since `in_admin_scope` already filtered to just that organization.
+pub async fn admin_list_organizations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let identity = match check_admin_auth(&state, &headers) {
+        Ok(identity) => identity,
+        Err(resp) => return *resp,
+    };
+
+    let clients: Vec<_> = state
+        .clients
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|c| in_admin_scope(&identity, c))
+        .cloned()
+        .collect();
+
+    let mut groups: Vec<(Option<String>, Vec<ClientConfig>)> = Vec::new();
+    for client in clients {
+        match groups
+            .iter_mut()
+            .find(|(org, _)| org == &client.organization)
+        {
+            Some((_, members)) => members.push(client),
+            None => groups.push((client.organization.clone(), vec![client])),
+        }
+    }
+
+    let mut data = Vec::with_capacity(groups.len());
+    for (organization, members) in groups {
+        let mut entries = Vec::with_capacity(members.len());
+        for client in &members {
+            let status = state.router.client_spend_status(&client.name).await;
+            entries.push(OrganizationClientEntry {
+                name: client.name.clone(),
+                workspace: client.workspace.clone(),
+                role: client.role,
+                requests_per_minute: client.requests_per_minute,
+                budget_usd: client.budget_usd,
+                spent_usd: status.map(|s| s.spent_usd),
+            });
+        }
+        data.push(OrganizationEntry {
+            organization,
+            clients: entries,
         });
     }
 
@@ -622,8 +831,22 @@ pub async fn admin_reset_client_spend(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Some(resp) = check_admin_auth(&state, &headers) {
-        return resp;
+    let identity = match check_admin_auth(&state, &headers) {
+        Ok(identity) => identity,
+        Err(resp) => return *resp,
+    };
+
+    let in_scope = state
+        .clients
+        .read()
+        .unwrap()
+        .iter()
+        .any(|c| c.name == name && in_admin_scope(&identity, c));
+    if !in_scope {
+        return json_error(
+            404,
+            &format!("no client named \"{name}\" with a configured budget"),
+        );
     }
 
     if state.router.reset_client_spend(&name) {
@@ -663,11 +886,25 @@ pub struct CreateClientRequest {
     /// ever shown, the same hygiene as GitHub/Stripe-style API keys.
     #[serde(default)]
     api_key: Option<String>,
+    /// A `Global` caller may set this to any value (or leave it unset for
+    /// no organization). A `Scoped` caller (an admin-role client's own
+    /// key) always has it forced to their own organization, regardless of
+    /// what's sent here -- creating a client outside your own organization
+    /// isn't a thing a scoped admin can do.
+    #[serde(default)]
+    organization: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    role: ClientRole,
 }
 
 #[derive(Serialize)]
 struct ClientProvisionResponse {
     name: String,
+    organization: Option<String>,
+    workspace: Option<String>,
+    role: ClientRole,
     requests_per_minute: u32,
     budget_usd: Option<f64>,
     budget_period: BudgetPeriod,
@@ -682,15 +919,16 @@ pub async fn admin_create_client(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Some(resp) = check_admin_auth(&state, &headers) {
-        return resp;
-    }
+    let identity = match check_admin_auth(&state, &headers) {
+        Ok(identity) => identity,
+        Err(resp) => return *resp,
+    };
     // Deserialized only after the auth check above -- unlike a `Json<T>`
     // extractor parameter, which axum would run before the handler body
     // (and thus before `check_admin_auth`) even executes, leaking a 415 on
     // a malformed/missing body to an unauthenticated caller instead of the
     // 401/404 they should see.
-    let req: CreateClientRequest = match serde_json::from_slice(&body) {
+    let mut req: CreateClientRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(e) => return json_error(400, &format!("invalid request body: {e}")),
     };
@@ -702,6 +940,9 @@ pub async fn admin_create_client(
     }
     if req.budget_usd.is_some_and(|b| b < 0.0) {
         return json_error(400, "\"budget_usd\" must not be negative");
+    }
+    if let AdminIdentity::Scoped { organization } = &identity {
+        req.organization = organization.clone();
     }
 
     {
@@ -731,6 +972,9 @@ pub async fn admin_create_client(
         requests_per_minute: req.requests_per_minute,
         budget_usd: req.budget_usd,
         budget_period: req.budget_period,
+        organization: req.organization.clone(),
+        workspace: req.workspace.clone(),
+        role: req.role,
     });
     state.router.set_client_budget(
         &req.name,
@@ -742,6 +986,9 @@ pub async fn admin_create_client(
         StatusCode::CREATED,
         Json(ClientProvisionResponse {
             name: req.name,
+            organization: req.organization,
+            workspace: req.workspace,
+            role: req.role,
             requests_per_minute: req.requests_per_minute,
             budget_usd: req.budget_usd,
             budget_period: req.budget_period,
@@ -784,9 +1031,10 @@ pub async fn admin_update_client(
     Path(name): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Some(resp) = check_admin_auth(&state, &headers) {
-        return resp;
-    }
+    let identity = match check_admin_auth(&state, &headers) {
+        Ok(identity) => identity,
+        Err(resp) => return *resp,
+    };
     // See `admin_create_client` for why this is deserialized manually
     // after the auth check, rather than via a `Json<T>` extractor
     // parameter.
@@ -809,7 +1057,10 @@ pub async fn admin_update_client(
 
     let updated = {
         let mut clients = state.clients.write().unwrap();
-        let Some(client) = clients.iter_mut().find(|c| c.name == name) else {
+        let Some(client) = clients
+            .iter_mut()
+            .find(|c| c.name == name && in_admin_scope(&identity, c))
+        else {
             return json_error(404, &format!("no client named \"{name}\""));
         };
         if let Some(rpm) = req.requests_per_minute {
@@ -854,6 +1105,9 @@ pub async fn admin_update_client(
 
     Json(ClientProvisionResponse {
         name: updated.name,
+        organization: updated.organization,
+        workspace: updated.workspace,
+        role: updated.role,
         requests_per_minute: updated.requests_per_minute,
         budget_usd: updated.budget_usd,
         budget_period: updated.budget_period,
@@ -867,14 +1121,15 @@ pub async fn admin_delete_client(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Some(resp) = check_admin_auth(&state, &headers) {
-        return resp;
-    }
+    let identity = match check_admin_auth(&state, &headers) {
+        Ok(identity) => identity,
+        Err(resp) => return *resp,
+    };
 
     let removed = {
         let mut clients = state.clients.write().unwrap();
         let before = clients.len();
-        clients.retain(|c| c.name != name);
+        clients.retain(|c| !(c.name == name && in_admin_scope(&identity, c)));
         clients.len() != before
     };
     if !removed {

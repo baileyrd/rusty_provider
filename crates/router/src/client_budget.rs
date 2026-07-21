@@ -113,6 +113,9 @@ mod tests {
             requests_per_minute: 60,
             budget_usd,
             budget_period: period,
+            organization: None,
+            workspace: None,
+            role: crate::config::ClientRole::default(),
         }
     }
 

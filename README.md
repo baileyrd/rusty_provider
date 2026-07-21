@@ -960,11 +960,13 @@ and managing configured clients' spend budgets:
 admin_key_env = "RUSTY_PROVIDER_ADMIN_KEY"
 ```
 
-- **`GET /v1/admin/clients`** — every configured `[[clients]]` entry, its
-  `requests_per_minute`, and (for clients with `budget_usd` set) its
-  current-period `spent_usd` and `budget_period`. A client with no
-  configured budget still appears, with `budget_usd`/`budget_period`/
-  `spent_usd` all `null`.
+- **`GET /v1/admin/clients`** — every `[[clients]]` entry the caller can
+  see (see [Organizations, workspaces & roles](#organizations-workspaces--roles)
+  below for what that means for a scoped caller), its `organization`/
+  `workspace`/`role`, `requests_per_minute`, and (for clients with
+  `budget_usd` set) its current-period `spent_usd` and `budget_period`. A
+  client with no configured budget still appears, with `budget_usd`/
+  `budget_period`/`spent_usd` all `null`.
 - **`POST /v1/admin/clients/{name}/reset-spend`** — zeroes that client's
   tracked spend for the current period, immediately un-blocking a client
   that's hit `402`. `404` for a client name that doesn't exist or has no
@@ -977,7 +979,10 @@ admin_key_env = "RUSTY_PROVIDER_ADMIN_KEY"
     "requests_per_minute": 60,
     "budget_usd": 10.0,       // optional, omit for unrestricted
     "budget_period": "monthly", // optional, "total" (default) / "daily" / "weekly" / "monthly"
-    "api_key": "..."          // optional -- omit to have the server generate one
+    "api_key": "...",         // optional -- omit to have the server generate one
+    "organization": "acme-corp", // optional, see Organizations below
+    "workspace": "prod",      // optional
+    "role": "member"          // optional, "member" (default) / "admin"
   }
   ```
   Responds `201` with the same shape plus `api_key` — the server-generated
@@ -985,7 +990,9 @@ admin_key_env = "RUSTY_PROVIDER_ADMIN_KEY"
   same hygiene as GitHub/Stripe-style API keys, so save it immediately.
   `400` for an empty `name`, a `requests_per_minute` of `0`, or a negative
   `budget_usd`; `409` if `name` or `api_key` collides with an existing
-  client.
+  client. A caller authenticated as a scoped (organization-admin) client
+  always has `organization` pinned to its own, regardless of what's sent —
+  see [Organizations, workspaces & roles](#organizations-workspaces--roles).
 - **`PATCH /v1/admin/clients/{name}`** — updates an existing client
   (config-defined or runtime-provisioned). Every field is optional and
   independent: omit a field to leave it unchanged, send `"budget_usd":
@@ -994,18 +1001,23 @@ admin_key_env = "RUSTY_PROVIDER_ADMIN_KEY"
   `"rotate_api_key": true` to revoke the client's current key and issue a
   new one, returned in the response the same one-time way creation does.
   `404` for an unknown client, `400` for an invalid `requests_per_minute`/
-  `budget_usd`.
+  `budget_usd`. `organization`/`workspace`/`role` are set at creation only
+  — not updatable through this endpoint.
 - **`DELETE /v1/admin/clients/{name}`** — removes a client entirely,
   immediately revoking its key and dropping its budget/spend tracking.
   `404` for an unknown client.
 
-Requests to every route above need `Authorization: Bearer <token>` matching
-`admin_key_env`'s resolved value — **not** `server.api_key_env` or any
-`[[clients]]` key, which authenticate chat completions but deliberately
-don't also grant access to every other client's spend data or the ability
-to provision/reset/delete clients. Leaving `admin_key_env` unset disables
-the admin API entirely: every route `404`s, as if it didn't exist, rather
-than silently falling open once *any* auth is configured elsewhere.
+Requests to every route above need `Authorization: Bearer <token>`, from
+one of two sources: `admin_key_env`'s resolved value (unscoped — sees and
+manages every client, in every organization), or an admin-role client's
+own key (scoped to its own `organization` — see
+[Organizations, workspaces & roles](#organizations-workspaces--roles)).
+**Not** `server.api_key_env` or a plain (`role = "member"`) `[[clients]]`
+key, which authenticate chat completions but deliberately don't also grant
+admin access. Leaving `admin_key_env` unset, with no admin-role client
+configured either, disables the admin API entirely: every route `404`s,
+as if it didn't exist, rather than silently falling open once *any* auth
+is configured elsewhere.
 
 Runtime-provisioned clients (created/updated/deleted via this API) are
 **in-memory only** — they don't survive a restart, and aren't written to
@@ -1017,6 +1029,79 @@ permanent client registry. A config-defined client can still be updated or
 deleted at runtime through this API — the change just doesn't get written
 back to `config.toml`, so a later restart reverts it to what the file
 says.
+
+## Organizations, workspaces & roles
+
+`[[clients]]` entries (config-defined or admin-API-provisioned) can carry
+three extra fields:
+
+```toml
+[[clients]]
+name = "acme-admin"
+api_key_env = "CLIENT_ACME_ADMIN_API_KEY"
+requests_per_minute = 60
+organization = "acme-corp"
+workspace = "prod"
+role = "admin"
+```
+
+`organization` and `workspace` are labels — a client's `organization`
+groups it (and only it) for `GET /v1/admin/organizations` below;
+`workspace` sub-groups it within that rollup. Neither has any effect on
+chat completions: two clients in different organizations are otherwise
+completely ordinary, independent `[[clients]]` entries. `role` is the one
+with teeth: `"admin"` (the default is `"member"`, i.e. no admin access at
+all) lets that client's own API key *also* authenticate to `/v1/admin/*`,
+in addition to `server.admin_key_env` — but only ever scoped to clients
+sharing its own `organization`. An admin-role client with no
+`organization` set is scoped to the shared "no organization" bucket
+(every other org-less client), not to every client everywhere — that
+breadth is reserved for `admin_key_env`.
+
+Concretely, an org-scoped admin's key:
+
+- `GET /v1/admin/clients` / `GET /v1/admin/organizations` only return
+  clients in its own organization.
+- `POST /v1/admin/clients` always creates the new client in its own
+  organization, regardless of what `organization` the request body sends.
+- `PATCH`/`DELETE /v1/admin/clients/{name}` and
+  `POST /v1/admin/clients/{name}/reset-spend` `404` (not `403`, so a
+  scoped admin can't distinguish "wrong organization" from "doesn't
+  exist") for any client outside its own organization.
+
+**`GET /v1/admin/organizations`** rolls up every client the caller can see
+into `(organization, [clients])` groups — one group per distinct
+`organization` value (`server.admin_key_env` sees every group; a
+scoped admin only ever sees its own single group):
+
+```jsonc
+{
+  "object": "list",
+  "data": [
+    {
+      "organization": "acme-corp",
+      "clients": [
+        {
+          "name": "acme-admin",
+          "workspace": "prod",
+          "role": "admin",
+          "requests_per_minute": 60,
+          "budget_usd": null,
+          "spent_usd": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+This is deliberately not a full multi-tenant identity system — there's no
+separate "organization" or "workspace" entity with its own settings,
+membership list, or invitations, just a label on `[[clients]]` and a
+same-organization check on top of the existing admin API. It's enough to
+let an operator delegate "manage your own team's clients" without handing
+out the unscoped `admin_key_env`, which is the actual problem this scopes
+down to.
 
 ## Persistence
 
