@@ -80,6 +80,31 @@ fn rate_limited_response(state: &AppState, identity: &str, retry_after_secs: f64
     )
 }
 
+/// The configured `[[clients]]` name whose key matches this request's
+/// bearer token, if any. `None` for an unauthenticated request, one using
+/// only the shared `server.api_key_env` token, or an unmatched caller —
+/// spend budgets only apply to named clients, never the IP-bucketed
+/// fallback.
+fn matched_client_name<'a>(state: &'a AppState, headers: &HeaderMap) -> Option<&'a str> {
+    let token = bearer_token(headers)?;
+    state.client_keys.get(token).map(|(name, _)| name.as_str())
+}
+
+fn budget_exceeded_response(
+    state: &AppState,
+    client_name: &str,
+    exceeded: crate::budget::BudgetExceeded,
+) -> Response {
+    state.router.record_client_budget_rejection(client_name);
+    json_error(
+        402,
+        &format!(
+            "client \"{client_name}\" has exceeded its configured budget (${:.2} spent of ${:.2})",
+            exceeded.spent_usd, exceeded.budget_usd
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +132,7 @@ mod tests {
             client_keys: Arc::new(client_keys),
             default_rate_limit_rpm,
             rate_limiter: Arc::new(RateLimiter::new()),
+            client_budgets: Arc::new(crate::budget::ClientBudgets::from_clients(&[])),
         }
     }
 
@@ -226,6 +252,86 @@ mod tests {
             .unwrap()
             .contains("retry after 5s"));
     }
+
+    // --- matched_client_name -------------------------------------------------
+
+    #[test]
+    fn matched_client_name_is_none_with_no_bearer_token() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None);
+        assert_eq!(matched_client_name(&state, &HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn matched_client_name_is_none_for_an_unmatched_token() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None);
+        assert_eq!(
+            matched_client_name(&state, &bearer_headers("wrong-key")),
+            None
+        );
+    }
+
+    #[test]
+    fn matched_client_name_returns_the_name_for_a_matching_client_token() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None);
+        assert_eq!(
+            matched_client_name(&state, &bearer_headers("secret-key")),
+            Some("acme")
+        );
+    }
+
+    // --- budget_exceeded_response ----------------------------------------------
+
+    #[test]
+    fn budget_exceeded_response_returns_402() {
+        let state = test_state(vec![], None);
+        let resp = budget_exceeded_response(
+            &state,
+            "acme",
+            crate::budget::BudgetExceeded {
+                spent_usd: 12.5,
+                budget_usd: 10.0,
+            },
+        );
+        assert_eq!(resp.status(), 402);
+    }
+
+    #[test]
+    fn budget_exceeded_response_records_the_rejection_under_the_client_name() {
+        let state = test_state(vec![], None);
+        budget_exceeded_response(
+            &state,
+            "acme",
+            crate::budget::BudgetExceeded {
+                spent_usd: 12.5,
+                budget_usd: 10.0,
+            },
+        );
+        let metrics = state.router.render_prometheus_metrics();
+        assert!(metrics.contains("rusty_provider_client_budget_rejections_total"));
+        assert!(metrics.contains(r#"client="acme""#));
+    }
+
+    #[tokio::test]
+    async fn budget_exceeded_response_body_reports_the_client_and_amounts() {
+        let state = test_state(vec![], None);
+        let resp = budget_exceeded_response(
+            &state,
+            "acme",
+            crate::budget::BudgetExceeded {
+                spent_usd: 12.5,
+                budget_usd: 10.0,
+            },
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], 402);
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("acme"));
+        assert!(message.contains("12.50"));
+        assert!(message.contains("10.00"));
+    }
 }
 
 pub async fn health() -> &'static str {
@@ -311,15 +417,28 @@ pub async fn chat_completions(
         return json_error(400, "\"messages\" must not be empty");
     }
 
+    let client_name = matched_client_name(&state, &headers).map(str::to_string);
+    if let Some(name) = &client_name {
+        if let Err(exceeded) = state.client_budgets.check(name) {
+            return budget_exceeded_response(&state, name, exceeded);
+        }
+    }
+
     if req.is_streaming() {
         match state.router.dispatch_stream(&req).await {
             Ok(chunk_stream) => {
+                let client_budgets = state.client_budgets.clone();
                 let events = chunk_stream
-                    .map(|item| {
+                    .map(move |item| {
                         let event = match item {
-                            Ok(chunk) => Event::default()
-                                .json_data(&chunk)
-                                .unwrap_or_else(|_| Event::default().data("{}")),
+                            Ok(chunk) => {
+                                if let (Some(name), Some(cost)) = (&client_name, chunk.cost_usd) {
+                                    client_budgets.record(name, cost);
+                                }
+                                Event::default()
+                                    .json_data(&chunk)
+                                    .unwrap_or_else(|_| Event::default().data("{}"))
+                            }
                             Err(e) => Event::default()
                                 .event("error")
                                 .data(json!({"error": {"message": e.to_string()}}).to_string()),
@@ -336,7 +455,12 @@ pub async fn chat_completions(
         }
     } else {
         match state.router.dispatch(&req).await {
-            Ok(resp) => Json(resp).into_response(),
+            Ok(resp) => {
+                if let (Some(name), Some(cost)) = (&client_name, resp.cost_usd) {
+                    state.client_budgets.record(name, cost);
+                }
+                Json(resp).into_response()
+            }
             Err(e) => router_error_response(e),
         }
     }

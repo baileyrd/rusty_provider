@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod errors;
 pub mod routes;
 pub mod state;

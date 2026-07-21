@@ -121,10 +121,22 @@ completion_per_million = 0.79
 # under that client's name rather than the source-IP fallback. Skipped
 # (with a warning) if its api_key_env isn't set, same as providers.
 
+# Each client can also cap its own spend with `budget_usd` -- once its
+# tracked cost_usd (the same figure GET /v1/usage reports, computed from
+# [[pricing]]) reaches this many US dollars for the current
+# `budget_period`, further requests get 402 until the period resets.
+# `budget_period` is "total" (a lifetime cap, the default) or "monthly"
+# (resets at the start of each calendar month, UTC). Omit `budget_usd`
+# entirely for an unrestricted client, same as leaving it commented out.
+# Like everything else cost-related, this only tracks requests to models
+# with a [[pricing]] entry -- unpriced requests don't count against it.
+
 # [[clients]]
 # name = "hermes"
 # api_key_env = "CLIENT_HERMES_API_KEY"
 # requests_per_minute = 60
+# budget_usd = 50.0
+# budget_period = "monthly"
 #
 # [[clients]]
 # name = "openclaw"
