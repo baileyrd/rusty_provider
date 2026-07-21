@@ -20,6 +20,9 @@ pub enum RouterError {
     #[error("no preset named \"{0}\"")]
     UnknownPreset(String),
 
+    #[error("request blocked by moderation (flagged categories: {})", .0.join(", "))]
+    ModerationFlagged(Vec<String>),
+
     #[error(transparent)]
     Provider(#[from] ProviderError),
 }
@@ -32,6 +35,7 @@ impl RouterError {
             RouterError::NoEligibleProvider(_) => 400,
             RouterError::GuardrailBlocked(_) => 400,
             RouterError::UnknownPreset(_) => 400,
+            RouterError::ModerationFlagged(_) => 400,
             RouterError::Provider(e) => e.status_code(),
         }
     }
@@ -89,6 +93,14 @@ mod tests {
     fn unknown_preset_maps_to_400() {
         assert_eq!(
             RouterError::UnknownPreset("support-bot".to_string()).status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn moderation_flagged_maps_to_400() {
+        assert_eq!(
+            RouterError::ModerationFlagged(vec!["violence".to_string()]).status_code(),
             400
         );
     }

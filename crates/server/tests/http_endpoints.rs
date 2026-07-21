@@ -479,6 +479,108 @@ async fn chat_completions_blocks_a_request_matching_a_block_guardrail() {
 }
 
 #[tokio::test]
+async fn chat_completions_blocks_a_request_flagged_by_moderation() {
+    let moderation_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/moderations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{
+                "flagged": true,
+                "categories": {"violence": true, "hate": false}
+            }]
+        })))
+        .mount(&moderation_server)
+        .await;
+
+    let moderation_key_var = unique_env_var("MODERATION_KEY");
+    std::env::set_var(&moderation_key_var, "moderation-key");
+    let config = format!(
+        r#"
+        providers = {{}}
+
+        [moderation]
+        api_key_env = "{moderation_key_var}"
+        base_url = "{}"
+        "#,
+        moderation_server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "something violent"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("violence"));
+}
+
+#[tokio::test]
+async fn chat_completions_allows_the_request_through_when_the_moderation_backend_is_unreachable() {
+    let provider_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello there"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        })))
+        .mount(&provider_server)
+        .await;
+
+    let openai_key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&openai_key_var, "test-key");
+    let moderation_key_var = unique_env_var("MODERATION_KEY");
+    std::env::set_var(&moderation_key_var, "moderation-key");
+    let config = format!(
+        r#"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{openai_key_var}"
+
+        [moderation]
+        api_key_env = "{moderation_key_var}"
+        base_url = "http://127.0.0.1:0"
+        "#,
+        provider_server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "an unreachable moderation backend must fail open, not block the request"
+    );
+}
+
+#[tokio::test]
 async fn chat_completions_redacts_a_request_matching_a_redact_guardrail_before_dispatch() {
     let server = MockServer::start().await;
     // The mock only matches if the request body's content has already

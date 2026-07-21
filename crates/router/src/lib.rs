@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod guardrails;
 mod metrics;
+mod moderation;
 mod persistence;
 mod presets;
 mod webhook;
@@ -15,12 +16,14 @@ use std::time::Instant;
 use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
     AutoRoutingConfig, BudgetPeriod, ClientConfig, ClientRole, Config, GuardrailAction,
-    GuardrailConfig, PersistenceBackend, PersistenceConfig, PostgresTlsMode, PresetConfig,
-    PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig, WebhookConfig,
+    GuardrailConfig, ModerationConfig, PersistenceBackend, PersistenceConfig, PostgresTlsMode,
+    PresetConfig, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig,
+    WebhookConfig,
 };
 pub use error::RouterError;
 use guardrails::Guardrail;
 pub use metrics::Metrics;
+use moderation::{ModerationClient, ModerationError};
 use persistence::{Persistence, PersistenceTarget};
 use webhook::WebhookNotifier;
 
@@ -413,6 +416,10 @@ pub struct Router {
     /// `[auto_routing]`, if configured -- backs `model: "auto"`. `None`
     /// means `"auto"` isn't special-cased at all.
     auto_routing: Option<AutoRoutingConfig>,
+    /// `[moderation]` client, if configured and its `api_key_env`
+    /// resolved. `None` means every request skips the moderation check
+    /// entirely, same as before this field existed.
+    moderation: Option<Arc<ModerationClient>>,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -657,6 +664,21 @@ impl Router {
 
         let auto_routing = config.auto_routing.clone();
 
+        // Same "skip with a warning" resilience as a misconfigured
+        // provider: an unresolvable api_key_env disables moderation
+        // rather than refusing to start the whole router over it.
+        let moderation = config.moderation.as_ref().and_then(|cfg| {
+            match std::env::var(&cfg.api_key_env) {
+                Ok(key) if !key.is_empty() => {
+                    Some(Arc::new(ModerationClient::new(cfg, key)))
+                }
+                _ => {
+                    tracing::warn!(env_var = %cfg.api_key_env, "moderation.api_key_env is set but not resolvable; moderation stays disabled");
+                    None
+                }
+            }
+        });
+
         Self {
             providers,
             provider_kinds,
@@ -679,6 +701,7 @@ impl Router {
             guardrails,
             presets,
             auto_routing,
+            moderation,
         }
     }
 
@@ -1138,6 +1161,38 @@ impl Router {
         guardrails::apply(&self.guardrails, req).map_err(RouterError::GuardrailBlocked)
     }
 
+    /// Checks `req`'s message text against `[moderation]`'s configured
+    /// backend, if any -- a no-op when moderation isn't configured (or its
+    /// `api_key_env` didn't resolve at startup). Intended to run after
+    /// `apply_guardrails`, so a guardrail's own redaction is what gets
+    /// checked, not the raw input. A flagged result blocks the request
+    /// with the triggering category names. A failure to reach the
+    /// moderation backend itself (network error, non-2xx, bad body) fails
+    /// *open* -- the request is allowed through and the failure only
+    /// logged, the same resilience-over-strictness this router already
+    /// gives every other auxiliary system (an unreachable webhook, an
+    /// unreachable persistence backend, an invalid guardrail regex at
+    /// startup): a moderation-backend outage shouldn't take down chat
+    /// completions entirely.
+    pub async fn apply_moderation(&self, req: &ChatRequest) -> Result<(), RouterError> {
+        let Some(moderation) = &self.moderation else {
+            return Ok(());
+        };
+        match moderation.check(req).await {
+            Ok(()) => Ok(()),
+            Err(ModerationError::Flagged(categories)) => {
+                for category in &categories {
+                    self.metrics.record_moderation_blocked(category);
+                }
+                Err(RouterError::ModerationFlagged(categories))
+            }
+            Err(ModerationError::RequestFailed(msg)) => {
+                tracing::warn!("moderation check failed, allowing request through: {msg}");
+                Ok(())
+            }
+        }
+    }
+
     /// If `req.preset` is set, looks up that `[[presets]]` entry and
     /// folds its defaults into `req` (see `presets::apply` for exactly
     /// what that means per field). A no-op when `req.preset` is unset;
@@ -1558,6 +1613,7 @@ mod tests {
             guardrails: Vec::new(),
             presets: HashMap::new(),
             auto_routing: None,
+            moderation: None,
         }
     }
 
@@ -2482,6 +2538,71 @@ mod tests {
         cache.insert(generation_record("id-a"));
         assert!(cache.get("id-a").is_some());
         assert!(cache.get("id-b").is_some());
+    }
+
+    // --- apply_moderation ------------------------------------------------------
+
+    fn moderation_config(base_url: &str) -> ModerationConfig {
+        ModerationConfig {
+            api_key_env: "UNUSED".to_string(),
+            base_url: base_url.to_string(),
+            model: "omni-moderation-latest".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_moderation_is_a_noop_when_unconfigured() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let req = test_request("anthropic/m1");
+        assert!(router.apply_moderation(&req).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn apply_moderation_blocks_and_records_a_metric_per_flagged_category() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/moderations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "flagged": true,
+                    "categories": {"violence": true, "hate": false}
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.moderation = Some(Arc::new(ModerationClient::new(
+            &moderation_config(&server.uri()),
+            "test-key".to_string(),
+        )));
+
+        let req = test_request("anthropic/m1");
+        let err = router.apply_moderation(&req).await.unwrap_err();
+        assert!(
+            matches!(err, RouterError::ModerationFlagged(categories) if categories == vec!["violence".to_string()])
+        );
+
+        let metrics = router.render_prometheus_metrics();
+        assert!(metrics.contains("rusty_provider_moderation_blocked_total"));
+        assert!(metrics.contains(r#"category="violence""#));
+    }
+
+    #[tokio::test]
+    async fn apply_moderation_allows_the_request_through_when_the_backend_is_unreachable() {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        // Port 0 never accepts connections -- a real, unrecoverable
+        // network failure, not just a non-2xx response.
+        router.moderation = Some(Arc::new(ModerationClient::new(
+            &moderation_config("http://127.0.0.1:0"),
+            "test-key".to_string(),
+        )));
+
+        let req = test_request("anthropic/m1");
+        assert!(
+            router.apply_moderation(&req).await.is_ok(),
+            "a moderation-backend outage must fail open, not block the request"
+        );
     }
 
     // --- apply_preset --------------------------------------------------------

@@ -294,6 +294,8 @@ pub struct Config {
     pub presets: Vec<PresetConfig>,
     #[serde(default)]
     pub auto_routing: Option<AutoRoutingConfig>,
+    #[serde(default)]
+    pub moderation: Option<ModerationConfig>,
 }
 
 /// Configures `model: "auto"` -- a heuristic (not ML) complexity-based
@@ -426,6 +428,35 @@ pub struct WebhookConfig {
     /// Unset means no `Authorization` header is sent.
     #[serde(default)]
     pub auth_header_env: Option<String>,
+}
+
+fn default_moderation_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_moderation_model() -> String {
+    "omni-moderation-latest".to_string()
+}
+
+/// Checks every request's message text against an external moderation
+/// endpoint before it's ever dispatched to a provider, blocking anything
+/// flagged. Only OpenAI's `/moderations` endpoint (or a compatible one --
+/// `base_url` is configurable) is supported; Anthropic and Gemini don't
+/// expose a public moderation API of their own. This is a different axis
+/// from `[[guardrails]]`: guardrails are operator-authored regex patterns
+/// (PII, specific keywords), this is a third-party classifier judging
+/// broad policy categories (hate, violence, self-harm, etc.) the operator
+/// doesn't have to enumerate by hand. Runs after guardrails, so a
+/// guardrail's own redaction is what gets checked, not the raw input.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ModerationConfig {
+    /// Name of the environment variable holding the API key for the
+    /// moderation backend (not the key itself).
+    pub api_key_env: String,
+    #[serde(default = "default_moderation_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_moderation_model")]
+    pub model: String,
 }
 
 impl Config {
@@ -1047,6 +1078,49 @@ mod tests {
         let auto_routing = config.auto_routing.unwrap();
         assert_eq!(auto_routing.simple_max_score, 50);
         assert_eq!(auto_routing.medium_max_score, 300);
+    }
+
+    // --- moderation ----------------------------------------------------------------
+
+    #[test]
+    fn moderation_defaults_to_absent() {
+        let config = Config::from_toml_str("providers = {}").unwrap();
+        assert!(config.moderation.is_none());
+    }
+
+    #[test]
+    fn moderation_parses_default_base_url_and_model() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [moderation]
+            api_key_env = "OPENAI_API_KEY"
+            "#,
+        )
+        .unwrap();
+        let moderation = config.moderation.unwrap();
+        assert_eq!(moderation.api_key_env, "OPENAI_API_KEY");
+        assert_eq!(moderation.base_url, "https://api.openai.com/v1");
+        assert_eq!(moderation.model, "omni-moderation-latest");
+    }
+
+    #[test]
+    fn moderation_honors_explicit_base_url_and_model() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [moderation]
+            api_key_env = "OPENAI_API_KEY"
+            base_url = "http://localhost:9999/v1"
+            model = "text-moderation-stable"
+            "#,
+        )
+        .unwrap();
+        let moderation = config.moderation.unwrap();
+        assert_eq!(moderation.base_url, "http://localhost:9999/v1");
+        assert_eq!(moderation.model, "text-moderation-stable");
     }
 
     // --- persistence backend -----------------------------------------------------

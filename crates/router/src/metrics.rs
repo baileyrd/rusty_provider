@@ -31,6 +31,7 @@ pub struct Metrics {
     provider_configured: IntGaugeVec,
     inbound_rate_limit_rejections_total: IntCounterVec,
     client_budget_rejections_total: IntCounterVec,
+    moderation_blocked_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -149,6 +150,19 @@ impl Metrics {
             .register(Box::new(client_budget_rejections_total.clone()))
             .expect("metric name is unique");
 
+        let moderation_blocked_total = IntCounterVec::new(
+            Opts::new(
+                "rusty_provider_moderation_blocked_total",
+                "Requests blocked by [moderation], labeled by the flagged category (\"hate\", \"violence\", etc. -- whatever the moderation backend reports).",
+            ),
+            &["category"],
+        )
+        .expect("valid metric definition");
+
+        registry
+            .register(Box::new(moderation_blocked_total.clone()))
+            .expect("metric name is unique");
+
         Self {
             registry,
             dispatch_attempts_total,
@@ -160,6 +174,7 @@ impl Metrics {
             provider_configured,
             inbound_rate_limit_rejections_total,
             client_budget_rejections_total,
+            moderation_blocked_total,
         }
     }
 
@@ -217,6 +232,12 @@ impl Metrics {
     pub fn record_client_budget_rejection(&self, client_name: &str) {
         self.client_budget_rejections_total
             .with_label_values(&[client_name])
+            .inc();
+    }
+
+    pub fn record_moderation_blocked(&self, category: &str) {
+        self.moderation_blocked_total
+            .with_label_values(&[category])
             .inc();
     }
 
@@ -479,6 +500,32 @@ mod tests {
                 &rendered,
                 "rusty_provider_client_budget_rejections_total",
                 &["client=\"globex\""],
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn record_moderation_blocked_increments_by_category() {
+        let metrics = Metrics::new();
+        metrics.record_moderation_blocked("violence");
+        metrics.record_moderation_blocked("violence");
+        metrics.record_moderation_blocked("hate");
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_moderation_blocked_total",
+                &["category=\"violence\""],
+            ),
+            2.0
+        );
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_moderation_blocked_total",
+                &["category=\"hate\""],
             ),
             1.0
         );
