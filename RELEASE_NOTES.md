@@ -24,8 +24,8 @@ entries are tracked by PR rather than by release.
 
 ---
 
-## Add standard governance/docs scaffold
-**2026-07-21**
+## PR #83 — Add standard governance/docs scaffold
+**2026-07-21** · [#83](https://github.com/baileyrd/rusty_provider/pull/83)
 
 - **Added:** `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`,
   `ARCHITECTURE.md`, `CHANGELOG.md`, this file, PR/issue templates, and
