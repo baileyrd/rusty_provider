@@ -313,6 +313,164 @@ async fn chat_stream_parses_tool_call_deltas_by_index() {
 }
 
 #[tokio::test]
+async fn chat_stream_filters_out_ping_and_content_block_stop_events() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+        "data: {\"type\":\"ping\"}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("claude-sonnet-5");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "claude-sonnet-5")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse"));
+    }
+
+    // "ping" and "content_block_stop" carry nothing we translate, so only
+    // message_start and the text delta produce chunks.
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("Hi"));
+}
+
+#[tokio::test]
+async fn chat_stream_filters_out_an_unrecognized_future_event_type() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+        "data: {\"type\":\"some_future_event_type\",\"foo\":\"bar\"}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("claude-sonnet-5");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "claude-sonnet-5")
+        .await
+        .expect("chat_stream should succeed");
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.expect("chunk should parse without erroring on the unknown type"));
+    }
+
+    assert_eq!(chunks.len(), 1);
+}
+
+#[tokio::test]
+async fn chat_stream_maps_an_error_event_to_an_upstream_error() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("claude-sonnet-5");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "claude-sonnet-5")
+        .await
+        .expect("chat_stream should succeed");
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+    }
+
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_ok());
+    match &items[1] {
+        Err(ProviderError::Upstream { status, message }) => {
+            assert_eq!(*status, 500);
+            assert_eq!(message, "Overloaded");
+        }
+        other => panic!("expected an Upstream error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn chat_stream_yields_a_decode_error_for_malformed_event_json() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+        "data: {not valid json\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("claude-sonnet-5");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "claude-sonnet-5")
+        .await
+        .expect("chat_stream should succeed");
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+    }
+
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_ok());
+    match &items[1] {
+        Err(ProviderError::Decode(_)) => {}
+        other => panic!("expected a Decode error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn chat_stream_yields_no_chunks_for_an_empty_stream() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("", "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let mut req = common::simple_request("claude-sonnet-5");
+    req.stream = Some(true);
+
+    let mut stream = provider
+        .chat_stream(&req, "claude-sonnet-5")
+        .await
+        .expect("chat_stream should succeed");
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
 async fn chat_maps_429_to_retryable_rate_limited() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
