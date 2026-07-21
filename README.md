@@ -788,6 +788,7 @@ proactively. `[webhook]` adds a push notification on top:
 [webhook]
 url = "https://hooks.example.com/rusty-provider"
 auth_header_env = "WEBHOOK_AUTH_HEADER"   # optional; e.g. "Bearer <token>"
+timeout_secs = 10                         # optional, this is the default
 ```
 
 This router POSTs a JSON body to `url` on two events:
@@ -865,6 +866,7 @@ anything flagged:
 api_key_env = "OPENAI_API_KEY"          # can reuse [providers.openai]'s key
 base_url = "https://api.openai.com/v1"  # optional, this is the default
 model = "omni-moderation-latest"        # optional, this is the default
+timeout_secs = 10                       # optional, this is the default
 ```
 
 This is a different axis from [Guardrails](#guardrails) above: a guardrail
@@ -1039,6 +1041,7 @@ answer in information beyond its training data:
 api_key_env = "BRAVE_SEARCH_API_KEY"
 base_url = "https://api.search.brave.com/res/v1/web/search"  # optional, this is the default
 max_results = 5                                                # optional, this is the default
+timeout_secs = 10                                              # optional, this is the default
 ```
 
 ```jsonc

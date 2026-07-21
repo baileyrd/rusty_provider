@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::Serialize;
 
 use crate::config::BudgetPeriod;
@@ -36,9 +38,12 @@ pub(crate) struct WebhookNotifier {
 }
 
 impl WebhookNotifier {
-    pub(crate) fn new(url: String, auth_header: Option<String>) -> Self {
+    pub(crate) fn new(url: String, auth_header: Option<String>, timeout_secs: u64) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .build()
+                .expect("reqwest client should build with a timeout configured"),
             url,
             auth_header,
         }

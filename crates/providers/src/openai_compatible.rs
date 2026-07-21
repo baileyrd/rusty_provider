@@ -33,8 +33,16 @@ impl OpenAiCompatibleProvider {
             name: name.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
-            client: reqwest::Client::new(),
+            client: crate::http::build_client(crate::http::DEFAULT_TIMEOUT),
         }
+    }
+
+    /// Overrides the default per-request timeout (see
+    /// `http::DEFAULT_TIMEOUT`) -- used by `rp-router` to apply
+    /// `[[providers]].timeout_secs`.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.client = crate::http::build_client(timeout);
+        self
     }
 
     fn endpoint(&self) -> String {

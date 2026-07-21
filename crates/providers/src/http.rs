@@ -1,4 +1,27 @@
+use std::time::Duration;
+
 use rp_core::ProviderError;
+
+/// Default total-request timeout for a provider's `reqwest::Client`, used
+/// by every adapter's `new()`. Generous on purpose -- a non-streaming
+/// completion from a large or reasoning-heavy model, or a long-running
+/// stream, can legitimately take minutes; this only needs to bound the
+/// failure mode of a connection that hangs forever, not shave time off
+/// normal slow responses. Overridable per-provider via `with_timeout`
+/// (wired to `[[providers]].timeout_secs` in `rp-router`).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Builds a `reqwest::Client` with `timeout` as its total per-request
+/// timeout (covers connecting, sending, and reading the full response --
+/// including a streamed one). Panics only if the underlying TLS backend
+/// fails to initialize, which `reqwest::Client::new()` (used everywhere
+/// before this) would also have panicked on.
+pub fn build_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("reqwest client should build with a timeout configured")
+}
 
 /// Turn a non-2xx reqwest response into a classified `ProviderError`,
 /// consuming the body for the error message.
@@ -47,6 +70,37 @@ pub fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // --- build_client --------------------------------------------------------
+
+    #[tokio::test]
+    async fn build_client_times_out_a_request_that_outlasts_the_configured_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(200)))
+            .mount(&server)
+            .await;
+
+        let client = build_client(Duration::from_millis(20));
+        let err = client.get(server.uri()).send().await.unwrap_err();
+        assert!(err.is_timeout());
+        assert!(matches!(map_reqwest_error(err), ProviderError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn build_client_succeeds_within_the_configured_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = build_client(Duration::from_secs(5));
+        let resp = client.get(server.uri()).send().await.unwrap();
+        assert!(resp.status().is_success());
+    }
 
     #[test]
     fn extract_error_message_from_nested_error_message_field() {

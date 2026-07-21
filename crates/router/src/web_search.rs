@@ -7,6 +7,8 @@
 //! into the last user message instead of a structured citations/
 //! annotations response field.
 
+use std::time::Duration;
+
 use rp_core::{ChatRequest, ContentPart, MessageContent, Role};
 use serde::Deserialize;
 
@@ -48,7 +50,10 @@ struct BraveResult {
 impl WebSearchClient {
     pub(crate) fn new(config: &WebSearchConfig, api_key: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(config.timeout_secs))
+                .build()
+                .expect("reqwest client should build with a timeout configured"),
             base_url: config.base_url.clone(),
             api_key,
             max_results: config.max_results,
@@ -172,6 +177,7 @@ mod tests {
             api_key_env: "UNUSED".to_string(),
             base_url: base_url.to_string(),
             max_results: 5,
+            timeout_secs: 5,
         }
     }
 
@@ -343,6 +349,24 @@ mod tests {
         // Port 0 never accepts connections -- a real network-level
         // failure, not just a non-2xx response.
         let client = WebSearchClient::new(&config("http://127.0.0.1:0"), "test-key".to_string());
+        assert!(client.search("hello").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn search_fails_when_the_backend_outlasts_timeout_secs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(1200))
+                    .set_body_json(serde_json::json!({"web": {"results": []}})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = config(&server.uri());
+        cfg.timeout_secs = 1;
+        let client = WebSearchClient::new(&cfg, "test-key".to_string());
         assert!(client.search("hello").await.is_err());
     }
 }
