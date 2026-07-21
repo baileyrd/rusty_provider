@@ -2197,6 +2197,267 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    // --- retry/fallback chain exhaustion ----------------------------------------
+
+    #[test]
+    fn dispatch_chain_resolution_returns_invalid_model_for_an_alias_with_an_empty_chain() {
+        // A route alias configured with no entries at all -- resolve_chain
+        // succeeds with an empty Vec (nothing to reject syntactically), and
+        // with no request-side `provider` preferences to short-circuit on,
+        // apply_preferences passes the empty chain straight through. Only
+        // dispatch's loop-then-fallback-to-InvalidModel actually catches it.
+        let router = test_router(vec![], vec![("smart", vec![])], vec![], vec![], vec![]);
+        let chain = router.resolve_chain("smart").unwrap();
+        assert!(chain.is_empty());
+        let chain = router.apply_preferences("smart", chain, None).unwrap();
+        assert!(chain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_invalid_model_when_route_alias_chain_is_empty() {
+        let router = test_router(vec![], vec![("smart", vec![])], vec![], vec![], vec![]);
+
+        let err = router.dispatch(&test_request("smart")).await.unwrap_err();
+
+        assert!(matches!(err, RouterError::InvalidModel(m) if m == "smart"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_exhausts_a_longer_chain_trying_every_candidate_before_failing() {
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::new(AtomicUsize::new(0));
+        let providers = vec![
+            (
+                "a",
+                Arc::new(MockProvider {
+                    name: "a".to_string(),
+                    behavior: MockBehavior::FailRetryable,
+                    calls: calls_a.clone(),
+                }) as Arc<dyn Provider>,
+            ),
+            (
+                "b",
+                Arc::new(MockProvider {
+                    name: "b".to_string(),
+                    behavior: MockBehavior::FailRetryable,
+                    calls: calls_b.clone(),
+                }) as Arc<dyn Provider>,
+            ),
+            (
+                "c",
+                Arc::new(MockProvider {
+                    name: "c".to_string(),
+                    behavior: MockBehavior::FailRetryable,
+                    calls: calls_c.clone(),
+                }) as Arc<dyn Provider>,
+            ),
+        ];
+        let router = test_router(
+            providers,
+            vec![("smart", vec!["a/m1", "b/m2", "c/m3"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let err = router.dispatch(&test_request("smart")).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            RouterError::Provider(ProviderError::Upstream { .. })
+        ));
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            calls_c.load(Ordering::SeqCst),
+            1,
+            "every candidate in the chain must be tried before giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_final_error_reflects_the_last_candidate_even_when_its_kind_differs() {
+        // "a" is configured and fails retryably; "b" isn't registered at
+        // all. The chain still runs to exhaustion and returns whichever
+        // error came last, regardless of whether it's a ProviderError or a
+        // router-level ProviderNotConfigured.
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let a = Arc::new(MockProvider {
+            name: "a".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: calls_a.clone(),
+        });
+        let router = test_router(
+            vec![("a", a)],
+            vec![("smart", vec!["a/m1", "b/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let err = router.dispatch(&test_request("smart")).await.unwrap_err();
+
+        assert!(matches!(err, RouterError::ProviderNotConfigured(p) if p == "b"));
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_stops_on_a_fatal_error_without_trying_remaining_candidates() {
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::new(AtomicUsize::new(0));
+        let a = Arc::new(MockProvider {
+            name: "a".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: calls_a.clone(),
+        });
+        let b = Arc::new(MockProvider {
+            name: "b".to_string(),
+            behavior: MockBehavior::FailFatal,
+            calls: calls_b.clone(),
+        });
+        let c = Arc::new(MockProvider {
+            name: "c".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_c.clone(),
+        });
+        let router = test_router(
+            vec![("a", a), ("b", b), ("c", c)],
+            vec![("smart", vec!["a/m1", "b/m2", "c/m3"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let err = router.dispatch(&test_request("smart")).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            RouterError::Provider(ProviderError::InvalidRequest(_))
+        ));
+        assert_eq!(
+            calls_a.load(Ordering::SeqCst),
+            1,
+            "a is tried and falls back"
+        );
+        assert_eq!(
+            calls_b.load(Ordering::SeqCst),
+            1,
+            "b's fatal error stops the chain"
+        );
+        assert_eq!(
+            calls_c.load(Ordering::SeqCst),
+            0,
+            "c is never reached once b fails fatally"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_falls_back_to_next_candidate_on_retryable_error() {
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let failing = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: calls_a.clone(),
+        });
+        let succeeding = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_b.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", failing), ("openai", succeeding)],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("smart");
+        req.stream = Some(true);
+
+        let mut stream = router
+            .dispatch_stream(&req)
+            .await
+            .expect("should fall through to openai");
+        let chunk = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(chunk.model, "openai/m2");
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_aborts_immediately_on_fatal_error() {
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let failing = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::FailFatal,
+            calls: calls_a.clone(),
+        });
+        let never_called = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_b.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", failing), ("openai", never_called)],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("smart");
+        req.stream = Some(true);
+
+        let err = match router.dispatch_stream(&req).await {
+            Ok(_) => panic!("expected a fatal error"),
+            Err(e) => e,
+        };
+
+        assert!(matches!(
+            err,
+            RouterError::Provider(ProviderError::InvalidRequest(_))
+        ));
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_returns_last_error_when_every_candidate_fails() {
+        let a = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let b = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let router = test_router(
+            vec![("anthropic", a), ("openai", b)],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("smart");
+        req.stream = Some(true);
+
+        let err = match router.dispatch_stream(&req).await {
+            Ok(_) => panic!("expected every candidate to fail"),
+            Err(e) => e,
+        };
+
+        assert!(matches!(
+            err,
+            RouterError::Provider(ProviderError::Upstream { .. })
+        ));
+    }
+
     // --- RouterError -----------------------------------------------------------
 
     #[test]
