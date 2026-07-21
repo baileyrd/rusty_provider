@@ -599,6 +599,13 @@ impl Router {
         if prefs.zdr == Some(true) {
             chain.retain(|(provider, _)| self.zdr_providers.contains(provider));
         }
+        if let Some(max_price) = prefs.max_price {
+            chain.retain(|(provider, model)| {
+                self.pricing
+                    .get(&format!("{provider}/{model}"))
+                    .is_some_and(|rates| rates.prompt_ppm <= max_price)
+            });
+        }
         if chain.is_empty() {
             return Err(RouterError::NoEligibleProvider(model.to_string()));
         }
@@ -1637,6 +1644,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_max_price_drops_candidates_priced_above_the_ceiling() {
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![("anthropic/m1", 3.0, 15.0), ("gemini/m3", 0.1, 0.4)],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            max_price: Some(1.0),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("gemini", "m3")]));
+    }
+
+    #[test]
+    fn apply_preferences_max_price_drops_candidates_with_no_configured_price() {
+        // Without a price on record the router can't verify the candidate
+        // is under the ceiling, so an unpriced entry is dropped too rather
+        // than let through unchecked.
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![("gemini/m3", 0.1, 0.4)],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            max_price: Some(1.0),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("gemini", "m3")]));
+    }
+
+    #[test]
+    fn apply_preferences_max_price_below_every_candidate_errors() {
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![("anthropic/m1", 3.0, 15.0)],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            max_price: Some(1.0),
+            ..Default::default()
+        };
+        let err = router
+            .apply_preferences("smart", chain(&[("anthropic", "m1")]), Some(&prefs))
+            .unwrap_err();
+        assert!(matches!(err, RouterError::NoEligibleProvider(_)));
+    }
+
+    #[test]
+    fn apply_preferences_max_price_applies_before_sort_price() {
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![
+                ("anthropic/m1", 3.0, 15.0),
+                ("openai/m2", 1.0, 5.0),
+                ("gemini/m3", 0.1, 0.4),
+            ],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            max_price: Some(1.0),
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("gemini", "m3"), ("openai", "m2")]));
     }
 
     #[test]

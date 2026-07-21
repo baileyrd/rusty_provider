@@ -392,6 +392,14 @@ pub struct ProviderPreferences {
     /// verifies against the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zdr: Option<bool>,
+    /// Drop every candidate priced above this, in USD per million prompt
+    /// tokens -- the same `prompt_per_million` figure `sort: "price"`
+    /// consults from `[[pricing]]`. A candidate with no configured price
+    /// is dropped too, on the same reasoning as `zdr`: an unverifiable
+    /// claim isn't a satisfied one, so with a hard ceiling in effect an
+    /// unpriced entry can't be trusted to be under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_price: Option<f64>,
 }
 
 impl ChatRequest {
