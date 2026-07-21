@@ -1,14 +1,18 @@
 mod config;
 mod error;
 mod metrics;
+mod persistence;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-pub use config::{Config, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig};
+pub use config::{
+    Config, PersistenceConfig, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig,
+};
 pub use error::RouterError;
 pub use metrics::Metrics;
+use persistence::Persistence;
 
 use futures::stream::StreamExt;
 use rp_core::{
@@ -62,10 +66,20 @@ pub struct Router {
     /// `throughput`, unlike `latency`) so it can be shared into a
     /// streaming response's instrumentation, which outlives
     /// `dispatch_stream` itself — the router hands the stream off to the
-    /// HTTP layer rather than consuming it.
+    /// HTTP layer rather than consuming it. Always kept up to date even
+    /// when `persistence` is configured (it's the fallback `usage_snapshot`
+    /// reads from if a DB read fails), but `persistence`, not this map, is
+    /// the source of truth for `GET /v1/usage` once it's set up.
     usage: Arc<RwLock<HashMap<String, UsageStats>>>,
+    /// Durable, cross-process backing store for `usage`, if `[persistence]`
+    /// is configured. `None` means the original in-memory-only behavior:
+    /// `usage` above resets on restart and is never shared across
+    /// processes.
+    persistence: Option<Arc<Persistence>>,
     /// Prometheus counters/histograms/gauges for `GET /metrics`, updated at
-    /// the same points as `latency`/`throughput`/`usage` above.
+    /// the same points as `latency`/`throughput`/`usage` above. Always
+    /// per-process, even when `persistence` is configured — Prometheus
+    /// aggregates across processes at scrape time, not here.
     metrics: Metrics,
     /// Provider names with a self-imposed `requests_per_minute` in config.
     provider_rpm: HashMap<String, u32>,
@@ -100,10 +114,13 @@ fn ewma_lookup(
 
 /// Compute a response's estimated USD cost (if `pricing` has an entry for
 /// "provider/model") and fold it, along with the raw token counts, into
-/// that entry's cumulative `UsageStats`. Returns the computed cost so the
-/// caller can attach it to the response/chunk sent back to the client.
+/// that entry's cumulative `UsageStats` -- both the in-memory map and, if
+/// configured, the durable `persistence` store. Returns the computed cost
+/// so the caller can attach it to the response/chunk sent back to the
+/// client.
 fn record_usage(
     usage_map: &RwLock<HashMap<String, UsageStats>>,
+    persistence: Option<&Persistence>,
     pricing: &HashMap<String, (f64, f64)>,
     provider: &str,
     model: &str,
@@ -115,13 +132,19 @@ fn record_usage(
             / 1_000_000.0
     });
 
-    let mut map = usage_map.write().unwrap();
-    let stats = map.entry(key).or_default();
-    stats.requests += 1;
-    stats.prompt_tokens += usage.prompt_tokens as u64;
-    stats.completion_tokens += usage.completion_tokens as u64;
-    if let Some(cost) = cost {
-        stats.cost_usd += cost;
+    {
+        let mut map = usage_map.write().unwrap();
+        let stats = map.entry(key.clone()).or_default();
+        stats.requests += 1;
+        stats.prompt_tokens += usage.prompt_tokens as u64;
+        stats.completion_tokens += usage.completion_tokens as u64;
+        if let Some(cost) = cost {
+            stats.cost_usd += cost;
+        }
+    }
+
+    if let Some(persistence) = persistence {
+        persistence.record(&key, usage, cost);
     }
 
     cost
@@ -187,6 +210,30 @@ impl Router {
             .filter_map(|(name, cfg)| cfg.requests_per_minute.map(|rpm| (name.clone(), rpm)))
             .collect();
 
+        // A bad [persistence] config (e.g. an unwritable path) is a soft
+        // failure -- the router still starts and runs with in-memory-only
+        // usage tracking, matching how a misconfigured provider or client
+        // is skipped-with-a-warning rather than refused at startup.
+        let persistence = config.persistence.as_ref().and_then(|p| {
+            match Persistence::open(&p.sqlite_path) {
+                Ok(p) => Some(Arc::new(p)),
+                Err(e) => {
+                    tracing::warn!(path = %p.sqlite_path, "failed to open persistence database, falling back to in-memory usage tracking: {e}");
+                    None
+                }
+            }
+        });
+        let usage = persistence
+            .as_ref()
+            .and_then(|p| match p.load_all() {
+                Ok(loaded) => Some(loaded),
+                Err(e) => {
+                    tracing::warn!("failed to load persisted usage stats: {e}");
+                    None
+                }
+            })
+            .unwrap_or_default();
+
         Self {
             providers,
             routes,
@@ -194,7 +241,8 @@ impl Router {
             zdr_providers,
             latency: RwLock::new(HashMap::new()),
             throughput: Arc::new(RwLock::new(HashMap::new())),
-            usage: Arc::new(RwLock::new(HashMap::new())),
+            usage: Arc::new(RwLock::new(usage)),
+            persistence,
             metrics,
             provider_rpm,
             outbound_limiter: RateLimiter::new(),
@@ -210,8 +258,20 @@ impl Router {
     }
 
     /// Snapshot of cumulative usage/cost per "provider/model", for
-    /// `GET /v1/usage`.
-    pub fn usage_snapshot(&self) -> HashMap<String, UsageStats> {
+    /// `GET /v1/usage`. When `[persistence]` is configured this reads
+    /// fresh from the shared database (reflecting every process's writes,
+    /// not just this one's), falling back to this process's own in-memory
+    /// view if that read fails. Without persistence, it's always the
+    /// in-memory view.
+    pub async fn usage_snapshot(&self) -> HashMap<String, UsageStats> {
+        if let Some(persistence) = &self.persistence {
+            match persistence.snapshot().await {
+                Ok(snapshot) => return snapshot,
+                Err(e) => {
+                    tracing::warn!("failed to read usage snapshot from persistence, falling back to in-memory view: {e}");
+                }
+            }
+        }
         self.usage.read().unwrap().clone()
     }
 
@@ -343,6 +403,7 @@ impl Router {
     ) -> ChatStream {
         let throughput = self.throughput.clone();
         let usage_map = self.usage.clone();
+        let persistence = self.persistence.clone();
         let pricing = self.pricing.clone();
         let metrics = self.metrics.clone();
 
@@ -357,7 +418,7 @@ impl Router {
                             metrics.observe_throughput_tps(&provider_name, &model_name, tps);
                             tracing::debug!(provider = %provider_name, model = %model_name, tokens_per_sec = tps, "recorded throughput");
                         }
-                        let cost = record_usage(&usage_map, &pricing, &provider_name, &model_name, &usage);
+                        let cost = record_usage(&usage_map, persistence.as_deref(), &pricing, &provider_name, &model_name, &usage);
                         metrics.record_tokens_and_cost(&provider_name, &model_name, usage.prompt_tokens, usage.completion_tokens, cost);
                         chunk.cost_usd = cost;
                     }
@@ -422,6 +483,7 @@ impl Router {
                         }
                         let cost = record_usage(
                             &self.usage,
+                            self.persistence.as_deref(),
                             &self.pricing,
                             provider_name,
                             model_name,
@@ -564,6 +626,7 @@ mod tests {
             latency: RwLock::new(HashMap::new()),
             throughput: Arc::new(RwLock::new(HashMap::new())),
             usage: Arc::new(RwLock::new(HashMap::new())),
+            persistence: None,
             metrics: Metrics::new(),
             provider_rpm: provider_rpm
                 .into_iter()
@@ -791,6 +854,104 @@ mod tests {
             router.resolve_chain("smart").unwrap(),
             chain(&[("b", "m2")])
         );
+    }
+
+    fn unique_temp_db_path(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "rp_router_from_config_persistence_test_{label}_{}.db",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn from_config_has_no_persistence_when_the_section_is_absent() {
+        let config = Config::from_toml_str("providers = {}").unwrap();
+        let router = Router::from_config(&config);
+        assert!(router.persistence.is_none());
+    }
+
+    #[test]
+    fn from_config_opens_persistence_when_configured() {
+        let path = unique_temp_db_path("opens");
+        let config = Config::from_toml_str(&format!(
+            "providers = {{}}\n\n[persistence]\nsqlite_path = {:?}\n",
+            path.to_str().unwrap()
+        ))
+        .unwrap();
+
+        let router = Router::from_config(&config);
+
+        assert!(router.persistence.is_some());
+    }
+
+    #[test]
+    fn from_config_falls_back_to_in_memory_when_persistence_path_is_invalid() {
+        // The parent directory doesn't exist, so Persistence::open fails --
+        // from_config must not panic or refuse to start, just skip it.
+        let bad_path = std::env::temp_dir()
+            .join("rp_router_from_config_test_nonexistent_dir")
+            .join("usage.db");
+        let config = Config::from_toml_str(&format!(
+            "providers = {{}}\n\n[persistence]\nsqlite_path = {:?}\n",
+            bad_path.to_str().unwrap()
+        ))
+        .unwrap();
+
+        let router = Router::from_config(&config);
+
+        assert!(router.persistence.is_none());
+    }
+
+    #[tokio::test]
+    async fn two_router_instances_sharing_a_persistence_file_see_each_others_usage() {
+        // Simulates two processes (or a restart): router_a dispatches and
+        // persists a request; router_b, an entirely separate Router that
+        // never dispatched anything itself, is pointed at the same SQLite
+        // file and must see router_a's usage via usage_snapshot().
+        let path = unique_temp_db_path("shared");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls,
+        });
+        let mut router_a = test_router(
+            vec![("anthropic", mock)],
+            vec![],
+            vec![("anthropic/m1", 2.0, 4.0)],
+            vec![],
+            vec![],
+        );
+        router_a.persistence = Some(Arc::new(
+            Persistence::open(&path).expect("persistence should open"),
+        ));
+
+        router_a
+            .dispatch(&test_request("anthropic/m1"))
+            .await
+            .expect("dispatch should succeed");
+        // The write goes through a background thread inside Persistence;
+        // give it a moment to land before a second handle reads it back.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let router_b = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let router_b = Router {
+            persistence: Some(Arc::new(
+                Persistence::open(&path).expect("persistence should reopen"),
+            )),
+            ..router_b
+        };
+
+        let snapshot = router_b.usage_snapshot().await;
+        let stats = &snapshot["anthropic/m1"];
+        assert_eq!(stats.requests, 1);
+        assert_eq!(stats.prompt_tokens, 1);
+        assert_eq!(stats.completion_tokens, 1);
+        assert!((stats.cost_usd - 6.0 / 1_000_000.0).abs() < 1e-12);
     }
 
     // --- resolve_chain -----------------------------------------------------
@@ -1817,6 +1978,7 @@ mod tests {
 
         let cost = record_usage(
             &usage_map,
+            None,
             &pricing,
             "anthropic",
             "m1",
@@ -1832,7 +1994,14 @@ mod tests {
         let usage_map = RwLock::new(HashMap::new());
         let pricing = HashMap::new();
 
-        let cost = record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(100, 50));
+        let cost = record_usage(
+            &usage_map,
+            None,
+            &pricing,
+            "anthropic",
+            "m1",
+            &usage(100, 50),
+        );
 
         assert!(cost.is_none());
         let stats = usage_map.read().unwrap();
@@ -1849,7 +2018,7 @@ mod tests {
         let mut pricing = HashMap::new();
         pricing.insert("anthropic/m1".to_string(), (2.0, 10.0));
 
-        let cost = record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(0, 0));
+        let cost = record_usage(&usage_map, None, &pricing, "anthropic", "m1", &usage(0, 0));
 
         assert_eq!(
             cost,
@@ -1864,8 +2033,22 @@ mod tests {
         let mut pricing = HashMap::new();
         pricing.insert("anthropic/m1".to_string(), (1.0, 1.0));
 
-        record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(100, 50));
-        record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(200, 100));
+        record_usage(
+            &usage_map,
+            None,
+            &pricing,
+            "anthropic",
+            "m1",
+            &usage(100, 50),
+        );
+        record_usage(
+            &usage_map,
+            None,
+            &pricing,
+            "anthropic",
+            "m1",
+            &usage(200, 100),
+        );
 
         let stats = usage_map.read().unwrap();
         let entry = &stats["anthropic/m1"];
@@ -1883,8 +2066,15 @@ mod tests {
         pricing.insert("anthropic/m1".to_string(), (1.0, 1.0));
         pricing.insert("openai/m2".to_string(), (5.0, 5.0));
 
-        record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(100, 0));
-        record_usage(&usage_map, &pricing, "openai", "m2", &usage(200, 0));
+        record_usage(
+            &usage_map,
+            None,
+            &pricing,
+            "anthropic",
+            "m1",
+            &usage(100, 0),
+        );
+        record_usage(&usage_map, None, &pricing, "openai", "m2", &usage(200, 0));
 
         let stats = usage_map.read().unwrap();
         assert_eq!(stats["anthropic/m1"].requests, 1);
@@ -2001,7 +2191,7 @@ mod tests {
         let expected_cost = 2.0 / 1_000_000.0;
         assert!((resp.cost_usd.unwrap() - expected_cost).abs() < 1e-12);
 
-        let snapshot = router.usage_snapshot();
+        let snapshot = router.usage_snapshot().await;
         let stats = &snapshot["anthropic/m1"];
         assert_eq!(stats.requests, 1);
         assert_eq!(stats.prompt_tokens, 1);
@@ -2025,7 +2215,7 @@ mod tests {
             .expect("dispatch should succeed");
 
         assert!(resp.cost_usd.is_none());
-        let snapshot = router.usage_snapshot();
+        let snapshot = router.usage_snapshot().await;
         let stats = &snapshot["anthropic/m1"];
         assert_eq!(stats.requests, 1);
         assert_eq!(stats.cost_usd, 0.0);
@@ -2046,7 +2236,7 @@ mod tests {
         router.dispatch(&req).await.unwrap();
         router.dispatch(&req).await.unwrap();
 
-        let snapshot = router.usage_snapshot();
+        let snapshot = router.usage_snapshot().await;
         let stats = &snapshot["anthropic/m1"];
         assert_eq!(stats.requests, 3);
         assert_eq!(stats.prompt_tokens, 3);
@@ -2086,7 +2276,7 @@ mod tests {
         let expected_cost = (3.0 + 9.0) / 1_000_000.0;
         assert!((chunk.cost_usd.unwrap() - expected_cost).abs() < 1e-12);
 
-        let snapshot = router.usage_snapshot();
+        let snapshot = router.usage_snapshot().await;
         let stats = &snapshot["anthropic/m1"];
         assert_eq!(stats.requests, 1);
         assert!((stats.cost_usd - expected_cost).abs() < 1e-12);
@@ -2124,7 +2314,7 @@ mod tests {
             "a chunk with 0 completion tokens must not be cost-stamped"
         );
         assert!(
-            !router.usage_snapshot().contains_key("anthropic/m1"),
+            !router.usage_snapshot().await.contains_key("anthropic/m1"),
             "0-completion-token chunks must not create a usage_snapshot entry"
         );
     }
@@ -2156,7 +2346,7 @@ mod tests {
         assert!((chunks[0].cost_usd.unwrap() - 15.0 / 1_000_000.0).abs() < 1e-12);
         assert!((chunks[1].cost_usd.unwrap() - 23.0 / 1_000_000.0).abs() < 1e-12);
 
-        let snapshot = router.usage_snapshot();
+        let snapshot = router.usage_snapshot().await;
         let stats = &snapshot["anthropic/m1"];
         assert_eq!(
             stats.requests, 2,
@@ -2191,7 +2381,7 @@ mod tests {
 
         assert!(chunk.cost_usd.is_none());
         assert!(chunk.usage.is_none());
-        assert!(!router.usage_snapshot().contains_key("anthropic/m1"));
+        assert!(!router.usage_snapshot().await.contains_key("anthropic/m1"));
     }
 
     #[tokio::test]
