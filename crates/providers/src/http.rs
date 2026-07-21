@@ -43,3 +43,55 @@ pub fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
         ProviderError::Network(err.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_error_message_from_nested_error_message_field() {
+        assert_eq!(
+            extract_error_message(r#"{"error":{"message":"bad request"}}"#),
+            Some("bad request".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_error_message_from_a_plain_string_error_field() {
+        assert_eq!(
+            extract_error_message(r#"{"error":"overloaded"}"#),
+            Some("overloaded".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_error_message_from_a_top_level_message_field() {
+        assert_eq!(
+            extract_error_message(r#"{"message":"invalid api key"}"#),
+            Some("invalid api key".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_error_message_prefers_error_over_top_level_message() {
+        assert_eq!(
+            extract_error_message(r#"{"error":{"message":"from error"},"message":"from top"}"#),
+            Some("from error".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_error_message_is_none_for_json_with_neither_recognized_shape() {
+        assert_eq!(extract_error_message(r#"{"foo":"bar"}"#), None);
+    }
+
+    #[test]
+    fn extract_error_message_is_none_for_non_json_body() {
+        assert_eq!(extract_error_message("not json at all"), None);
+    }
+
+    #[test]
+    fn extract_error_message_is_none_for_an_empty_body() {
+        assert_eq!(extract_error_message(""), None);
+    }
+}
