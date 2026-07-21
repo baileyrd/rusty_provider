@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::{stream, StreamExt};
 use rp_core::{ChatRequest, ModelInfo};
-use rp_router::{BudgetPeriod, ClientConfig, UsageStats};
+use rp_router::{BudgetPeriod, ClientConfig, ProviderStats, UsageStats};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -461,6 +461,28 @@ pub async fn usage_stats(State(state): State<AppState>, headers: HeaderMap) -> R
         .await
         .into_iter()
         .map(|(model, stats)| UsageEntry { model, stats })
+        .collect();
+
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+#[derive(Serialize)]
+struct ProviderStatsEntry {
+    model: String,
+    #[serde(flatten)]
+    stats: ProviderStats,
+}
+
+pub async fn provider_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+
+    let data: Vec<ProviderStatsEntry> = state
+        .router
+        .provider_stats()
+        .into_iter()
+        .map(|(model, stats)| ProviderStatsEntry { model, stats })
         .collect();
 
     Json(json!({ "object": "list", "data": data })).into_response()

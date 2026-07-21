@@ -233,6 +233,20 @@ async fn usage_stats_endpoint_returns_empty_list_before_any_requests() {
 }
 
 #[tokio::test]
+async fn provider_stats_endpoint_returns_empty_list_before_any_requests() {
+    let base_url = spawn_app("providers = {}").await;
+
+    let resp = reqwest::get(format!("{base_url}/v1/providers/stats"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn metrics_endpoint_returns_prometheus_text_with_configured_provider_gauge() {
     let server = MockServer::start().await;
     let key_var = unique_env_var("OPENAI_KEY");
@@ -338,6 +352,25 @@ async fn chat_completions_success_roundtrips_through_a_mocked_provider() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["model"], "openai/gpt-4o-mini");
     assert_eq!(entries[0]["requests"], 1);
+
+    // The router should also have folded this response into
+    // /v1/providers/stats -- a successful dispatch records latency,
+    // throughput, and uptime for "openai/gpt-4o-mini".
+    let stats_resp = reqwest::get(format!("{base_url}/v1/providers/stats"))
+        .await
+        .unwrap();
+    let stats: Value = stats_resp.json().await.unwrap();
+    let stats_entries = stats["data"].as_array().unwrap();
+    assert_eq!(stats_entries.len(), 1);
+    assert_eq!(stats_entries[0]["model"], "openai/gpt-4o-mini");
+    assert!(stats_entries[0]["latency_ms"].as_f64().unwrap() >= 0.0);
+    assert!(
+        stats_entries[0]["throughput_tokens_per_sec"]
+            .as_f64()
+            .unwrap()
+            >= 0.0
+    );
+    assert_eq!(stats_entries[0]["uptime"], 1.0);
 }
 
 #[tokio::test]

@@ -17,6 +17,7 @@ pub fn build_app(state: AppState) -> AxumRouter {
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::list_models))
         .route("/v1/usage", get(routes::usage_stats))
+        .route("/v1/providers/stats", get(routes::provider_stats))
         .route("/metrics", get(routes::metrics))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route(

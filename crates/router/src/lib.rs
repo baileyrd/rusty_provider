@@ -31,6 +31,22 @@ use rp_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatibleProvider};
 /// noise.
 const EWMA_ALPHA: f64 = 0.3;
 
+/// This router's own observed performance for one "provider/model", as
+/// returned by `GET /v1/providers/stats` -- the same EWMA figures
+/// `sort: "latency"`/`"throughput"`/`"uptime"` consult internally, finally
+/// surfaced to clients instead of staying purely an internal ranking
+/// signal. `None` for any figure this process hasn't observed yet, same
+/// "unobserved, not zero" convention the sorts themselves use.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct ProviderStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throughput_tokens_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime: Option<f64>,
+}
+
 /// Cumulative request/token/cost counters for one "provider/model", as
 /// returned by `GET /v1/usage`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -601,6 +617,39 @@ impl Router {
                             .collect(),
                     ),
                 })
+            })
+            .collect()
+    }
+
+    /// Snapshot of this process's own observed latency/throughput/uptime
+    /// EWMAs per "provider/model", for `GET /v1/providers/stats`. Only
+    /// includes entries this process has actually dispatched to at least
+    /// once -- a "provider/model" this process has never tried isn't
+    /// listed at all, rather than listed with every figure absent.
+    /// In-memory only, per-process: resets on restart, isn't a shared or
+    /// global feed, and reflects only this process's own traffic even
+    /// behind a load balancer.
+    pub fn provider_stats(&self) -> HashMap<String, ProviderStats> {
+        let latency = self.latency.read().unwrap();
+        let throughput = self.throughput.read().unwrap();
+        let uptime = self.uptime.read().unwrap();
+
+        let keys: HashSet<&String> = latency
+            .keys()
+            .chain(throughput.keys())
+            .chain(uptime.keys())
+            .collect();
+
+        keys.into_iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    ProviderStats {
+                        latency_ms: latency.get(key).copied(),
+                        throughput_tokens_per_sec: throughput.get(key).copied(),
+                        uptime: uptime.get(key).copied(),
+                    },
+                )
             })
             .collect()
     }
@@ -2079,6 +2128,37 @@ mod tests {
             vec![],
         );
         assert!(router.priced_models().is_empty());
+    }
+
+    // --- provider_stats ------------------------------------------------------
+
+    #[test]
+    fn provider_stats_is_empty_with_no_observations() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        assert!(router.provider_stats().is_empty());
+    }
+
+    #[test]
+    fn provider_stats_reports_only_observed_figures_per_key() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        // "anthropic/m1" has all three observed; "openai/m2" only latency.
+        ewma_record(&router.latency, "anthropic/m1".to_string(), 500.0);
+        ewma_record(&router.throughput, "anthropic/m1".to_string(), 42.0);
+        ewma_record(&router.uptime, "anthropic/m1".to_string(), 1.0);
+        ewma_record(&router.latency, "openai/m2".to_string(), 100.0);
+
+        let stats = router.provider_stats();
+        assert_eq!(stats.len(), 2);
+
+        let anthropic = &stats["anthropic/m1"];
+        assert_eq!(anthropic.latency_ms, Some(500.0));
+        assert_eq!(anthropic.throughput_tokens_per_sec, Some(42.0));
+        assert_eq!(anthropic.uptime, Some(1.0));
+
+        let openai = &stats["openai/m2"];
+        assert_eq!(openai.latency_ms, Some(100.0));
+        assert_eq!(openai.throughput_tokens_per_sec, None);
+        assert_eq!(openai.uptime, None);
     }
 
     // --- resolve_chain -----------------------------------------------------

@@ -582,6 +582,37 @@ accumulates for models with a `[[pricing]]` entry; it stays `0.0` for
 everything else (which means "unpriced," not "free" — `requests` and
 `*_tokens` still count normally regardless of pricing).
 
+### `GET /v1/providers/stats`
+
+The same per-"provider/model" EWMA figures `sort: "latency"`/
+`"throughput"`/`"uptime"` consult internally when ranking a fallback
+chain, surfaced directly instead of staying a purely internal signal:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "model": "anthropic/claude-sonnet-5",
+      "latency_ms": 812.4,
+      "throughput_tokens_per_sec": 46.2,
+      "uptime": 1.0
+    }
+  ]
+}
+```
+
+Only "provider/model" pairs this process has actually dispatched to at
+least once are listed — one this process has never tried isn't included
+at all, rather than included with every figure absent. Each of
+`latency_ms`/`throughput_tokens_per_sec`/`uptime` is independently
+omitted if this process hasn't observed that particular figure yet (e.g.
+every attempt so far failed before a latency sample could be taken, but
+did count toward `uptime`). Same caveats as the sorts that consume this
+data: in-memory only, resets on restart, and reflects only this process's
+own traffic, not a shared or global feed — behind a load balancer, each
+process reports its own view.
+
 ### `GET /metrics`
 
 The same underlying data as above, in Prometheus text exposition format
