@@ -296,6 +296,8 @@ pub struct Config {
     pub auto_routing: Option<AutoRoutingConfig>,
     #[serde(default)]
     pub moderation: Option<ModerationConfig>,
+    #[serde(default)]
+    pub web_search: Option<WebSearchConfig>,
 }
 
 /// Configures `model: "auto"` -- a heuristic (not ML) complexity-based
@@ -457,6 +459,30 @@ pub struct ModerationConfig {
     pub base_url: String,
     #[serde(default = "default_moderation_model")]
     pub model: String,
+}
+
+fn default_web_search_base_url() -> String {
+    "https://api.search.brave.com/res/v1/web/search".to_string()
+}
+
+fn default_web_search_max_results() -> u32 {
+    5
+}
+
+/// Backs `"web_search": true` on a request: a live search (via Brave
+/// Search's API, or a compatible one) whose top results get woven into
+/// the request as extra context before dispatch. Only Brave's API shape
+/// is supported today -- there's no aggregation across multiple search
+/// backends.
+#[derive(Debug, Deserialize, Clone)]
+pub struct WebSearchConfig {
+    /// Name of the environment variable holding the API key for the
+    /// search backend (not the key itself).
+    pub api_key_env: String,
+    #[serde(default = "default_web_search_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_web_search_max_results")]
+    pub max_results: u32,
 }
 
 impl Config {
@@ -1121,6 +1147,52 @@ mod tests {
         let moderation = config.moderation.unwrap();
         assert_eq!(moderation.base_url, "http://localhost:9999/v1");
         assert_eq!(moderation.model, "text-moderation-stable");
+    }
+
+    // --- web_search ------------------------------------------------------------
+
+    #[test]
+    fn web_search_defaults_to_absent() {
+        let config = Config::from_toml_str("providers = {}").unwrap();
+        assert!(config.web_search.is_none());
+    }
+
+    #[test]
+    fn web_search_parses_default_base_url_and_max_results() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [web_search]
+            api_key_env = "BRAVE_SEARCH_API_KEY"
+            "#,
+        )
+        .unwrap();
+        let web_search = config.web_search.unwrap();
+        assert_eq!(web_search.api_key_env, "BRAVE_SEARCH_API_KEY");
+        assert_eq!(
+            web_search.base_url,
+            "https://api.search.brave.com/res/v1/web/search"
+        );
+        assert_eq!(web_search.max_results, 5);
+    }
+
+    #[test]
+    fn web_search_honors_explicit_base_url_and_max_results() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [web_search]
+            api_key_env = "BRAVE_SEARCH_API_KEY"
+            base_url = "http://localhost:9999/search"
+            max_results = 3
+            "#,
+        )
+        .unwrap();
+        let web_search = config.web_search.unwrap();
+        assert_eq!(web_search.base_url, "http://localhost:9999/search");
+        assert_eq!(web_search.max_results, 3);
     }
 
     // --- persistence backend -----------------------------------------------------

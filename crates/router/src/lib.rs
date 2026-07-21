@@ -7,6 +7,7 @@ mod metrics;
 mod moderation;
 mod persistence;
 mod presets;
+mod web_search;
 mod webhook;
 
 use std::collections::{HashMap, HashSet};
@@ -18,13 +19,14 @@ pub use config::{
     AutoRoutingConfig, BudgetPeriod, ClientConfig, ClientRole, Config, GuardrailAction,
     GuardrailConfig, ModerationConfig, PersistenceBackend, PersistenceConfig, PostgresTlsMode,
     PresetConfig, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig,
-    WebhookConfig,
+    WebSearchConfig, WebhookConfig,
 };
 pub use error::RouterError;
 use guardrails::Guardrail;
 pub use metrics::Metrics;
 use moderation::{ModerationClient, ModerationError};
 use persistence::{Persistence, PersistenceTarget};
+use web_search::WebSearchClient;
 use webhook::WebhookNotifier;
 
 use futures::stream::StreamExt;
@@ -420,6 +422,10 @@ pub struct Router {
     /// resolved. `None` means every request skips the moderation check
     /// entirely, same as before this field existed.
     moderation: Option<Arc<ModerationClient>>,
+    /// `[web_search]` client, if configured and its `api_key_env`
+    /// resolved. `None` means `"web_search": true` on a request is a
+    /// no-op -- the same as before this field existed.
+    web_search: Option<Arc<WebSearchClient>>,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -679,6 +685,17 @@ impl Router {
             }
         });
 
+        // Same "skip with a warning" resilience as moderation above.
+        let web_search = config.web_search.as_ref().and_then(|cfg| {
+            match std::env::var(&cfg.api_key_env) {
+                Ok(key) if !key.is_empty() => Some(Arc::new(WebSearchClient::new(cfg, key))),
+                _ => {
+                    tracing::warn!(env_var = %cfg.api_key_env, "web_search.api_key_env is set but not resolvable; web search stays disabled");
+                    None
+                }
+            }
+        });
+
         Self {
             providers,
             provider_kinds,
@@ -702,6 +719,7 @@ impl Router {
             presets,
             auto_routing,
             moderation,
+            web_search,
         }
     }
 
@@ -1193,6 +1211,42 @@ impl Router {
         }
     }
 
+    /// If `req.web_search` is `true` and `[web_search]` is configured,
+    /// searches using the latest `user`-role message's text as the query
+    /// and prepends the results as context onto that same message,
+    /// mutating the caller's owned copy in place -- same "mutate before
+    /// dispatch" pattern `apply_guardrails`'s redaction uses. A no-op when
+    /// `web_search` isn't requested, isn't configured, there's no
+    /// user-message text to search for, or the search comes back with
+    /// zero results. A search-backend failure (network error, non-2xx,
+    /// bad body) never blocks or errors the request either -- only logged
+    /// and counted, the request proceeds unmodified.
+    pub async fn apply_web_search(&self, req: &mut ChatRequest) {
+        if req.web_search != Some(true) {
+            return;
+        }
+        let Some(web_search) = &self.web_search else {
+            return;
+        };
+        let Some(query) = web_search::last_user_query(req) else {
+            return;
+        };
+        match web_search.search(&query).await {
+            Ok(results) if !results.is_empty() => {
+                self.metrics.record_web_search("results");
+                let prefix = web_search::format_results(&results);
+                web_search::prepend_to_last_user_message(req, &prefix);
+            }
+            Ok(_) => {
+                self.metrics.record_web_search("no_results");
+            }
+            Err(msg) => {
+                tracing::warn!("web search failed, continuing without results: {msg}");
+                self.metrics.record_web_search("error");
+            }
+        }
+    }
+
     /// If `req.preset` is set, looks up that `[[presets]]` entry and
     /// folds its defaults into `req` (see `presets::apply` for exactly
     /// what that means per field). A no-op when `req.preset` is unset;
@@ -1548,7 +1602,9 @@ mod tests {
 
     use async_trait::async_trait;
     use futures::stream;
-    use rp_core::{ChatChunk, ChatMessage, ChatMessageDelta, Choice, ChunkChoice, Role};
+    use rp_core::{
+        ChatChunk, ChatMessage, ChatMessageDelta, Choice, ChunkChoice, MessageContent, Role,
+    };
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1614,6 +1670,7 @@ mod tests {
             presets: HashMap::new(),
             auto_routing: None,
             moderation: None,
+            web_search: None,
         }
     }
 
@@ -1652,6 +1709,7 @@ mod tests {
             transforms: None,
             logprobs: None,
             top_logprobs: None,
+            web_search: None,
         }
     }
 
@@ -2603,6 +2661,134 @@ mod tests {
             router.apply_moderation(&req).await.is_ok(),
             "a moderation-backend outage must fail open, not block the request"
         );
+    }
+
+    // --- apply_web_search ------------------------------------------------------
+
+    fn web_search_config(base_url: &str) -> WebSearchConfig {
+        WebSearchConfig {
+            api_key_env: "UNUSED".to_string(),
+            base_url: base_url.to_string(),
+            max_results: 5,
+        }
+    }
+
+    fn request_wanting_web_search(text: &str) -> ChatRequest {
+        let mut req = test_request("anthropic/m1");
+        req.messages = vec![ChatMessage::user(text)];
+        req.web_search = Some(true);
+        req
+    }
+
+    #[tokio::test]
+    async fn apply_web_search_is_a_noop_when_unconfigured() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let mut req = request_wanting_web_search("what's new in Rust");
+        let before = req.messages[0].content.clone();
+        router.apply_web_search(&mut req).await;
+        assert_eq!(req.messages[0].content, before);
+    }
+
+    #[tokio::test]
+    async fn apply_web_search_is_a_noop_when_not_requested() {
+        let server = MockServer::start().await;
+        // No mock mounted -- a call here would fail the test, proving
+        // apply_web_search never even reaches the backend when
+        // req.web_search isn't set.
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.web_search = Some(Arc::new(WebSearchClient::new(
+            &web_search_config(&server.uri()),
+            "test-key".to_string(),
+        )));
+
+        let mut req = test_request("anthropic/m1");
+        req.messages = vec![ChatMessage::user("what's new in Rust")];
+        let before = req.messages[0].content.clone();
+        router.apply_web_search(&mut req).await;
+        assert_eq!(req.messages[0].content, before);
+    }
+
+    #[tokio::test]
+    async fn apply_web_search_prepends_results_to_the_last_user_message_and_records_a_metric() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/res/v1/web/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "web": {
+                    "results": [
+                        {"title": "Rust 1.80", "url": "https://blog.rust-lang.org", "description": "Release notes"}
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.web_search = Some(Arc::new(WebSearchClient::new(
+            &web_search_config(&format!("{}/res/v1/web/search", server.uri())),
+            "test-key".to_string(),
+        )));
+
+        let mut req = request_wanting_web_search("what's new in Rust");
+        router.apply_web_search(&mut req).await;
+
+        match &req.messages[0].content {
+            Some(MessageContent::Text(text)) => {
+                assert!(text.contains("Rust 1.80"));
+                assert!(text.contains("https://blog.rust-lang.org"));
+                assert!(text.ends_with("what's new in Rust"));
+            }
+            other => panic!("expected Text content, got {other:?}"),
+        }
+
+        let metrics = router.render_prometheus_metrics();
+        assert!(metrics.contains("rusty_provider_web_search_total"));
+        assert!(metrics.contains(r#"outcome="results""#));
+    }
+
+    #[tokio::test]
+    async fn apply_web_search_leaves_the_message_unchanged_when_there_are_no_results() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.web_search = Some(Arc::new(WebSearchClient::new(
+            &web_search_config(&server.uri()),
+            "test-key".to_string(),
+        )));
+
+        let mut req = request_wanting_web_search("an obscure query");
+        let before = req.messages[0].content.clone();
+        router.apply_web_search(&mut req).await;
+        assert_eq!(req.messages[0].content, before);
+
+        let metrics = router.render_prometheus_metrics();
+        assert!(metrics.contains(r#"outcome="no_results""#));
+    }
+
+    #[tokio::test]
+    async fn apply_web_search_leaves_the_request_unmodified_when_the_backend_is_unreachable() {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        // Port 0 never accepts connections -- a real, unrecoverable
+        // network failure, not just a non-2xx response.
+        router.web_search = Some(Arc::new(WebSearchClient::new(
+            &web_search_config("http://127.0.0.1:0"),
+            "test-key".to_string(),
+        )));
+
+        let mut req = request_wanting_web_search("what's new in Rust");
+        let before = req.messages[0].content.clone();
+        router.apply_web_search(&mut req).await;
+        assert_eq!(
+            req.messages[0].content, before,
+            "a web-search-backend outage must leave the request unmodified, not error"
+        );
+
+        let metrics = router.render_prometheus_metrics();
+        assert!(metrics.contains(r#"outcome="error""#));
     }
 
     // --- apply_preset --------------------------------------------------------

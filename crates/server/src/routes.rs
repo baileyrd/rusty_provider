@@ -1188,6 +1188,8 @@ async fn chat_completions_dispatch(
         return router_error_response(e);
     }
 
+    state.router.apply_web_search(&mut req).await;
+
     if let Err(e) = state.router.apply_guardrails(&mut req) {
         return router_error_response(e);
     }

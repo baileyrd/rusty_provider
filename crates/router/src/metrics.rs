@@ -32,6 +32,7 @@ pub struct Metrics {
     inbound_rate_limit_rejections_total: IntCounterVec,
     client_budget_rejections_total: IntCounterVec,
     moderation_blocked_total: IntCounterVec,
+    web_search_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -163,6 +164,19 @@ impl Metrics {
             .register(Box::new(moderation_blocked_total.clone()))
             .expect("metric name is unique");
 
+        let web_search_total = IntCounterVec::new(
+            Opts::new(
+                "rusty_provider_web_search_total",
+                "Requests that triggered [web_search], labeled by outcome (\"results\", \"no_results\", \"error\").",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric definition");
+
+        registry
+            .register(Box::new(web_search_total.clone()))
+            .expect("metric name is unique");
+
         Self {
             registry,
             dispatch_attempts_total,
@@ -175,6 +189,7 @@ impl Metrics {
             inbound_rate_limit_rejections_total,
             client_budget_rejections_total,
             moderation_blocked_total,
+            web_search_total,
         }
     }
 
@@ -239,6 +254,10 @@ impl Metrics {
         self.moderation_blocked_total
             .with_label_values(&[category])
             .inc();
+    }
+
+    pub fn record_web_search(&self, outcome: &str) {
+        self.web_search_total.with_label_values(&[outcome]).inc();
     }
 
     /// Render every registered metric in the Prometheus text exposition
@@ -526,6 +545,32 @@ mod tests {
                 &rendered,
                 "rusty_provider_moderation_blocked_total",
                 &["category=\"hate\""],
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn record_web_search_increments_by_outcome() {
+        let metrics = Metrics::new();
+        metrics.record_web_search("results");
+        metrics.record_web_search("results");
+        metrics.record_web_search("error");
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_web_search_total",
+                &["outcome=\"results\""],
+            ),
+            2.0
+        );
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_web_search_total",
+                &["outcome=\"error\""],
             ),
             1.0
         );
