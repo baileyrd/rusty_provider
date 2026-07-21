@@ -874,6 +874,7 @@ mod tests {
     fn request_with_response_format(response_format: Option<ResponseFormat>) -> ChatRequest {
         ChatRequest {
             model: "anthropic/claude-sonnet-5".to_string(),
+            models: None,
             messages: vec![ChatMessage::user("hi")],
             temperature: None,
             top_p: None,
@@ -1321,6 +1322,7 @@ mod tests {
         let provider = AnthropicProvider::new("http://127.0.0.1:1", "test-key");
         let req = ChatRequest {
             model: "anthropic/claude-sonnet-5".to_string(),
+            models: None,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: Some(MessageContent::Parts(vec![ContentPart::InputAudio {

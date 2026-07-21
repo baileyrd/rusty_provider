@@ -51,6 +51,24 @@ Same request/response shape as OpenAI's chat completions endpoint.
   the router tries each entry in that chain in order and falls back on
   retryable errors.
 
+A request can also send its own ad-hoc fallback list with `models` (each
+entry a `"provider/model"` string), à la OpenRouter's `models` field,
+instead of relying on an operator-predefined `[[routes]]` alias:
+
+```jsonc
+{
+  "model": "anthropic/claude-sonnet-5",
+  "models": ["openai/gpt-4o", "groq/llama-3.3-70b-versatile"],
+  "messages": [{"role": "user", "content": "Say hi in one word."}]
+}
+```
+
+`model` is tried first, then each of `models` in order on a retryable
+error — same fallback behavior as a configured route alias, just
+assembled by the client for this one request. A non-empty `models`
+entirely bypasses `[[routes]]` alias lookup, so `model` must itself be a
+direct `"provider/model"` here, not an alias.
+
 ```sh
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \

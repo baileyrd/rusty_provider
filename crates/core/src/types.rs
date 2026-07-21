@@ -221,6 +221,15 @@ pub struct ChatRequest {
     /// one provider directly, or a router alias defined in the config's
     /// fallback chains (e.g. "smart").
     pub model: String,
+    /// An ad-hoc fallback chain for just this request, each entry a
+    /// "provider/model" string tried in order after `model` if it fails --
+    /// à la OpenRouter's `models` field. When non-empty, this entirely
+    /// bypasses `[[routes]]` alias lookup for `model` (so `model` itself
+    /// must be a direct "provider/model" here, not an alias); every other
+    /// request keeps resolving `model` through configured route aliases as
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
     pub messages: Vec<ChatMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
