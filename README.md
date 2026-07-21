@@ -392,8 +392,47 @@ A request can also constrain and order the resolved fallback chain with a
 
 ### `GET /v1/models`
 
-Lists configured route aliases and `provider/*` for every provider with a
-resolved API key.
+Lists configured route aliases, `provider/*` for every provider with a
+resolved API key, and rich metadata for every concrete "provider/model"
+with a `[[pricing]]` entry:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "smart", "object": "model", "owned_by": "router-alias"},
+    {"id": "anthropic/*", "object": "model", "owned_by": "anthropic"},
+    {
+      "id": "anthropic/claude-sonnet-5",
+      "object": "model",
+      "owned_by": "anthropic",
+      "context_length": 200000,
+      "pricing": {
+        "prompt": 3.0,
+        "completion": 15.0,
+        "cache_read": 0.3,
+        "cache_write": 3.75
+      },
+      "supported_params": ["temperature", "top_p", "max_tokens", "..."]
+    }
+  ]
+}
+```
+
+`context_length`/`pricing`/`supported_params` are only known for a concrete
+"provider/model" with a `[[pricing]]` entry — a route alias (which can span
+models with different context windows and pricing) and a `"{provider}/*"`
+wildcard omit all three. `pricing` mirrors the entry's
+`prompt_per_million`/`completion_per_million`/`cache_read_per_million`/
+`cache_write_per_million` (cache rates already defaulted to `prompt` when
+left unset in config, same as `cost_usd` computation uses).
+`context_length` is purely informational — not enforced against actual
+request size. `supported_params` lists which `ChatRequest` fields that
+model's provider adapter gives an actual effect to (native support or,
+for OpenAI-compatible, unconditional passthrough) — see the
+[Sampling parameters](#sampling-parameters), `response_format`, `reasoning`,
+and prompt-caching sections above for what's native per provider versus a
+silent no-op.
 
 ### `GET /v1/usage`
 

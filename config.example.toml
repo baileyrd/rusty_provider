@@ -115,6 +115,10 @@ completion_per_million = 15.0
 # current figures before relying on these.
 cache_read_per_million = 0.3
 cache_write_per_million = 3.75
+# Optional: this model's context window in tokens. Purely informational --
+# surfaced at GET /v1/models for clients picking a model by capacity, not
+# enforced against actual request size.
+context_length = 200000
 
 [[pricing]]
 model = "openai/gpt-4o"

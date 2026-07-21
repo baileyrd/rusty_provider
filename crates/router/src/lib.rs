@@ -19,8 +19,8 @@ use persistence::{Persistence, PersistenceTarget};
 
 use futures::stream::StreamExt;
 use rp_core::{
-    ChatRequest, ChatResponse, ChatStream, Provider, ProviderError, ProviderPreferences,
-    RateLimiter, Usage,
+    ChatRequest, ChatResponse, ChatStream, ModelInfo, ModelPricing, Provider, ProviderError,
+    ProviderPreferences, RateLimiter, Usage,
 };
 use rp_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatibleProvider};
 
@@ -69,6 +69,7 @@ struct PriceRates {
     completion_ppm: f64,
     cache_read_ppm: f64,
     cache_write_ppm: f64,
+    context_length: Option<u32>,
 }
 
 impl From<&PricingEntry> for PriceRates {
@@ -78,8 +79,43 @@ impl From<&PricingEntry> for PriceRates {
             completion_ppm: p.completion_per_million,
             cache_read_ppm: p.cache_read_per_million.unwrap_or(p.prompt_per_million),
             cache_write_ppm: p.cache_write_per_million.unwrap_or(p.prompt_per_million),
+            context_length: p.context_length,
         }
     }
+}
+
+/// Which `ChatRequest` fields this provider kind's adapter actually gives
+/// an effect to -- natively, or (OpenAI-compatible only) via unconditional
+/// passthrough to whatever inference server is behind it. Mirrors the
+/// per-provider support tables in the README; a field left off a kind's
+/// list is either rejected or silently a no-op there, not actually
+/// influencing the response.
+fn supported_params(kind: ProviderKind) -> Vec<&'static str> {
+    let mut params = vec![
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "stop",
+        "tools",
+        "tool_choice",
+        "response_format",
+        "reasoning",
+        "top_k",
+    ];
+    match kind {
+        ProviderKind::Openai => params.extend([
+            "min_p",
+            "top_a",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+            "logit_bias",
+            "seed",
+        ]),
+        ProviderKind::Anthropic => params.push("cache_control"),
+        ProviderKind::Gemini => params.extend(["frequency_penalty", "presence_penalty", "seed"]),
+    }
+    params
 }
 
 /// Holds every provider adapter that could be built from config (i.e. its
@@ -92,6 +128,11 @@ impl From<&PricingEntry> for PriceRates {
 /// falling back on retryable errors (rate limits, timeouts, 5xxs).
 pub struct Router {
     providers: HashMap<String, Arc<dyn Provider>>,
+    /// Provider name -> its configured `kind`, for every provider in
+    /// `providers` above (i.e. only ones that actually got built). Used to
+    /// report `GET /v1/models`' `supported_params`, which depends only on
+    /// which wire format a provider speaks, not on its specific model.
+    provider_kinds: HashMap<String, ProviderKind>,
     routes: HashMap<String, Vec<String>>,
     /// "provider/model" -> per-million-token USD rates.
     pricing: Arc<HashMap<String, PriceRates>>,
@@ -253,6 +294,7 @@ impl Router {
     pub async fn from_config(config: &Config) -> Self {
         let metrics = Metrics::new();
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        let mut provider_kinds: HashMap<String, ProviderKind> = HashMap::new();
 
         for (name, cfg) in &config.providers {
             let key = match std::env::var(&cfg.api_key_env) {
@@ -277,6 +319,7 @@ impl Router {
             };
             metrics.set_provider_configured(name, true);
             providers.insert(name.clone(), provider);
+            provider_kinds.insert(name.clone(), cfg.kind);
         }
 
         let routes = config
@@ -340,6 +383,7 @@ impl Router {
 
         Self {
             providers,
+            provider_kinds,
             routes,
             pricing: Arc::new(pricing),
             zdr_providers,
@@ -361,6 +405,40 @@ impl Router {
 
     pub fn route_aliases(&self) -> impl Iterator<Item = &str> {
         self.routes.keys().map(String::as_str)
+    }
+
+    /// Rich metadata for every "provider/model" with a `[[pricing]]`
+    /// entry, for `GET /v1/models` -- context length, pricing, and which
+    /// request params that provider's adapter actually understands. A
+    /// pricing entry for a provider this process couldn't configure (e.g.
+    /// its API key env var was unset) is skipped, since `supported_params`
+    /// depends on knowing that provider's `kind`.
+    pub fn priced_models(&self) -> Vec<ModelInfo> {
+        self.pricing
+            .iter()
+            .filter_map(|(id, rates)| {
+                let provider = id.split('/').next()?;
+                let kind = *self.provider_kinds.get(provider)?;
+                Some(ModelInfo {
+                    id: id.clone(),
+                    object: "model",
+                    owned_by: provider.to_string(),
+                    context_length: rates.context_length,
+                    pricing: Some(ModelPricing {
+                        prompt: rates.prompt_ppm,
+                        completion: rates.completion_ppm,
+                        cache_read: rates.cache_read_ppm,
+                        cache_write: rates.cache_write_ppm,
+                    }),
+                    supported_params: Some(
+                        supported_params(kind)
+                            .into_iter()
+                            .map(String::from)
+                            .collect(),
+                    ),
+                })
+            })
+            .collect()
     }
 
     /// Snapshot of cumulative usage/cost per "provider/model", for
@@ -903,6 +981,7 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
+            provider_kinds: HashMap::new(),
             routes: routes
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
@@ -918,6 +997,7 @@ mod tests {
                                 completion_ppm: c,
                                 cache_read_ppm: p,
                                 cache_write_ppm: p,
+                                context_length: None,
                             },
                         )
                     })
@@ -1486,6 +1566,82 @@ mod tests {
         assert_eq!(stats.prompt_tokens, 1);
         assert_eq!(stats.completion_tokens, 1);
         assert!((stats.cost_usd - 6.0 / 1_000_000.0).abs() < 1e-12);
+    }
+
+    // --- supported_params ----------------------------------------------------
+
+    #[test]
+    fn supported_params_lists_top_k_as_common_but_gates_the_rest_by_kind() {
+        let anthropic = supported_params(ProviderKind::Anthropic);
+        let gemini = supported_params(ProviderKind::Gemini);
+        let openai = supported_params(ProviderKind::Openai);
+
+        for params in [&anthropic, &gemini, &openai] {
+            assert!(params.contains(&"top_k"));
+        }
+        assert!(anthropic.contains(&"cache_control"));
+        assert!(!gemini.contains(&"cache_control"));
+        assert!(!openai.contains(&"cache_control"));
+
+        assert!(gemini.contains(&"frequency_penalty"));
+        assert!(!anthropic.contains(&"frequency_penalty"));
+
+        assert!(openai.contains(&"logit_bias"));
+        assert!(!anthropic.contains(&"logit_bias"));
+        assert!(!gemini.contains(&"logit_bias"));
+    }
+
+    // --- priced_models ---------------------------------------------------
+
+    #[test]
+    fn priced_models_reports_context_length_pricing_and_supported_params() {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router
+            .provider_kinds
+            .insert("anthropic".to_string(), ProviderKind::Anthropic);
+        router.pricing = Arc::new(HashMap::from([(
+            "anthropic/m1".to_string(),
+            PriceRates {
+                prompt_ppm: 3.0,
+                completion_ppm: 15.0,
+                cache_read_ppm: 0.3,
+                cache_write_ppm: 3.75,
+                context_length: Some(200_000),
+            },
+        )]));
+
+        let models = router.priced_models();
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model.id, "anthropic/m1");
+        assert_eq!(model.owned_by, "anthropic");
+        assert_eq!(model.context_length, Some(200_000));
+        let pricing = model.pricing.expect("pricing should be present");
+        assert_eq!(pricing.prompt, 3.0);
+        assert_eq!(pricing.completion, 15.0);
+        assert_eq!(pricing.cache_read, 0.3);
+        assert_eq!(pricing.cache_write, 3.75);
+        let params = model
+            .supported_params
+            .as_ref()
+            .expect("supported_params should be present");
+        assert!(params.iter().any(|p| p == "cache_control"));
+    }
+
+    #[test]
+    fn priced_models_skips_an_entry_for_a_provider_that_was_never_configured() {
+        // A `[[pricing]]` entry can reference a provider whose API key env
+        // var wasn't set at startup (so it never made it into
+        // `provider_kinds`) -- skipped rather than reported with a
+        // guessed/missing `supported_params`.
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![("anthropic/m1", 3.0, 15.0)],
+            vec![],
+            vec![],
+        );
+        assert!(router.priced_models().is_empty());
     }
 
     // --- resolve_chain -----------------------------------------------------
@@ -2657,6 +2813,7 @@ mod tests {
             completion_ppm,
             cache_read_ppm: prompt_ppm,
             cache_write_ppm: prompt_ppm,
+            context_length: None,
         }
     }
 
@@ -2784,6 +2941,7 @@ mod tests {
             completion_per_million: 15.0,
             cache_read_per_million: None,
             cache_write_per_million: None,
+            context_length: None,
         };
         let rates = PriceRates::from(&entry);
         assert_eq!(rates.cache_read_ppm, 3.0);
@@ -2798,6 +2956,7 @@ mod tests {
             completion_per_million: 15.0,
             cache_read_per_million: Some(0.3),
             cache_write_per_million: Some(3.75),
+            context_length: None,
         };
         let rates = PriceRates::from(&entry);
         assert_eq!(rates.cache_read_ppm, 0.3);
@@ -2832,6 +2991,7 @@ mod tests {
                 completion_ppm: 15.0,
                 cache_read_ppm: 0.3,
                 cache_write_ppm: 3.75,
+                context_length: None,
             },
         );
 
@@ -2860,6 +3020,7 @@ mod tests {
                 completion_ppm: 15.0,
                 cache_read_ppm: 0.3,
                 cache_write_ppm: 3.75,
+                context_length: None,
             },
         );
 

@@ -528,12 +528,37 @@ pub struct ChatChunk {
 }
 
 /// Metadata describing a model exposed by the router, for `GET /v1/models`.
+/// `context_length`/`pricing`/`supported_params` are only known for a
+/// concrete "provider/model" with a `[[pricing]]` entry -- absent for a
+/// `[[routes]]` alias (which can span models with different context
+/// windows and pricing) and for a `"{provider}/*"` wildcard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(skip_deserializing, default = "model_object")]
     pub object: &'static str,
     pub owned_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+    /// Which `ChatRequest` fields this model's provider adapter actually
+    /// gives an effect to -- see each adapter's own docs/README for the
+    /// per-provider translation or silent-no-op behavior of each.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_params: Option<Vec<String>>,
+}
+
+/// USD per million tokens, mirroring a `[[pricing]]` entry -- with
+/// `cache_read`/`cache_write` already defaulted to `prompt` when the
+/// operator left them unset in config, same as `cost_usd` computation
+/// uses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ModelPricing {
+    pub prompt: f64,
+    pub completion: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
 }
 
 fn chat_completion_object() -> &'static str {

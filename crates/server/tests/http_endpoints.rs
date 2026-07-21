@@ -133,6 +133,54 @@ async fn list_models_includes_route_aliases_and_provider_wildcards() {
 }
 
 #[tokio::test]
+async fn list_models_reports_rich_metadata_for_a_priced_model() {
+    let server = MockServer::start().await;
+    let key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&key_var, "test-key");
+
+    let config = format!(
+        r#"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{key_var}"
+
+        [[pricing]]
+        model = "openai/gpt-4o-mini"
+        prompt_per_million = 0.15
+        completion_per_million = 0.6
+        context_length = 128000
+        "#,
+        server.uri()
+    );
+
+    let base_url = spawn_app(&config).await;
+    let resp = reqwest::get(format!("{base_url}/v1/models"))
+        .await
+        .expect("request should succeed");
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.expect("valid json");
+    let entry = body["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .find(|m| m["id"] == "openai/gpt-4o-mini")
+        .expect("priced model entry present")
+        .clone();
+
+    assert_eq!(entry["context_length"], 128000);
+    assert_eq!(entry["pricing"]["prompt"], 0.15);
+    assert_eq!(entry["pricing"]["completion"], 0.6);
+    let supported = entry["supported_params"]
+        .as_array()
+        .expect("supported_params array");
+    let supported: Vec<&str> = supported.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(supported.contains(&"logit_bias"));
+    assert!(!supported.contains(&"cache_control"));
+}
+
+#[tokio::test]
 async fn protected_endpoint_rejects_missing_or_wrong_key_and_accepts_correct_one() {
     let key_var = unique_env_var("SERVER_API_KEY");
     std::env::set_var(&key_var, "s3cret");
