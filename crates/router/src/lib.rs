@@ -8,7 +8,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 pub use config::{
-    Config, PersistenceConfig, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig,
+    BudgetPeriod, ClientConfig, Config, PersistenceConfig, PricingEntry, ProviderConfig,
+    ProviderKind, RouteAlias, ServerConfig,
 };
 pub use error::RouterError;
 pub use metrics::Metrics;
@@ -286,6 +287,13 @@ impl Router {
     /// alongside every other counter this router tracks.
     pub fn record_inbound_rate_limit_rejection(&self, identity: &str) {
         self.metrics.record_inbound_rate_limit_rejection(identity);
+    }
+
+    /// Record a request rejected by the HTTP layer's own per-client spend
+    /// budget (`[[clients]].budget_usd`), so it shows up in `GET /metrics`
+    /// alongside every other counter this router tracks.
+    pub fn record_client_budget_rejection(&self, client_name: &str) {
+        self.metrics.record_client_budget_rejection(client_name);
     }
 
     /// Resolve a client-supplied `model` string into an ordered chain of

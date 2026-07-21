@@ -272,6 +272,43 @@ up in `GET /metrics` (`rusty_provider_dispatch_attempts_total` with
 the same in-memory, per-process, resets-on-restart token buckets as
 everything else this router tracks itself.
 
+## Spend budgets
+
+Rate limits cap how *often* a client can call this router; `budget_usd` on
+a `[[clients]]` entry caps how much they can *spend*:
+
+```toml
+[[clients]]
+name = "hermes"
+api_key_env = "CLIENT_HERMES_API_KEY"
+requests_per_minute = 60
+budget_usd = 50.0
+budget_period = "monthly"   # or "total" (the default) for a lifetime cap
+```
+
+Spend is tracked from the same `cost_usd` this router already computes for
+`GET /v1/usage`, so it only ever counts requests to a model with a
+`[[pricing]]` entry — an unpriced request never counts against a budget,
+the same way it never adds to `cost_usd` there. Once a client's tracked
+spend for the current period reaches `budget_usd`, further requests from
+that client get `402` until the period resets (or forever, for the
+default `"total"` period — there's no automatic reset, so raising the
+config value, or restarting the process, is the only way a `"total"`
+client keeps going). A request already in flight when a client crosses
+its budget is still allowed to complete — the check happens before
+dispatch, using spend as of the *start* of the request, not a mid-flight
+cutoff — so the client's actual spend can end up somewhat over
+`budget_usd` by the time it's cut off, not capped exactly at it.
+
+This only applies to named `[[clients]]`, the same as the rate-limiting
+client bucket — there's no budget for the IP-bucketed fallback used by
+unmatched callers, since there's no stable identity to track spend
+against. Like the rate limiter, this is in-memory, per-process, and
+resets on restart — it doesn't share state with `[persistence]`'s
+`GET /v1/usage` totals, even though both are derived from the same
+per-response `cost_usd`. Rejections show up in `GET /metrics` as
+`rusty_provider_client_budget_rejections_total`, labeled by client name.
+
 ## Persistence
 
 By default, cumulative usage/cost stats (`GET /v1/usage`) live only in
@@ -341,13 +378,9 @@ rather than fail loudly.
 
 ## Not yet implemented
 
-- Spend-based enforcement (cost estimation, cumulative usage tracking —
-  now optionally persisted across restarts and processes, see
-  Persistence above — and requests-per-minute rate limiting are
-  supported, but there's no cutting a client off once they've cost you
-  $X rather than once they've sent N requests/minute)
-- Multi-host/distributed usage aggregation (persistence is a single
-  SQLite file shared by processes on one host or a shared volume, not a
-  networked database multiple machines can write to)
+- Multi-host/distributed spend/usage aggregation (both `[[clients]].budget_usd`
+  and `[persistence]`'s `GET /v1/usage` totals are single-process or
+  single-SQLite-file, not a networked store multiple machines can share —
+  see Spend budgets and Persistence above)
 - Audio content (image content in messages is supported, see `POST
   /v1/chat/completions` above)

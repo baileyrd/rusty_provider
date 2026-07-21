@@ -6,6 +6,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use rp_core::RateLimiter;
 use rp_router::{Config, Router as ProviderRouter};
+use rp_server::budget::ClientBudgets;
 use rp_server::build_app;
 use rp_server::state::AppState;
 use serde_json::{json, Value};
@@ -51,6 +52,7 @@ async fn spawn_app(config_toml: &str) -> String {
         client_keys: Arc::new(client_keys),
         default_rate_limit_rpm: config.server.default_rate_limit_rpm,
         rate_limiter: Arc::new(RateLimiter::new()),
+        client_budgets: Arc::new(ClientBudgets::from_clients(&config.clients)),
     };
 
     let app = build_app(state);
@@ -487,4 +489,170 @@ async fn chat_completions_has_no_rate_limit_when_unmatched_and_no_default_config
             .unwrap();
         assert_ne!(resp.status(), 429);
     }
+}
+
+#[tokio::test]
+async fn chat_completions_cuts_off_a_client_after_a_non_streaming_response_exceeds_its_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello there"},
+                "finish_reason": "stop"
+            }],
+            // At $1/token (below) this response costs $15 -- well over the
+            // client's $1 budget, so it must be the *last* request the
+            // client is allowed to make.
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(&server)
+        .await;
+
+    let openai_key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&openai_key_var, "test-key");
+    let client_key_var = unique_env_var("CLIENT_KEY");
+    std::env::set_var(&client_key_var, "client-secret");
+
+    let config = format!(
+        r#"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{openai_key_var}"
+
+        [[pricing]]
+        model = "openai/gpt-4o-mini"
+        prompt_per_million = 1000000.0
+        completion_per_million = 1000000.0
+
+        [[clients]]
+        name = "acme"
+        api_key_env = "{client_key_var}"
+        requests_per_minute = 1000
+        budget_usd = 1.0
+        "#,
+        server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": "openai/gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    // The first request is allowed through -- its own cost isn't known
+    // until after it completes -- and it's the one that pushes spend past
+    // the $1 budget.
+    let first = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth("client-secret")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+
+    // The second request is rejected before it ever reaches the provider.
+    let second = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth("client-secret")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 402);
+    let err: Value = second.json().await.unwrap();
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(message.contains("acme"));
+    assert!(message.contains("15.00"));
+    assert!(message.contains("1.00"));
+
+    let metrics = client
+        .get(format!("{base_url}/metrics"))
+        .bearer_auth("client-secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("rusty_provider_client_budget_rejections_total"));
+    assert!(metrics.contains(r#"client="acme""#));
+}
+
+#[tokio::test]
+async fn chat_completions_cuts_off_a_client_after_a_streaming_response_exceeds_its_budget() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let openai_key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&openai_key_var, "test-key");
+    let client_key_var = unique_env_var("CLIENT_KEY");
+    std::env::set_var(&client_key_var, "client-secret");
+
+    let config = format!(
+        r#"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{openai_key_var}"
+
+        [[pricing]]
+        model = "openai/gpt-4o-mini"
+        prompt_per_million = 1000000.0
+        completion_per_million = 1000000.0
+
+        [[clients]]
+        name = "acme"
+        api_key_env = "{client_key_var}"
+        requests_per_minute = 1000
+        budget_usd = 1.0
+        "#,
+        server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": "openai/gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true
+    });
+
+    // The streamed response's final chunk carries usage costing $4 -- over
+    // the client's $1 budget -- which the router must record from inside
+    // the SSE stream itself, not just non-streaming responses.
+    let first = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth("client-secret")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let mut stream = first.bytes_stream();
+    while stream.next().await.is_some() {}
+
+    let second = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth("client-secret")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 402);
 }

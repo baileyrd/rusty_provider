@@ -103,6 +103,30 @@ pub struct ClientConfig {
     /// (not the key itself — keeps secrets out of the config file).
     pub api_key_env: String,
     pub requests_per_minute: u32,
+    /// If set, this client is cut off (`402`) once its tracked spend for
+    /// the current `budget_period` reaches this many US dollars. Spend is
+    /// tracked from the same `cost_usd` this router already computes for
+    /// `GET /v1/usage`, so it's only as accurate as `[[pricing]]` is —
+    /// requests to an unpriced model don't count against the budget.
+    /// Unset means unrestricted, same as omitting the field entirely.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
+    /// How `budget_usd` resets. Meaningless (but harmless) without
+    /// `budget_usd` set.
+    #[serde(default)]
+    pub budget_period: BudgetPeriod,
+}
+
+/// How a client's `budget_usd` cap resets.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetPeriod {
+    /// Never resets — a lifetime cap on this client's total tracked spend.
+    #[default]
+    Total,
+    /// Resets to zero at the start of each calendar month (server wall
+    /// clock, UTC).
+    Monthly,
 }
 
 /// Durable storage for cumulative usage/cost stats, so they survive a
@@ -389,6 +413,59 @@ mod tests {
             "#,
         );
         assert!(missing_rpm.is_err());
+    }
+
+    #[test]
+    fn client_budget_defaults_to_unset_with_total_period() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[clients]]
+            name = "acme"
+            api_key_env = "ACME_KEY"
+            requests_per_minute = 60
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.clients[0].budget_usd, None);
+        assert_eq!(config.clients[0].budget_period, BudgetPeriod::Total);
+    }
+
+    #[test]
+    fn client_budget_usd_and_period_are_honored_when_set() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[clients]]
+            name = "acme"
+            api_key_env = "ACME_KEY"
+            requests_per_minute = 60
+            budget_usd = 25.0
+            budget_period = "monthly"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.clients[0].budget_usd, Some(25.0));
+        assert_eq!(config.clients[0].budget_period, BudgetPeriod::Monthly);
+    }
+
+    #[test]
+    fn client_budget_period_rejects_unknown_value() {
+        let err = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[clients]]
+            name = "acme"
+            api_key_env = "ACME_KEY"
+            requests_per_minute = 60
+            budget_period = "yearly"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("budget_period"));
     }
 
     // --- malformed input / from_file --------------------------------------------

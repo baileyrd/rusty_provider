@@ -30,6 +30,7 @@ pub struct Metrics {
     throughput_tokens_per_second: HistogramVec,
     provider_configured: IntGaugeVec,
     inbound_rate_limit_rejections_total: IntCounterVec,
+    client_budget_rejections_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -135,6 +136,19 @@ impl Metrics {
             .register(Box::new(inbound_rate_limit_rejections_total.clone()))
             .expect("metric name is unique");
 
+        let client_budget_rejections_total = IntCounterVec::new(
+            Opts::new(
+                "rusty_provider_client_budget_rejections_total",
+                "Requests rejected because the calling client has exceeded its configured budget_usd, labeled by client name.",
+            ),
+            &["client"],
+        )
+        .expect("valid metric definition");
+
+        registry
+            .register(Box::new(client_budget_rejections_total.clone()))
+            .expect("metric name is unique");
+
         Self {
             registry,
             dispatch_attempts_total,
@@ -145,6 +159,7 @@ impl Metrics {
             throughput_tokens_per_second,
             provider_configured,
             inbound_rate_limit_rejections_total,
+            client_budget_rejections_total,
         }
     }
 
@@ -196,6 +211,12 @@ impl Metrics {
     pub fn record_inbound_rate_limit_rejection(&self, identity: &str) {
         self.inbound_rate_limit_rejections_total
             .with_label_values(&[identity])
+            .inc();
+    }
+
+    pub fn record_client_budget_rejection(&self, client_name: &str) {
+        self.client_budget_rejections_total
+            .with_label_values(&[client_name])
             .inc();
     }
 
@@ -432,6 +453,32 @@ mod tests {
                 &rendered,
                 "rusty_provider_inbound_rate_limit_rejections_total",
                 &["identity=\"ip:127.0.0.1\""],
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn record_client_budget_rejection_increments_by_client_name() {
+        let metrics = Metrics::new();
+        metrics.record_client_budget_rejection("acme");
+        metrics.record_client_budget_rejection("acme");
+        metrics.record_client_budget_rejection("globex");
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_client_budget_rejections_total",
+                &["client=\"acme\""],
+            ),
+            2.0
+        );
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_client_budget_rejections_total",
+                &["client=\"globex\""],
             ),
             1.0
         );

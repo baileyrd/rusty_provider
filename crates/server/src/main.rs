@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use rp_core::RateLimiter;
 use rp_router::{Config, Router as ProviderRouter};
+use rp_server::budget::ClientBudgets;
 use rp_server::build_app;
 use rp_server::state::AppState;
 
@@ -60,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         client_keys: Arc::new(client_keys),
         default_rate_limit_rpm: config.server.default_rate_limit_rpm,
         rate_limiter: Arc::new(RateLimiter::new()),
+        client_budgets: Arc::new(ClientBudgets::from_clients(&config.clients)),
     };
 
     let app = build_app(state);
