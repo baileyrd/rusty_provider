@@ -170,6 +170,54 @@ Per-provider support:
   provider that actually supports it, and a direct `"anthropic/..."`
   request fails with `400`.
 
+A request can ask a reasoning-capable model to think before answering with
+`reasoning`:
+
+```jsonc
+{
+  "model": "smart",
+  "reasoning": {
+    "effort": "high",     // "low" / "medium" / "high" -- how much to think
+    "max_tokens": 8000,   // or an explicit thinking-token budget instead of effort
+    "exclude": false      // true: still think, but don't return the reasoning text
+  },
+  "messages": [{"role": "user", "content": "..."}]
+}
+```
+
+Both `effort` and `max_tokens` are optional and mutually exclusive in
+effect — `max_tokens` wins if both are set. With neither set, requesting
+`reasoning` at all still turns thinking on, using `medium`'s effort
+mapping. The response's `message.reasoning` (or, streamed, each chunk's
+`delta.reasoning`) carries the model's reasoning as plain text, separate
+from the answer in `content` — `None`/absent when there's nothing to show
+(no `reasoning` requested, `exclude: true`, or the model returned none).
+This is a plain-text summary, not full fidelity: providers with richer
+structure (e.g. Anthropic's signed, replayable thinking blocks) don't
+round-trip that structure back into a follow-up request the way their own
+native SDKs would.
+
+Per-provider translation:
+
+- **Gemini** has native support via `generationConfig.thinkingConfig`
+  (`thinkingBudget` / `includeThoughts`). Response parts Gemini marks
+  `thought: true` are collected into `reasoning` instead of `content`.
+- **Anthropic** has native support via extended thinking
+  (`"thinking": {"type": "enabled", "budget_tokens": N}`). Anthropic
+  requires `budget_tokens >= 1024` and `max_tokens > budget_tokens`; both
+  are enforced automatically (the budget is floored to 1024, and
+  `max_tokens` is raised if needed) so a low-effort or unset-`max_tokens`
+  request never gets rejected by the upstream API. Anthropic has no
+  server-side way to suppress `thinking` blocks the way Gemini's
+  `includeThoughts` does, so `exclude: true` is enforced client-side —
+  the model still thinks (and is still billed for it), the text is just
+  dropped before it reaches the response.
+- **OpenAI-compatible** sends the widely-adopted `reasoning_effort` field
+  and parses `message.reasoning_content` / `delta.reasoning_content` from
+  the response — the convention used across DeepSeek, Groq, and most other
+  OpenAI-compatible reasoning models. `effort` maps straight through;
+  `max_tokens` has no equivalent on this wire format and is ignored.
+
 If `[[pricing]]` has an entry for the model that actually served the
 request, the response (and, for streaming, whichever chunk carries the
 final `usage`) includes an extra `cost_usd` field — the request's

@@ -1,6 +1,6 @@
 use rp_core::{
     ChatMessage, ChatRequest, ContentPart, ImageUrl, InputAudio, JsonSchemaFormat, MessageContent,
-    ResponseFormat, Role, Tool,
+    ReasoningConfig, ResponseFormat, Role, Tool,
 };
 
 /// A minimal single-user-turn request, for tests that don't care about the
@@ -19,6 +19,7 @@ pub fn simple_request(model: &str) -> ChatRequest {
         tool_choice: None,
         provider: None,
         response_format: None,
+        reasoning: None,
     }
 }
 
@@ -43,6 +44,7 @@ pub fn request_with_image(model: &str) -> ChatRequest {
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
     }];
     req
 }
@@ -68,6 +70,7 @@ pub fn request_with_audio(model: &str) -> ChatRequest {
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
     }];
     req
 }
@@ -99,6 +102,14 @@ pub fn request_with_json_schema(model: &str) -> ChatRequest {
 pub fn request_with_json_object(model: &str) -> ChatRequest {
     let mut req = simple_request(model);
     req.response_format = Some(ResponseFormat::JsonObject);
+    req
+}
+
+/// Same as [`simple_request`], but with a `reasoning` config attached, for
+/// tests exercising thinking-token request/response translation.
+pub fn request_with_reasoning(model: &str, reasoning: ReasoningConfig) -> ChatRequest {
+    let mut req = simple_request(model);
+    req.reasoning = Some(reasoning);
     req
 }
 

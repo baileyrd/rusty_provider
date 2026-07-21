@@ -12,17 +12,19 @@ use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
     ChunkChoice, ContentPart, FunctionCallDelta, MessageContent, Provider, ProviderError,
-    ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
+    ReasoningConfig, ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::http::{map_error_response, map_reqwest_error};
-use crate::util::{gen_id, now};
+use crate::util::{effort_thinking_budget, gen_id, now};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; used when the client doesn't specify one.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// Anthropic rejects `budget_tokens` below this.
+const MIN_THINKING_BUDGET: u32 = 1024;
 
 pub struct AnthropicProvider {
     base_url: String,
@@ -76,6 +78,8 @@ struct WireRequest<'a> {
     tools: Option<Vec<WireTool<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
     /// Set when `response_format` asked for schema-constrained output: the
     /// name of the synthetic tool `tools`/`tool_choice` above were built
     /// from, so `chat`/`chat_stream` can recognize that tool's `tool_use`
@@ -83,6 +87,12 @@ struct WireRequest<'a> {
     /// surfacing it as a real tool call. Never sent on the wire.
     #[serde(skip)]
     forced_output_tool_name: Option<String>,
+    /// Mirrors `reasoning.exclude` -- Anthropic has no server-side toggle to
+    /// suppress `thinking` blocks the way Gemini's `includeThoughts` does,
+    /// so `chat`/`chat_stream` drop them client-side when this is set.
+    /// Never sent on the wire.
+    #[serde(skip)]
+    exclude_reasoning: bool,
 }
 
 /// Split messages into Anthropic's shape: a single top-level `system`
@@ -266,6 +276,19 @@ fn forced_structured_output_tool(req: &ChatRequest) -> Result<Option<WireTool<'_
     }
 }
 
+/// Builds Anthropic's `thinking: {"type": "enabled", "budget_tokens": N}`
+/// request field, picking `budget_tokens` the same way Gemini's
+/// `thinkingBudget` is picked (explicit `reasoning.max_tokens` if set, else
+/// a fraction of the request's own `max_tokens`, else a flat default) but
+/// clamped to Anthropic's minimum of `MIN_THINKING_BUDGET`.
+fn thinking_config(reasoning: &ReasoningConfig, req_max_tokens: Option<u32>) -> Value {
+    let budget = reasoning
+        .max_tokens
+        .unwrap_or_else(|| effort_thinking_budget(reasoning.effort.as_deref(), req_max_tokens))
+        .max(MIN_THINKING_BUDGET);
+    json!({"type": "enabled", "budget_tokens": budget})
+}
+
 fn map_stop_reason(reason: &str) -> &'static str {
     match reason {
         "end_turn" | "stop_sequence" => "stop",
@@ -300,9 +323,31 @@ impl<'a> WireRequest<'a> {
                 ),
             };
 
+        let thinking = req
+            .reasoning
+            .as_ref()
+            .map(|r| thinking_config(r, req.max_tokens));
+        let budget_tokens = thinking
+            .as_ref()
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
+        let mut max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        if let Some(budget) = budget_tokens {
+            // Anthropic requires `max_tokens > budget_tokens`.
+            if max_tokens <= budget {
+                max_tokens = budget + DEFAULT_MAX_TOKENS;
+            }
+        }
+        let exclude_reasoning = req
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.exclude)
+            .unwrap_or(false);
+
         Ok(Self {
             model,
-            max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            max_tokens,
             messages,
             system,
             temperature: req.temperature,
@@ -311,7 +356,9 @@ impl<'a> WireRequest<'a> {
             stream,
             tools,
             tool_choice,
+            thinking,
             forced_output_tool_name,
+            exclude_reasoning,
         })
     }
 }
@@ -328,6 +375,11 @@ struct WireContentBlock {
     name: Option<String>,
     #[serde(default)]
     input: Option<Value>,
+    /// Set on `"thinking"` blocks. `"redacted_thinking"` blocks carry an
+    /// encrypted `data` field instead, which has no readable text to
+    /// surface -- those are counted but otherwise ignored.
+    #[serde(default)]
+    thinking: String,
 }
 
 #[derive(Deserialize)]
@@ -353,6 +405,7 @@ impl Provider for AnthropicProvider {
     async fn chat(&self, req: &ChatRequest, model: &str) -> Result<ChatResponse, ProviderError> {
         let body = WireRequest::from_core(req, model, false)?;
         let forced_output_tool_name = body.forced_output_tool_name.clone();
+        let exclude_reasoning = body.exclude_reasoning;
 
         let resp = self
             .client
@@ -374,10 +427,12 @@ impl Provider for AnthropicProvider {
             .map_err(|e| ProviderError::Decode(e.to_string()))?;
 
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut tool_calls = Vec::new();
         for b in &wire.content {
             match b.kind.as_str() {
                 "text" => text.push_str(&b.text),
+                "thinking" => reasoning.push_str(&b.thinking),
                 "tool_use" => {
                     let id = b.id.clone().unwrap_or_default();
                     let tool_name = b.name.clone().unwrap_or_default();
@@ -396,6 +451,11 @@ impl Provider for AnthropicProvider {
                 _ => {}
             }
         }
+        let reasoning = if exclude_reasoning || reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        };
 
         let finish_reason = if forced_output_tool_name.is_some() {
             // Anthropic reports `stop_reason: "tool_use"` for the forced
@@ -432,6 +492,7 @@ impl Provider for AnthropicProvider {
                         Some(tool_calls)
                     },
                     tool_call_id: None,
+                    reasoning,
                 },
                 finish_reason,
             }],
@@ -451,6 +512,7 @@ impl Provider for AnthropicProvider {
     ) -> Result<ChatStream, ProviderError> {
         let body = WireRequest::from_core(req, model, true)?;
         let is_forced_structured_output = body.forced_output_tool_name.is_some();
+        let exclude_reasoning = body.exclude_reasoning;
 
         let resp = self
             .client
@@ -588,6 +650,27 @@ impl Provider for AnthropicProvider {
                                 };
                                 Some(Ok(empty_chunk(&full_model, delta, None)))
                             }
+                            Some("thinking_delta") => {
+                                if exclude_reasoning {
+                                    return None;
+                                }
+                                let text = value
+                                    .pointer("/delta/thinking")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                if text.is_empty() {
+                                    return None;
+                                }
+                                Some(Ok(empty_chunk(
+                                    &full_model,
+                                    ChatMessageDelta {
+                                        reasoning: Some(text),
+                                        ..Default::default()
+                                    },
+                                    None,
+                                )))
+                            }
                             _ => None,
                         }
                     }
@@ -724,6 +807,7 @@ mod tests {
             tool_choice: None,
             provider: None,
             response_format,
+            reasoning: None,
         }
     }
 
@@ -966,6 +1050,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }];
         let (_, turns) = build_messages(&messages).unwrap();
         assert_eq!(turns.len(), 1);
@@ -989,6 +1074,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
             },
             ChatMessage::assistant("ok"),
         ];
@@ -1015,6 +1101,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }];
         let err = build_messages(&messages).unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedContent(_)));
@@ -1044,6 +1131,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
             }],
             temperature: None,
             top_p: None,
@@ -1055,6 +1143,7 @@ mod tests {
             tool_choice: None,
             provider: None,
             response_format: None,
+            reasoning: None,
         };
         let err = provider.chat(&req, "claude-sonnet-5").await.unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedContent(_)));

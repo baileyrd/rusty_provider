@@ -26,6 +26,14 @@ pub struct ChatMessage {
     /// `tool_calls`) of the call this message's `content` answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// The model's reasoning/thinking trace behind this message, if the
+    /// request opted in via `ChatRequest.reasoning` and the provider
+    /// returned one. Plain text -- providers that expose richer structure
+    /// (e.g. Anthropic's signed thinking blocks, needed to replay a prior
+    /// turn in a later request) don't get full fidelity here, only the
+    /// human-readable trace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl ChatMessage {
@@ -36,6 +44,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }
     }
 
@@ -46,6 +55,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }
     }
 
@@ -56,6 +66,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }
     }
 }
@@ -221,6 +232,34 @@ pub struct ChatRequest {
     /// chain treats the same as any other retryable error).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
+    /// Requests a visible reasoning/thinking trace from models that
+    /// support one. `None` means "use the model's default" -- most
+    /// reasoning models still reason internally either way; this only
+    /// controls how much budget/effort goes into it and whether the trace
+    /// is surfaced back in `ChatMessage.reasoning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
+}
+
+/// Requests and tunes a model's reasoning/thinking trace. `effort` and
+/// `max_tokens` are alternative ways of specifying the same budget --
+/// `effort` (OpenAI's convention: `"low"`/`"medium"`/`"high"`) for
+/// providers with no direct token-budget knob, `max_tokens` (Anthropic/
+/// Gemini's convention) for providers that take one directly. If both are
+/// set, a provider that supports `max_tokens` uses it directly; one that
+/// only understands `effort` ignores `max_tokens`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// If `true`, the model still reasons internally (where supported) but
+    /// the trace is withheld from `ChatMessage.reasoning` -- saves
+    /// response size/bandwidth without giving up whatever quality benefit
+    /// reasoning provides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<bool>,
 }
 
 /// Constrains a model's output shape, matching the OpenAI
@@ -333,6 +372,10 @@ pub struct ChatMessageDelta {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+    /// Incremental piece of the model's reasoning/thinking trace, streamed
+    /// the same way `content` is -- see `ChatMessage.reasoning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// An incremental piece of a tool call, streamed across possibly many
@@ -469,6 +512,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let round_tripped: ChatMessage = serde_json::from_str(&json).unwrap();

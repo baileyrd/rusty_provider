@@ -12,13 +12,13 @@ use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
     ChunkChoice, ContentPart, FunctionCallDelta, InputAudio, MessageContent, Provider,
-    ProviderError, ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
+    ProviderError, ReasoningConfig, ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::http::map_reqwest_error;
-use crate::util::{gen_id, now};
+use crate::util::{effort_thinking_budget, gen_id, now};
 
 pub struct GeminiProvider {
     base_url: String,
@@ -65,6 +65,8 @@ struct GenerationConfig<'a> {
     response_mime_type: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "responseSchema")]
     response_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
+    thinking_config: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -271,6 +273,16 @@ fn response_format_config(fmt: &ResponseFormat) -> (Option<&'static str>, Option
     }
 }
 
+fn thinking_config(reasoning: &ReasoningConfig, max_tokens: Option<u32>) -> Value {
+    let budget = reasoning
+        .max_tokens
+        .unwrap_or_else(|| effort_thinking_budget(reasoning.effort.as_deref(), max_tokens));
+    json!({
+        "thinkingBudget": budget,
+        "includeThoughts": !reasoning.exclude.unwrap_or(false),
+    })
+}
+
 fn build_request(req: &ChatRequest) -> WireRequest<'_> {
     let (system, contents) = build_contents(&req.messages);
     let (response_mime_type, response_schema) = req
@@ -291,6 +303,10 @@ fn build_request(req: &ChatRequest) -> WireRequest<'_> {
             stop_sequences: req.stop.as_deref(),
             response_mime_type,
             response_schema,
+            thinking_config: req
+                .reasoning
+                .as_ref()
+                .map(|r| thinking_config(r, req.max_tokens)),
         },
         tools: req.tools.as_deref().map(to_wire_tools),
         tool_config: req.tool_choice.as_ref().map(to_wire_tool_choice),
@@ -317,6 +333,11 @@ struct WirePart {
     text: String,
     #[serde(default, rename = "functionCall")]
     function_call: Option<WireFunctionCall>,
+    /// Marks this part as a thought summary rather than the actual answer
+    /// -- only present (and only ever `true`) when `thinkingConfig.
+    /// includeThoughts` was set in the request.
+    #[serde(default)]
+    thought: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -352,7 +373,31 @@ struct WireResponse {
 }
 
 fn candidate_text(c: &WireCandidate) -> String {
-    c.content.parts.iter().map(|p| p.text.as_str()).collect()
+    c.content
+        .parts
+        .iter()
+        .filter(|p| !p.thought)
+        .map(|p| p.text.as_str())
+        .collect()
+}
+
+/// The model's thought-summary text (parts marked `thought: true`),
+/// separate from the actual answer -- `None` if the candidate has none
+/// (either the request didn't ask for reasoning, or this model doesn't
+/// support it).
+fn candidate_reasoning(c: &WireCandidate) -> Option<String> {
+    let text: String = c
+        .content
+        .parts
+        .iter()
+        .filter(|p| p.thought)
+        .map(|p| p.text.as_str())
+        .collect();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn candidate_tool_calls(c: &WireCandidate) -> Vec<ToolCall> {
@@ -424,13 +469,18 @@ impl Provider for GeminiProvider {
             .await
             .map_err(|e| ProviderError::Decode(e.to_string()))?;
         let candidate = wire.candidates.into_iter().next();
-        let (text, tool_calls, finish_reason) = match &candidate {
+        let (text, reasoning, tool_calls, finish_reason) = match &candidate {
             Some(c) => {
                 let tool_calls = candidate_tool_calls(c);
                 let finish_reason = resolve_finish_reason(c, &tool_calls);
-                (candidate_text(c), tool_calls, finish_reason)
+                (
+                    candidate_text(c),
+                    candidate_reasoning(c),
+                    tool_calls,
+                    finish_reason,
+                )
             }
-            None => (String::new(), Vec::new(), None),
+            None => (String::new(), None, Vec::new(), None),
         };
 
         Ok(ChatResponse {
@@ -454,6 +504,7 @@ impl Provider for GeminiProvider {
                         Some(tool_calls)
                     },
                     tool_call_id: None,
+                    reasoning,
                 },
                 finish_reason,
             }],
@@ -498,13 +549,18 @@ impl Provider for GeminiProvider {
                     Err(e) => return Some(Err(ProviderError::Decode(e.to_string()))),
                 };
                 let candidate = wire.candidates.into_iter().next();
-                let (text, tool_calls, finish_reason) = match &candidate {
+                let (text, reasoning, tool_calls, finish_reason) = match &candidate {
                     Some(c) => {
                         let tool_calls = candidate_tool_calls(c);
                         let finish_reason = resolve_finish_reason(c, &tool_calls);
-                        (candidate_text(c), tool_calls, finish_reason)
+                        (
+                            candidate_text(c),
+                            candidate_reasoning(c),
+                            tool_calls,
+                            finish_reason,
+                        )
                     }
-                    None => (String::new(), Vec::new(), None),
+                    None => (String::new(), None, Vec::new(), None),
                 };
                 let usage = if wire.usage_metadata.total_token_count > 0 {
                     Some(Usage {
@@ -527,6 +583,7 @@ impl Provider for GeminiProvider {
                             role: Some(Role::Assistant),
                             content: if text.is_empty() { None } else { Some(text) },
                             tool_calls: tool_call_deltas(&tool_calls),
+                            reasoning,
                         },
                         finish_reason,
                     }],
@@ -683,6 +740,83 @@ mod tests {
         );
     }
 
+    // --- effort_thinking_budget / thinking_config -----------------------------
+
+    #[test]
+    fn effort_thinking_budget_takes_a_fraction_of_max_tokens_when_set() {
+        assert_eq!(effort_thinking_budget(Some("high"), Some(1000)), 800);
+        assert_eq!(effort_thinking_budget(Some("medium"), Some(1000)), 500);
+        assert_eq!(effort_thinking_budget(None, Some(1000)), 500);
+        assert_eq!(effort_thinking_budget(Some("low"), Some(1000)), 200);
+    }
+
+    #[test]
+    fn effort_thinking_budget_falls_back_to_a_flat_default_without_max_tokens() {
+        assert_eq!(effort_thinking_budget(Some("high"), None), 24_576);
+        assert_eq!(effort_thinking_budget(None, None), 8_192);
+        assert_eq!(effort_thinking_budget(Some("low"), None), 1_024);
+    }
+
+    #[test]
+    fn thinking_config_uses_max_tokens_directly_when_set() {
+        let reasoning = rp_core::ReasoningConfig {
+            effort: Some("high".to_string()),
+            max_tokens: Some(2048),
+            exclude: None,
+        };
+        assert_eq!(
+            thinking_config(&reasoning, Some(10_000)),
+            json!({"thinkingBudget": 2048, "includeThoughts": true})
+        );
+    }
+
+    #[test]
+    fn thinking_config_sets_include_thoughts_false_when_excluded() {
+        let reasoning = rp_core::ReasoningConfig {
+            effort: None,
+            max_tokens: Some(1024),
+            exclude: Some(true),
+        };
+        assert_eq!(
+            thinking_config(&reasoning, None),
+            json!({"thinkingBudget": 1024, "includeThoughts": false})
+        );
+    }
+
+    // --- candidate_reasoning -------------------------------------------------
+
+    #[test]
+    fn candidate_reasoning_collects_only_thought_parts() {
+        let candidate = WireCandidate {
+            content: WireContent {
+                parts: vec![
+                    WirePart {
+                        text: "Let me think...".to_string(),
+                        function_call: None,
+                        thought: true,
+                    },
+                    WirePart {
+                        text: "The answer is 42.".to_string(),
+                        function_call: None,
+                        thought: false,
+                    },
+                ],
+            },
+            finish_reason: Some("STOP".to_string()),
+        };
+        assert_eq!(
+            candidate_reasoning(&candidate),
+            Some("Let me think...".to_string())
+        );
+        assert_eq!(candidate_text(&candidate), "The answer is 42.");
+    }
+
+    #[test]
+    fn candidate_reasoning_is_none_without_any_thought_parts() {
+        let candidate = candidate_with_text_only("hello", "STOP");
+        assert_eq!(candidate_reasoning(&candidate), None);
+    }
+
     // --- candidate_tool_calls / resolve_finish_reason / tool_call_deltas ------
 
     fn candidate_with_function_call(name: &str, args: Value) -> WireCandidate {
@@ -694,6 +828,7 @@ mod tests {
                         name: name.to_string(),
                         args,
                     }),
+                    thought: false,
                 }],
             },
             finish_reason: Some("STOP".to_string()),
@@ -706,6 +841,7 @@ mod tests {
                 parts: vec![WirePart {
                     text: text.to_string(),
                     function_call: None,
+                    thought: false,
                 }],
             },
             finish_reason: Some(finish_reason.to_string()),
@@ -910,6 +1046,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }];
         let (_, contents) = build_contents(&messages);
         assert_eq!(contents.len(), 1);
@@ -932,6 +1069,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
             },
             ChatMessage::assistant("ok"),
         ];
@@ -953,6 +1091,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }];
         let (_, contents) = build_contents(&messages);
         assert_eq!(
