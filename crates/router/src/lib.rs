@@ -197,6 +197,13 @@ pub struct Router {
     /// "provider/model" -> EWMA completion tokens/sec, measured the same
     /// way.
     throughput: Arc<RwLock<HashMap<String, f64>>>,
+    /// "provider/model" -> EWMA success rate (1.0 per successful attempt,
+    /// 0.0 per failed one -- retryable or fatal), sampled only on an
+    /// actual dispatch attempt against that provider, not on a candidate
+    /// skipped locally (unconfigured, or this process's own outbound rate
+    /// limit). Same in-memory-only, per-process caveats as
+    /// `latency`/`throughput`.
+    uptime: RwLock<HashMap<String, f64>>,
     /// "provider/model" -> cumulative usage/cost. `Arc`-wrapped (like
     /// `throughput`, unlike `latency`) so it can be shared into a
     /// streaming response's instrumentation, which outlives
@@ -457,6 +464,7 @@ impl Router {
             pricing: Arc::new(pricing),
             zdr_providers,
             latency: RwLock::new(HashMap::new()),
+            uptime: RwLock::new(HashMap::new()),
             throughput: Arc::new(RwLock::new(HashMap::new())),
             usage: Arc::new(RwLock::new(usage)),
             persistence,
@@ -846,6 +854,17 @@ impl Router {
                     0.0,
                 ))
             }),
+            // Descending: higher observed success rate is better, and an
+            // unobserved entry (0.0) sorts last -- same convention as
+            // throughput, not an optimistic "assume healthy" default.
+            Some("uptime") => chain.sort_by(|a, b| {
+                ewma_lookup(&self.uptime, &b.0, &b.1, 0.0).total_cmp(&ewma_lookup(
+                    &self.uptime,
+                    &a.0,
+                    &a.1,
+                    0.0,
+                ))
+            }),
             _ => {}
         }
 
@@ -987,6 +1006,7 @@ impl Router {
                         format!("{provider_name}/{model_name}"),
                         elapsed_secs * 1000.0,
                     );
+                    ewma_record(&self.uptime, format!("{provider_name}/{model_name}"), 1.0);
                     self.metrics
                         .observe_latency_seconds(provider_name, model_name, elapsed_secs);
                     self.metrics
@@ -1027,11 +1047,13 @@ impl Router {
                 }
                 Err(e) if e.is_retryable() => {
                     tracing::warn!(provider = %provider_name, model = %model_name, "provider failed, falling back: {e}");
+                    ewma_record(&self.uptime, format!("{provider_name}/{model_name}"), 0.0);
                     self.metrics
                         .record_attempt(provider_name, model_name, "retryable_error");
                     last_err = Some(RouterError::Provider(e));
                 }
                 Err(e) => {
+                    ewma_record(&self.uptime, format!("{provider_name}/{model_name}"), 0.0);
                     self.metrics
                         .record_attempt(provider_name, model_name, "error");
                     return Err(RouterError::Provider(e));
@@ -1077,6 +1099,7 @@ impl Router {
                         format!("{provider_name}/{model_name}"),
                         elapsed_ms,
                     );
+                    ewma_record(&self.uptime, format!("{provider_name}/{model_name}"), 1.0);
                     self.metrics.observe_latency_seconds(
                         provider_name,
                         model_name,
@@ -1095,11 +1118,13 @@ impl Router {
                 }
                 Err(e) if e.is_retryable() => {
                     tracing::warn!(provider = %provider_name, model = %model_name, "provider failed, falling back: {e}");
+                    ewma_record(&self.uptime, format!("{provider_name}/{model_name}"), 0.0);
                     self.metrics
                         .record_attempt(provider_name, model_name, "retryable_error");
                     last_err = Some(RouterError::Provider(e));
                 }
                 Err(e) => {
+                    ewma_record(&self.uptime, format!("{provider_name}/{model_name}"), 0.0);
                     self.metrics
                         .record_attempt(provider_name, model_name, "error");
                     return Err(RouterError::Provider(e));
@@ -1164,6 +1189,7 @@ mod tests {
             ),
             zdr_providers: zdr_providers.into_iter().map(String::from).collect(),
             latency: RwLock::new(HashMap::new()),
+            uptime: RwLock::new(HashMap::new()),
             throughput: Arc::new(RwLock::new(HashMap::new())),
             usage: Arc::new(RwLock::new(HashMap::new())),
             persistence: None,
@@ -3055,6 +3081,115 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    // --- uptime sort -----------------------------------------------------
+
+    #[test]
+    fn apply_preferences_sorts_descending_by_uptime() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        {
+            let mut uptime = router.uptime.write().unwrap();
+            uptime.insert("anthropic/m1".to_string(), 0.5);
+            uptime.insert("openai/m2".to_string(), 0.95);
+        }
+        let prefs = ProviderPreferences {
+            sort: Some("uptime".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_unobserved_uptime_sorts_last() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router
+            .uptime
+            .write()
+            .unwrap()
+            .insert("anthropic/m1".to_string(), 0.8);
+        // "openai/m2" has no observed uptime -- despite being first in the
+        // chain, it should sort after the entry with a real observation,
+        // not be assumed healthy.
+        let prefs = ProviderPreferences {
+            sort: Some("uptime".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("openai", "m2"), ("anthropic", "m1")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
+    }
+
+    #[tokio::test]
+    async fn dispatch_records_uptime_of_one_on_success() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let succeeding = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls,
+        });
+        let router = test_router(
+            vec![("anthropic", succeeding)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        router
+            .dispatch(&test_request("anthropic/claude-sonnet-5"))
+            .await
+            .expect("dispatch should succeed");
+        assert_eq!(
+            *router
+                .uptime
+                .read()
+                .unwrap()
+                .get("anthropic/claude-sonnet-5")
+                .unwrap(),
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_records_uptime_of_zero_on_retryable_failure_and_falls_through() {
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let failing = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: calls_a,
+        });
+        let succeeding = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_b,
+        });
+        let router = test_router(
+            vec![("anthropic", failing), ("openai", succeeding)],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+        router
+            .dispatch(&test_request("smart"))
+            .await
+            .expect("should fall through to openai");
+        let uptime = router.uptime.read().unwrap();
+        assert_eq!(*uptime.get("anthropic/m1").unwrap(), 0.0);
+        assert_eq!(*uptime.get("openai/m2").unwrap(), 1.0);
     }
 
     // --- active_params / filter_by_required_parameters ------------------------
