@@ -79,6 +79,21 @@ pub async fn usage_stats(State(state): State<AppState>, headers: HeaderMap) -> R
     Json(json!({ "object": "list", "data": data })).into_response()
 }
 
+pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        state.router.render_prometheus_metrics(),
+    )
+        .into_response()
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,

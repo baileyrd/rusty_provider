@@ -158,6 +158,40 @@ accumulates for models with a `[[pricing]]` entry; it stays `0.0` for
 everything else (which means "unpriced," not "free" — `requests` and
 `*_tokens` still count normally regardless of pricing).
 
+### `GET /metrics`
+
+The same underlying data as above, in Prometheus text exposition format
+for scraping:
+
+- `rusty_provider_dispatch_attempts_total{provider,model,outcome}` —
+  counter, one increment per candidate tried in a fallback chain.
+  `outcome` is `success`, `retryable_error` (fell through to the next
+  candidate), `error` (fatal, chain aborted), or `not_configured`
+  (candidate skipped, no resolved API key).
+- `rusty_provider_prompt_tokens_total{provider,model}` /
+  `rusty_provider_completion_tokens_total{provider,model}` — counters.
+- `rusty_provider_cost_usd_total{provider,model}` — counter; same
+  unpriced-means-zero caveat as `GET /v1/usage`.
+- `rusty_provider_response_latency_seconds{provider,model}` — histogram;
+  full round-trip for non-streaming requests, time-to-first-byte for
+  streaming ones.
+- `rusty_provider_throughput_tokens_per_second{provider,model}` —
+  histogram of observed completion-token generation rate per response.
+- `rusty_provider_provider_configured{provider}` — gauge, `1`/`0`, set
+  once at startup per `[providers.*]` entry.
+
+Subject to the same `server.api_key_env` auth as every other endpoint —
+if you've enabled it, point Prometheus's scrape config at it with a
+bearer token:
+
+```yaml
+scrape_configs:
+  - job_name: rusty_provider
+    bearer_token: "your-token-here"
+    static_configs:
+      - targets: ["localhost:8080"]
+```
+
 ### `GET /health`
 
 Liveness check.
