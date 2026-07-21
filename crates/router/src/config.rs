@@ -116,6 +116,13 @@ pub struct PricingEntry {
     /// `cache_read_per_million`.
     #[serde(default)]
     pub cache_write_per_million: Option<f64>,
+    /// This model's context window, in tokens -- purely informational,
+    /// surfaced at `GET /v1/models` for clients that want to pick a model
+    /// by capacity. Not enforced anywhere: an over-length request still
+    /// goes to the provider and fails (or gets silently truncated) exactly
+    /// as it would without this field set.
+    #[serde(default)]
+    pub context_length: Option<u32>,
 }
 
 /// A named inbound caller, identified by its own API key, with its own

@@ -425,12 +425,19 @@ pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> R
             id: alias.to_string(),
             object: "model",
             owned_by: "router-alias".to_string(),
+            context_length: None,
+            pricing: None,
+            supported_params: None,
         })
         .chain(state.router.configured_providers().map(|p| ModelInfo {
             id: format!("{p}/*"),
             object: "model",
             owned_by: p.to_string(),
+            context_length: None,
+            pricing: None,
+            supported_params: None,
         }))
+        .chain(state.router.priced_models())
         .collect();
 
     Json(json!({ "object": "list", "data": data })).into_response()
