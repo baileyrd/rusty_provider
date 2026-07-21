@@ -44,6 +44,24 @@ pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> {
     }
 }
 
+/// Gates `/v1/admin/*`. Requires `server.admin_key_env` to be configured
+/// and resolved -- unlike `check_auth`, there's no "auth disabled" fallback
+/// and no cross-recognition of `api_key`/`client_keys` tokens, since those
+/// grant access to chat completions, not to every client's spend data.
+/// Reports `404` (not `401`) when the admin API isn't configured at all,
+/// so an operator who never set it up doesn't leak that these routes
+/// exist.
+pub fn check_admin_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let Some(admin_key) = &state.admin_key else {
+        return Some(json_error(404, "not found"));
+    };
+
+    match bearer_token(headers) {
+        Some(token) if token == admin_key => None,
+        _ => Some(json_error(401, "missing or invalid admin API key")),
+    }
+}
+
 /// Resolve which rate-limit bucket a request falls into: the named client
 /// its bearer token matches, or (if `server.default_rate_limit_rpm` is
 /// set) a bucket keyed by source IP. Returns `None` if no limit applies —
@@ -131,6 +149,8 @@ mod tests {
             client_keys: Arc::new(client_keys),
             default_rate_limit_rpm,
             rate_limiter: Arc::new(RateLimiter::new()),
+            clients: Arc::new(vec![]),
+            admin_key: None,
         }
     }
 
@@ -277,6 +297,57 @@ mod tests {
         );
     }
 
+    // --- check_admin_auth ------------------------------------------------------
+
+    #[tokio::test]
+    async fn check_admin_auth_is_404_when_admin_key_is_not_configured() {
+        let state = test_state(vec![], None).await;
+        let resp = check_admin_auth(&state, &HeaderMap::new()).unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn check_admin_auth_is_401_with_no_bearer_token_when_configured() {
+        let state = AppState {
+            admin_key: Some("admin-secret".to_string()),
+            ..test_state(vec![], None).await
+        };
+        let resp = check_admin_auth(&state, &HeaderMap::new()).unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn check_admin_auth_is_401_with_a_wrong_token() {
+        let state = AppState {
+            admin_key: Some("admin-secret".to_string()),
+            ..test_state(vec![], None).await
+        };
+        let resp = check_admin_auth(&state, &bearer_headers("wrong")).unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn check_admin_auth_rejects_a_regular_client_key() {
+        // A client key that authenticates chat completions must not also
+        // unlock the admin API -- they're deliberately separate trust
+        // levels.
+        let state = AppState {
+            admin_key: Some("admin-secret".to_string()),
+            ..test_state(vec![("client-key", "acme", 30)], None).await
+        };
+        let resp = check_admin_auth(&state, &bearer_headers("client-key")).unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn check_admin_auth_passes_with_the_correct_token() {
+        let state = AppState {
+            admin_key: Some("admin-secret".to_string()),
+            ..test_state(vec![], None).await
+        };
+        assert!(check_admin_auth(&state, &bearer_headers("admin-secret")).is_none());
+    }
+
     // --- budget_exceeded_response ----------------------------------------------
 
     #[tokio::test]
@@ -395,6 +466,57 @@ pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Respo
         state.router.render_prometheus_metrics(),
     )
         .into_response()
+}
+
+#[derive(Serialize)]
+struct AdminClientEntry {
+    name: String,
+    requests_per_minute: u32,
+    budget_usd: Option<f64>,
+    budget_period: Option<rp_router::BudgetPeriod>,
+    /// The client's live tracked spend for the current `budget_period`, or
+    /// `None` for a client with no `budget_usd` configured -- there's
+    /// nothing to track.
+    spent_usd: Option<f64>,
+}
+
+pub async fn admin_list_clients(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = check_admin_auth(&state, &headers) {
+        return resp;
+    }
+
+    let mut data = Vec::with_capacity(state.clients.len());
+    for client in state.clients.iter() {
+        let status = state.router.client_spend_status(&client.name).await;
+        data.push(AdminClientEntry {
+            name: client.name.clone(),
+            requests_per_minute: client.requests_per_minute,
+            budget_usd: client.budget_usd,
+            budget_period: status.map(|s| s.period),
+            spent_usd: status.map(|s| s.spent_usd),
+        });
+    }
+
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+pub async fn admin_reset_client_spend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    if let Some(resp) = check_admin_auth(&state, &headers) {
+        return resp;
+    }
+
+    if state.router.reset_client_spend(&name) {
+        Json(json!({ "status": "ok" })).into_response()
+    } else {
+        json_error(
+            404,
+            &format!("no client named \"{name}\" with a configured budget"),
+        )
+    }
 }
 
 pub async fn chat_completions(

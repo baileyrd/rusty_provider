@@ -36,6 +36,12 @@ async fn spawn_app(config_toml: &str) -> String {
         .as_ref()
         .and_then(|var| std::env::var(var).ok());
 
+    let admin_key = config
+        .server
+        .admin_key_env
+        .as_ref()
+        .and_then(|var| std::env::var(var).ok());
+
     let mut client_keys = HashMap::new();
     for client in &config.clients {
         if let Ok(k) = std::env::var(&client.api_key_env) {
@@ -51,6 +57,8 @@ async fn spawn_app(config_toml: &str) -> String {
         client_keys: Arc::new(client_keys),
         default_rate_limit_rpm: config.server.default_rate_limit_rpm,
         rate_limiter: Arc::new(RateLimiter::new()),
+        clients: Arc::new(config.clients.clone()),
+        admin_key,
     };
 
     let app = build_app(state);
@@ -582,6 +590,256 @@ async fn chat_completions_cuts_off_a_client_after_a_non_streaming_response_excee
         .unwrap();
     assert!(metrics.contains("rusty_provider_client_budget_rejections_total"));
     assert!(metrics.contains(r#"client="acme""#));
+}
+
+#[tokio::test]
+async fn admin_endpoints_are_404_when_admin_key_env_is_not_configured() {
+    let base_url = spawn_app("providers = {}").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/v1/admin/clients"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let resp = client
+        .post(format!("{base_url}/v1/admin/clients/acme/reset-spend"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn admin_list_clients_rejects_missing_wrong_and_regular_client_keys() {
+    let admin_key_var = unique_env_var("ADMIN_KEY");
+    std::env::set_var(&admin_key_var, "admin-secret");
+    let client_key_var = unique_env_var("CLIENT_KEY");
+    std::env::set_var(&client_key_var, "client-secret");
+
+    let config = format!(
+        r#"
+        providers = {{}}
+
+        [server]
+        admin_key_env = "{admin_key_var}"
+
+        [[clients]]
+        name = "acme"
+        api_key_env = "{client_key_var}"
+        requests_per_minute = 60
+        "#
+    );
+    let base_url = spawn_app(&config).await;
+    let client = reqwest::Client::new();
+
+    let no_auth = client
+        .get(format!("{base_url}/v1/admin/clients"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_auth.status(), 401);
+
+    let wrong_key = client
+        .get(format!("{base_url}/v1/admin/clients"))
+        .bearer_auth("nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_key.status(), 401);
+
+    // A regular client key (valid for chat completions) must not also
+    // unlock the admin API.
+    let client_key = client
+        .get(format!("{base_url}/v1/admin/clients"))
+        .bearer_auth("client-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(client_key.status(), 401);
+}
+
+#[tokio::test]
+async fn admin_list_clients_reports_configured_clients_and_live_spend() {
+    let admin_key_var = unique_env_var("ADMIN_KEY");
+    std::env::set_var(&admin_key_var, "admin-secret");
+    let budgeted_key_var = unique_env_var("BUDGETED_CLIENT_KEY");
+    std::env::set_var(&budgeted_key_var, "budgeted-secret");
+    let unbudgeted_key_var = unique_env_var("UNBUDGETED_CLIENT_KEY");
+    std::env::set_var(&unbudgeted_key_var, "unbudgeted-secret");
+
+    let config = format!(
+        r#"
+        providers = {{}}
+
+        [server]
+        admin_key_env = "{admin_key_var}"
+
+        [[clients]]
+        name = "acme"
+        api_key_env = "{budgeted_key_var}"
+        requests_per_minute = 30
+        budget_usd = 10.0
+        budget_period = "monthly"
+
+        [[clients]]
+        name = "globex"
+        api_key_env = "{unbudgeted_key_var}"
+        requests_per_minute = 60
+        "#
+    );
+    let base_url = spawn_app(&config).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/v1/admin/clients"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+
+    let acme = data.iter().find(|c| c["name"] == "acme").unwrap();
+    assert_eq!(acme["requests_per_minute"], 30);
+    assert_eq!(acme["budget_usd"], 10.0);
+    assert_eq!(acme["budget_period"], "monthly");
+    assert_eq!(acme["spent_usd"], 0.0);
+
+    let globex = data.iter().find(|c| c["name"] == "globex").unwrap();
+    assert_eq!(globex["requests_per_minute"], 60);
+    assert!(globex["budget_usd"].is_null());
+    assert!(globex["budget_period"].is_null());
+    assert!(globex["spent_usd"].is_null());
+}
+
+#[tokio::test]
+async fn admin_reset_client_spend_zeroes_spend_and_unblocks_the_client() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello there"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(&server)
+        .await;
+
+    let admin_key_var = unique_env_var("ADMIN_KEY");
+    std::env::set_var(&admin_key_var, "admin-secret");
+    let openai_key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&openai_key_var, "test-key");
+    let client_key_var = unique_env_var("CLIENT_KEY");
+    std::env::set_var(&client_key_var, "client-secret");
+
+    let config = format!(
+        r#"
+        [server]
+        admin_key_env = "{admin_key_var}"
+
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{openai_key_var}"
+
+        [[pricing]]
+        model = "openai/gpt-4o-mini"
+        prompt_per_million = 1000000.0
+        completion_per_million = 1000000.0
+
+        [[clients]]
+        name = "acme"
+        api_key_env = "{client_key_var}"
+        requests_per_minute = 1000
+        budget_usd = 1.0
+        "#,
+        server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": "openai/gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    // Push spend ($15) past the $1 budget.
+    let first = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth("client-secret")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let blocked = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth("client-secret")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), 402);
+
+    let reset = client
+        .post(format!("{base_url}/v1/admin/clients/acme/reset-spend"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), 200);
+
+    let unblocked = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth("client-secret")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unblocked.status(), 200);
+}
+
+#[tokio::test]
+async fn admin_reset_client_spend_is_404_for_a_client_with_no_configured_budget() {
+    let admin_key_var = unique_env_var("ADMIN_KEY");
+    std::env::set_var(&admin_key_var, "admin-secret");
+    let client_key_var = unique_env_var("CLIENT_KEY");
+    std::env::set_var(&client_key_var, "client-secret");
+
+    let config = format!(
+        r#"
+        providers = {{}}
+
+        [server]
+        admin_key_env = "{admin_key_var}"
+
+        [[clients]]
+        name = "acme"
+        api_key_env = "{client_key_var}"
+        requests_per_minute = 60
+        "#
+    );
+    let base_url = spawn_app(&config).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/v1/admin/clients/acme/reset-spend"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]

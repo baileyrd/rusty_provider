@@ -12,6 +12,12 @@ port = 8080
 # entry, bucketed by source IP. Unset (the default) means no limit for
 # such callers — rate limiting is entirely opt-in.
 # default_rate_limit_rpm = 60
+# Uncomment to enable the admin API (GET /v1/admin/clients, POST
+# /v1/admin/clients/{name}/reset-spend), unlocked by this separate token --
+# a client key that authenticates chat completions does NOT also unlock
+# this. Leaving it unset disables the admin API entirely (404s, as if the
+# routes didn't exist).
+# admin_key_env = "RUSTY_PROVIDER_ADMIN_KEY"
 
 # --- Providers -------------------------------------------------------------
 # `kind` is one of: "openai" (any OpenAI-compatible /chat/completions API),
@@ -165,9 +171,14 @@ completion_per_million = 0.79
 # Backend 2: a shared Postgres database, reachable over the network -- the
 # way to get usage/spend tracking consistent across multiple *hosts*, not
 # just multiple processes on one. Tables are created automatically on first
-# use. Connections are unencrypted (no TLS support yet), so use a trusted
-# network or an external tunnel.
+# use. Connections are unencrypted by default (postgres_tls = "disable"); set
+# postgres_tls = "require" to encrypt the connection, verified against the
+# host's native root certificate store (the same one reqwest trusts for
+# outbound provider calls). Use a trusted network, an external tunnel, or
+# postgres_tls = "require" -- never send this over an untrusted network in
+# the clear.
 
 # [persistence]
 # backend = "postgres"
 # postgres_url_env = "DATABASE_URL"
+# postgres_tls = "require"

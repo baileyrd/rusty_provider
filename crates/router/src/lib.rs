@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
-    BudgetPeriod, ClientConfig, Config, PersistenceBackend, PersistenceConfig, PricingEntry,
-    ProviderConfig, ProviderKind, RouteAlias, ServerConfig,
+    BudgetPeriod, ClientConfig, Config, PersistenceBackend, PersistenceConfig, PostgresTlsMode,
+    PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig,
 };
 pub use error::RouterError;
 pub use metrics::Metrics;
@@ -49,6 +49,15 @@ pub struct UsageStats {
 pub struct ClientBudgetExceeded {
     pub spent_usd: f64,
     pub budget_usd: f64,
+}
+
+/// A client's live spend against its configured budget, returned by
+/// [`Router::client_spend_status`] for the admin API.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct ClientSpendStatus {
+    pub spent_usd: f64,
+    pub budget_usd: f64,
+    pub period: BudgetPeriod,
 }
 
 /// Holds every provider adapter that could be built from config (i.e. its
@@ -189,7 +198,10 @@ fn resolve_persistence_target(config: &PersistenceConfig) -> Option<PersistenceT
         },
         PersistenceBackend::Postgres => match &config.postgres_url_env {
             Some(var) => match std::env::var(var) {
-                Ok(url) if !url.is_empty() => Some(PersistenceTarget::Postgres(url)),
+                Ok(url) if !url.is_empty() => Some(PersistenceTarget::Postgres {
+                    url,
+                    tls: config.postgres_tls,
+                }),
                 _ => {
                     tracing::warn!(env_var = %var, "persistence backend is \"postgres\" but the connection string env var isn't set; falling back to in-memory usage tracking");
                     None
@@ -350,12 +362,28 @@ impl Router {
     /// sharing it, not just this one); without persistence it's this
     /// process's own in-memory view, same as latency/throughput tracking.
     pub async fn check_client_budget(&self, client_name: &str) -> Result<(), ClientBudgetExceeded> {
-        let Some(setting) = self.client_budgets.get(client_name) else {
+        let Some(setting) = self.client_budgets.get(client_name).copied() else {
             return Ok(());
         };
+        let spent_usd = self.spent_usd_for(client_name, &setting).await;
+
+        if spent_usd >= setting.budget_usd {
+            Err(ClientBudgetExceeded {
+                spent_usd,
+                budget_usd: setting.budget_usd,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Shared by `check_client_budget` and `client_spend_status`: reads
+    /// `client_name`'s tracked spend for `setting`'s current period,
+    /// treating a rolled-over or unreadable value as unspent.
+    async fn spent_usd_for(&self, client_name: &str, setting: &ClientBudgetSetting) -> f64 {
         let current_key = client_budget::period_key_at(setting.period, client_budget::now_unix());
 
-        let spent_usd = if let Some(persistence) = &self.persistence {
+        if let Some(persistence) = &self.persistence {
             match persistence.client_spend(client_name).await {
                 Ok(Some((period_key, spent_usd))) if period_key == current_key => spent_usd,
                 Ok(_) => 0.0,
@@ -369,16 +397,46 @@ impl Router {
             let state = spend.entry(client_name.to_string()).or_default();
             client_budget::roll_period_if_needed(state, current_key);
             state.spent_usd
-        };
-
-        if spent_usd >= setting.budget_usd {
-            Err(ClientBudgetExceeded {
-                spent_usd,
-                budget_usd: setting.budget_usd,
-            })
-        } else {
-            Ok(())
         }
+    }
+
+    /// `client_name`'s live spend against its configured budget, for the
+    /// admin API (`GET /v1/admin/clients`). `None` if `client_name` has no
+    /// configured `budget_usd` -- there's nothing to report.
+    pub async fn client_spend_status(&self, client_name: &str) -> Option<ClientSpendStatus> {
+        let setting = *self.client_budgets.get(client_name)?;
+        let spent_usd = self.spent_usd_for(client_name, &setting).await;
+        Some(ClientSpendStatus {
+            spent_usd,
+            budget_usd: setting.budget_usd,
+            period: setting.period,
+        })
+    }
+
+    /// Resets `client_name`'s tracked spend to zero for the current
+    /// `budget_period`, for the admin API's manual budget reset
+    /// (`POST /v1/admin/clients/{name}/reset-spend`). Returns `false` (a
+    /// no-op) for a client with no configured budget -- there's nothing to
+    /// reset.
+    pub fn reset_client_spend(&self, client_name: &str) -> bool {
+        let Some(setting) = self.client_budgets.get(client_name) else {
+            return false;
+        };
+        let current_key = client_budget::period_key_at(setting.period, client_budget::now_unix());
+
+        if let Some(persistence) = &self.persistence {
+            persistence.reset_client_spend(client_name, current_key);
+        } else {
+            let mut spend = self.client_spend.lock().unwrap();
+            spend.insert(
+                client_name.to_string(),
+                SpendState {
+                    period_key: current_key,
+                    spent_usd: 0.0,
+                },
+            );
+        }
+        true
     }
 
     /// Adds `cost_usd` to `client_name`'s tracked spend for the current
@@ -1093,6 +1151,63 @@ mod tests {
         assert!(router.check_client_budget("globex").await.is_ok());
     }
 
+    // --- client_spend_status / reset_client_spend (admin API) --------------------
+
+    fn router_with_budgeted_client(budget_usd: f64, period: BudgetPeriod) -> Router {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.client_budgets.insert(
+            "acme".to_string(),
+            ClientBudgetSetting { budget_usd, period },
+        );
+        router
+    }
+
+    #[tokio::test]
+    async fn client_spend_status_is_none_for_a_client_with_no_configured_budget() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        assert_eq!(router.client_spend_status("acme").await, None);
+    }
+
+    #[tokio::test]
+    async fn client_spend_status_reports_zero_spend_before_any_requests() {
+        let router = router_with_budgeted_client(10.0, BudgetPeriod::Total);
+        let status = router.client_spend_status("acme").await.unwrap();
+        assert_eq!(status.spent_usd, 0.0);
+        assert_eq!(status.budget_usd, 10.0);
+        assert_eq!(status.period, BudgetPeriod::Total);
+    }
+
+    #[tokio::test]
+    async fn client_spend_status_reflects_recorded_spend() {
+        let router = router_with_budgeted_client(10.0, BudgetPeriod::Total);
+        router.record_client_spend("acme", 4.0);
+        let status = router.client_spend_status("acme").await.unwrap();
+        assert_eq!(status.spent_usd, 4.0);
+    }
+
+    #[tokio::test]
+    async fn reset_client_spend_is_a_no_op_for_a_client_with_no_configured_budget() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        assert!(!router.reset_client_spend("acme"));
+    }
+
+    #[tokio::test]
+    async fn reset_client_spend_zeroes_a_budgeted_clients_spend() {
+        let router = router_with_budgeted_client(10.0, BudgetPeriod::Total);
+        router.record_client_spend("acme", 8.0);
+        assert!(router.check_client_budget("acme").await.is_ok());
+        router.record_client_spend("acme", 5.0);
+        assert!(router.check_client_budget("acme").await.is_err());
+
+        assert!(router.reset_client_spend("acme"));
+
+        assert!(router.check_client_budget("acme").await.is_ok());
+        assert_eq!(
+            router.client_spend_status("acme").await.unwrap().spent_usd,
+            0.0
+        );
+    }
+
     #[tokio::test]
     async fn client_budget_is_persisted_and_shared_across_two_router_instances_sqlite() {
         // Same shape as the usage-sharing test below, but for client spend
@@ -1150,9 +1265,12 @@ mod tests {
 
         let mut router_a = test_router(vec![], vec![], vec![], vec![], vec![]);
         router_a.persistence = Some(Arc::new(
-            Persistence::open(PersistenceTarget::Postgres(url.clone()))
-                .await
-                .unwrap(),
+            Persistence::open(PersistenceTarget::Postgres {
+                url: url.clone(),
+                tls: PostgresTlsMode::Disable,
+            })
+            .await
+            .unwrap(),
         ));
         router_a.client_budgets.insert(client_name.clone(), setting);
         router_a.record_client_spend(&client_name, 12.0);
@@ -1160,9 +1278,12 @@ mod tests {
 
         let mut router_b = test_router(vec![], vec![], vec![], vec![], vec![]);
         router_b.persistence = Some(Arc::new(
-            Persistence::open(PersistenceTarget::Postgres(url))
-                .await
-                .unwrap(),
+            Persistence::open(PersistenceTarget::Postgres {
+                url,
+                tls: PostgresTlsMode::Disable,
+            })
+            .await
+            .unwrap(),
         ));
         router_b.client_budgets.insert(client_name.clone(), setting);
 

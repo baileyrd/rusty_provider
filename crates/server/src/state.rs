@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rp_core::RateLimiter;
-use rp_router::Router;
+use rp_router::{ClientConfig, Router};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,4 +26,13 @@ pub struct AppState {
     /// bucketed by source IP. `None` means no limit for such callers.
     pub default_rate_limit_rpm: Option<u32>,
     pub rate_limiter: Arc<RateLimiter>,
+    /// Every configured `[[clients]]` entry, for the admin API
+    /// (`GET /v1/admin/clients`) to enumerate -- `client_keys` above is
+    /// keyed by API key (for authenticating inbound requests), not by
+    /// name, so it can't be listed the other way around.
+    pub clients: Arc<Vec<ClientConfig>>,
+    /// Bearer token that unlocks `/v1/admin/*`, if `server.admin_key_env`
+    /// was set in config and the env var resolved. `None` disables the
+    /// admin API entirely, independent of `api_key`/`client_keys` above.
+    pub admin_key: Option<String>,
 }

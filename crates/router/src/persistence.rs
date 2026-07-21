@@ -13,6 +13,7 @@ use std::sync::mpsc;
 use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
+use crate::config::PostgresTlsMode;
 use crate::UsageStats;
 use rp_core::Usage;
 
@@ -22,6 +23,8 @@ pub enum PersistenceError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Postgres(#[from] tokio_postgres::Error),
+    #[error("failed to set up TLS for the postgres connection: {0}")]
+    Tls(String),
 }
 
 /// Where `Persistence::open` should connect to. Decoupled from
@@ -30,7 +33,7 @@ pub enum PersistenceError {
 /// resolves all of that first.
 pub enum PersistenceTarget {
     Sqlite(PathBuf),
-    Postgres(String),
+    Postgres { url: String, tls: PostgresTlsMode },
 }
 
 /// A cumulative usage/cost delta for one "provider/model" key, enqueued to
@@ -82,8 +85,8 @@ impl Persistence {
     pub async fn open(target: PersistenceTarget) -> Result<Self, PersistenceError> {
         let backend = match target {
             PersistenceTarget::Sqlite(path) => Backend::Sqlite(SqliteBackend::open(path)?),
-            PersistenceTarget::Postgres(url) => {
-                Backend::Postgres(PostgresBackend::connect(&url).await?)
+            PersistenceTarget::Postgres { url, tls } => {
+                Backend::Postgres(PostgresBackend::connect(&url, tls).await?)
             }
         };
         Ok(Self { backend })
@@ -145,6 +148,19 @@ impl Persistence {
             Backend::Postgres(b) => b.client_spend(client_name).await,
         }
     }
+
+    /// Unconditionally zeroes `client_name`'s spend for `period_key`,
+    /// regardless of what's currently stored -- unlike
+    /// `record_client_spend`, this doesn't add to an existing value for a
+    /// matching period, it always resets. Fire-and-forget, like `record`
+    /// and `record_client_spend`; used by the admin API's manual budget
+    /// reset.
+    pub fn reset_client_spend(&self, client_name: &str, period_key: i64) {
+        match &self.backend {
+            Backend::Sqlite(b) => b.reset_client_spend(client_name, period_key),
+            Backend::Postgres(b) => b.reset_client_spend(client_name, period_key),
+        }
+    }
 }
 
 fn read_usage_rows<E>(
@@ -186,6 +202,10 @@ enum SqliteWrite {
         client_name: String,
         period_key: i64,
         cost_usd: f64,
+    },
+    ResetClientSpend {
+        client_name: String,
+        period_key: i64,
     },
 }
 
@@ -259,6 +279,14 @@ impl SqliteBackend {
                                  spent_usd = CASE WHEN client_spend.period_key = ?2 THEN client_spend.spent_usd + ?3 ELSE ?3 END",
                             rusqlite::params![client_name, period_key, cost_usd],
                         ),
+                        SqliteWrite::ResetClientSpend { client_name, period_key } => conn.execute(
+                            "INSERT INTO client_spend (client_name, period_key, spent_usd)
+                             VALUES (?1, ?2, 0.0)
+                             ON CONFLICT(client_name) DO UPDATE SET
+                                 period_key = ?2,
+                                 spent_usd = 0.0",
+                            rusqlite::params![client_name, period_key],
+                        ),
                     };
                     if let Err(e) = result {
                         tracing::warn!("failed to persist event to sqlite: {e}");
@@ -308,6 +336,16 @@ impl SqliteBackend {
         }
     }
 
+    fn reset_client_spend(&self, client_name: &str, period_key: i64) {
+        let event = SqliteWrite::ResetClientSpend {
+            client_name: client_name.to_string(),
+            period_key,
+        };
+        if self.tx.send(event).is_err() {
+            tracing::warn!("persistence writer thread is gone; dropping client spend reset");
+        }
+    }
+
     async fn client_spend(
         &self,
         client_name: &str,
@@ -339,9 +377,66 @@ struct PostgresBackend {
     client: std::sync::Arc<tokio_postgres::Client>,
 }
 
+/// Builds a `rustls::ClientConfig` trusting the host's native root
+/// certificate store -- the same set `reqwest` trusts for outbound
+/// provider calls, so operators don't need a separate CA bundle just for
+/// the Postgres connection. Explicitly bound to the `ring` crypto
+/// provider (matching the one already pulled in by `reqwest`'s
+/// `rustls-tls-native-roots` feature) rather than relying on a
+/// process-wide default, so this doesn't race with -- or require -- any
+/// other code installing one first.
+fn build_rustls_client_config() -> Result<rustls::ClientConfig, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    let loaded = rustls_native_certs::load_native_certs();
+    for err in &loaded.errors {
+        tracing::warn!("error loading a native root certificate: {err}");
+    }
+    for cert in loaded.certs {
+        if let Err(e) = roots.add(cert) {
+            tracing::warn!("failed to add a native root certificate: {e}");
+        }
+    }
+    if roots.is_empty() {
+        return Err("no usable root certificates found in the native trust store".to_string());
+    }
+
+    let builder = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| format!("failed to configure TLS protocol versions: {e}"))?;
+    Ok(builder.with_root_certificates(roots).with_no_client_auth())
+}
+
 impl PostgresBackend {
-    async fn connect(url: &str) -> Result<Self, tokio_postgres::Error> {
-        let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls).await?;
+    async fn connect(url: &str, tls: PostgresTlsMode) -> Result<Self, PersistenceError> {
+        let mut config: tokio_postgres::Config = url.parse()?;
+        match tls {
+            PostgresTlsMode::Disable => Self::connect_with(config, tokio_postgres::NoTls).await,
+            PostgresTlsMode::Require => {
+                // Set explicitly (rather than trusting the connection
+                // string to say `sslmode=require`) so this mode always
+                // means what it says: refuse to fall back to plaintext,
+                // even against a server that doesn't support TLS.
+                config.ssl_mode(tokio_postgres::config::SslMode::Require);
+                let tls_config = build_rustls_client_config().map_err(PersistenceError::Tls)?;
+                let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
+                Self::connect_with(config, tls).await
+            }
+        }
+    }
+
+    async fn connect_with<T>(
+        config: tokio_postgres::Config,
+        tls: T,
+    ) -> Result<Self, PersistenceError>
+    where
+        T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Send + 'static,
+        T::TlsConnect: Send,
+        T::Stream: Send,
+        <T::TlsConnect as tokio_postgres::tls::TlsConnect<tokio_postgres::Socket>>::Future: Send,
+    {
+        let (client, connection) = config.connect(tls).await?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::error!("postgres persistence connection closed with an error: {e}");
@@ -437,6 +532,26 @@ impl PostgresBackend {
         });
     }
 
+    fn reset_client_spend(&self, client_name: &str, period_key: i64) {
+        let client = self.client.clone();
+        let client_name = client_name.to_string();
+        tokio::spawn(async move {
+            let result = client
+                .execute(
+                    "INSERT INTO client_spend (client_name, period_key, spent_usd)
+                     VALUES ($1, $2, 0.0)
+                     ON CONFLICT (client_name) DO UPDATE SET
+                         period_key = $2,
+                         spent_usd = 0.0",
+                    &[&client_name, &period_key],
+                )
+                .await;
+            if let Err(e) = result {
+                tracing::warn!("failed to persist client spend reset to postgres: {e}");
+            }
+        });
+    }
+
     async fn client_spend(
         &self,
         client_name: &str,
@@ -455,6 +570,17 @@ impl PostgresBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- rustls TLS config -------------------------------------------------------
+
+    #[test]
+    fn build_rustls_client_config_succeeds_with_the_hosts_native_roots() {
+        // Doesn't touch the network -- just confirms the native trust
+        // store loads and produces a usable `rustls::ClientConfig`,
+        // independent of whether a TLS-enabled Postgres is reachable in
+        // this environment.
+        build_rustls_client_config().expect("native root certificates should load");
+    }
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -704,6 +830,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reset_client_spend_zeroes_an_existing_balance() {
+        let path = unique_temp_path("client_spend_reset");
+        let persistence = open_sqlite(&path).await;
+        persistence.record_client_spend("acme", 100, 5.0);
+        wait_for_writer();
+        persistence.reset_client_spend("acme", 100);
+        wait_for_writer();
+        assert_eq!(
+            persistence.client_spend("acme").await.unwrap(),
+            Some((100, 0.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_client_spend_creates_a_zeroed_row_for_an_unrecorded_client() {
+        let path = unique_temp_path("client_spend_reset_new");
+        let persistence = open_sqlite(&path).await;
+        persistence.reset_client_spend("acme", 100);
+        wait_for_writer();
+        assert_eq!(
+            persistence.client_spend("acme").await.unwrap(),
+            Some((100, 0.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_client_spend_does_not_affect_other_clients() {
+        let path = unique_temp_path("client_spend_reset_independent");
+        let persistence = open_sqlite(&path).await;
+        persistence.record_client_spend("acme", 100, 5.0);
+        persistence.record_client_spend("globex", 100, 9.0);
+        wait_for_writer();
+        persistence.reset_client_spend("acme", 100);
+        wait_for_writer();
+        assert_eq!(
+            persistence.client_spend("globex").await.unwrap(),
+            Some((100, 9.0))
+        );
+    }
+
     // --- postgres backend ----------------------------------------------------------
     //
     // Gated on TEST_POSTGRES_URL so contributors without a local Postgres
@@ -715,9 +882,12 @@ mod tests {
 
     async fn open_postgres_for_test(label: &str) -> Option<Persistence> {
         let base_url = test_postgres_url()?;
-        let persistence = Persistence::open(PersistenceTarget::Postgres(base_url))
-            .await
-            .expect("TEST_POSTGRES_URL should be reachable");
+        let persistence = Persistence::open(PersistenceTarget::Postgres {
+            url: base_url,
+            tls: PostgresTlsMode::Disable,
+        })
+        .await
+        .expect("TEST_POSTGRES_URL should be reachable");
         // Each test gets its own key prefix rather than its own database
         // (creating/dropping databases per test is slow and needs
         // elevated privileges) -- scoped via a unique key/client_name
@@ -799,12 +969,18 @@ mod tests {
             eprintln!("skipping: TEST_POSTGRES_URL not set");
             return;
         };
-        let handle_a = Persistence::open(PersistenceTarget::Postgres(url.clone()))
-            .await
-            .unwrap();
-        let handle_b = Persistence::open(PersistenceTarget::Postgres(url))
-            .await
-            .unwrap();
+        let handle_a = Persistence::open(PersistenceTarget::Postgres {
+            url: url.clone(),
+            tls: PostgresTlsMode::Disable,
+        })
+        .await
+        .unwrap();
+        let handle_b = Persistence::open(PersistenceTarget::Postgres {
+            url,
+            tls: PostgresTlsMode::Disable,
+        })
+        .await
+        .unwrap();
 
         let key = unique_key("shared");
         handle_a.record(
@@ -847,5 +1023,63 @@ mod tests {
             persistence.client_spend(&client_name).await.unwrap(),
             Some((101, 1.5))
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_reset_client_spend_zeroes_an_existing_balance() {
+        let Some(persistence) = open_postgres_for_test("client_spend_reset").await else {
+            eprintln!("skipping: TEST_POSTGRES_URL not set");
+            return;
+        };
+        let client_name = unique_key("client_reset");
+
+        persistence.record_client_spend(&client_name, 100, 5.0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        persistence.reset_client_spend(&client_name, 100);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            persistence.client_spend(&client_name).await.unwrap(),
+            Some((100, 0.0))
+        );
+    }
+
+    // --- postgres backend, TLS ------------------------------------------------------
+    //
+    // Separately gated on TEST_POSTGRES_TLS_URL (not TEST_POSTGRES_URL)
+    // since this needs a Postgres with TLS actually enabled and a
+    // certificate the test host's native trust store accepts -- more to
+    // ask of a CI service container than the plaintext tests above, so
+    // this stays opt-in even where TEST_POSTGRES_URL is provided.
+
+    #[tokio::test]
+    async fn postgres_require_tls_round_trip() {
+        let Ok(url) = std::env::var("TEST_POSTGRES_TLS_URL") else {
+            eprintln!("skipping: TEST_POSTGRES_TLS_URL not set");
+            return;
+        };
+        let persistence = Persistence::open(PersistenceTarget::Postgres {
+            url,
+            tls: PostgresTlsMode::Require,
+        })
+        .await
+        .expect("TEST_POSTGRES_TLS_URL should be reachable over TLS");
+
+        let key = unique_key("tls");
+        persistence.record(
+            &key,
+            &Usage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5,
+            },
+            Some(0.05),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stats = persistence.load_all().await.unwrap();
+        let entry = &stats[&key];
+        assert_eq!(entry.requests, 1);
+        assert_eq!(entry.prompt_tokens, 3);
+        assert_eq!(entry.completion_tokens, 2);
     }
 }

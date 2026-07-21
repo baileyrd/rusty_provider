@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 fn default_host() -> String {
     "0.0.0.0".to_string()
@@ -27,6 +27,16 @@ pub struct ServerConfig {
     /// limit for such callers.
     #[serde(default)]
     pub default_rate_limit_rpm: Option<u32>,
+    /// If set, the env var holding a bearer token that unlocks the admin
+    /// API (`/v1/admin/*`) -- listing configured clients' live spend and
+    /// resetting a client's budget. Deliberately separate from
+    /// `api_key_env`/`[[clients]]` keys: those grant access to
+    /// `/v1/chat/completions`, not to every other client's spend data or
+    /// the ability to reset it. Leaving this unset disables the admin API
+    /// entirely (`404`, as if the routes didn't exist) rather than falling
+    /// open.
+    #[serde(default)]
+    pub admin_key_env: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -36,6 +46,7 @@ impl Default for ServerConfig {
             port: default_port(),
             api_key_env: None,
             default_rate_limit_rpm: None,
+            admin_key_env: None,
         }
     }
 }
@@ -118,7 +129,7 @@ pub struct ClientConfig {
 }
 
 /// How a client's `budget_usd` cap resets.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BudgetPeriod {
     /// Never resets — a lifetime cap on this client's total tracked spend.
@@ -143,6 +154,22 @@ pub enum PersistenceBackend {
     Postgres,
 }
 
+/// Whether the Postgres backend encrypts its connection.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PostgresTlsMode {
+    /// Plaintext connection. Fine on a trusted network or an already-
+    /// encrypted tunnel (e.g. a Unix socket, a VPN, `stunnel`); never use
+    /// this across an untrusted network.
+    #[default]
+    Disable,
+    /// Require TLS, verifying the server's certificate against the host's
+    /// native trust store (the same roots `reqwest` trusts for outbound
+    /// provider calls). The connection is refused if TLS can't be
+    /// negotiated or the certificate doesn't validate.
+    Require,
+}
+
 /// Durable storage for cumulative usage/cost stats and client spend
 /// budgets, so they survive a restart and stay consistent across every
 /// router process pointed at the same backend. Omit this section entirely
@@ -160,11 +187,13 @@ pub struct PersistenceConfig {
     /// Name of the environment variable holding a Postgres connection
     /// string (e.g. `postgres://user:pass@host/dbname`), kept out of the
     /// config file the same way provider/client API keys are. Required
-    /// when `backend` is `"postgres"`; ignored otherwise. Connections are
-    /// unencrypted (no TLS support yet) — use a trusted network or an
-    /// external tunnel.
+    /// when `backend` is `"postgres"`; ignored otherwise.
     #[serde(default)]
     pub postgres_url_env: Option<String>,
+    /// Whether the Postgres connection is encrypted. Ignored when
+    /// `backend` is `"sqlite"`.
+    #[serde(default)]
+    pub postgres_tls: PostgresTlsMode,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -220,6 +249,7 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.api_key_env, None);
         assert_eq!(config.server.default_rate_limit_rpm, None);
+        assert_eq!(config.server.admin_key_env, None);
     }
 
     #[test]
@@ -233,6 +263,7 @@ mod tests {
             port = 9000
             api_key_env = "RP_API_KEY"
             default_rate_limit_rpm = 60
+            admin_key_env = "RP_ADMIN_KEY"
             "#,
         )
         .unwrap();
@@ -240,6 +271,7 @@ mod tests {
         assert_eq!(config.server.port, 9000);
         assert_eq!(config.server.api_key_env.as_deref(), Some("RP_API_KEY"));
         assert_eq!(config.server.default_rate_limit_rpm, Some(60));
+        assert_eq!(config.server.admin_key_env.as_deref(), Some("RP_ADMIN_KEY"));
     }
 
     // --- providers -------------------------------------------------------------
@@ -545,6 +577,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("backend"));
+    }
+
+    #[test]
+    fn postgres_tls_defaults_to_disable() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [persistence]
+            backend = "postgres"
+            postgres_url_env = "DATABASE_URL"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.persistence.unwrap().postgres_tls,
+            PostgresTlsMode::Disable
+        );
+    }
+
+    #[test]
+    fn postgres_tls_require_is_honored_when_set() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [persistence]
+            backend = "postgres"
+            postgres_url_env = "DATABASE_URL"
+            postgres_tls = "require"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.persistence.unwrap().postgres_tls,
+            PostgresTlsMode::Require
+        );
+    }
+
+    #[test]
+    fn postgres_tls_rejects_unknown_value() {
+        let err = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [persistence]
+            backend = "postgres"
+            postgres_url_env = "DATABASE_URL"
+            postgres_tls = "verify-full"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("postgres_tls"));
     }
 
     // --- malformed input / from_file --------------------------------------------
