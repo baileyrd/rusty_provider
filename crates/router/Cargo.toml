@@ -18,6 +18,9 @@ prometheus.workspace = true
 rusqlite.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

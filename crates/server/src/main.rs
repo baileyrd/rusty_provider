@@ -39,6 +39,19 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let admin_key = config
+        .server
+        .admin_key_env
+        .as_ref()
+        .and_then(|var| std::env::var(var).ok());
+    if admin_key.is_none() && config.server.admin_key_env.is_some() {
+        tracing::warn!(
+            "server.admin_key_env is set in config but the env var isn't — the admin API stays disabled"
+        );
+    } else if admin_key.is_some() {
+        tracing::info!("admin API enabled");
+    }
+
     let mut client_keys = HashMap::new();
     for client in &config.clients {
         match std::env::var(&client.api_key_env) {
@@ -60,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
         client_keys: Arc::new(client_keys),
         default_rate_limit_rpm: config.server.default_rate_limit_rpm,
         rate_limiter: Arc::new(RateLimiter::new()),
+        clients: Arc::new(config.clients.clone()),
+        admin_key,
     };
 
     let app = build_app(state);

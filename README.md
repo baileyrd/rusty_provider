@@ -326,6 +326,34 @@ enforces the same budget consistently instead of each tracking its own
 slice of a client's traffic. Rejections show up in `GET /metrics` as
 `rusty_provider_client_budget_rejections_total`, labeled by client name.
 
+## Admin API
+
+Setting `server.admin_key_env` unlocks a small admin API for inspecting
+and managing configured clients' spend budgets:
+
+```toml
+[server]
+admin_key_env = "RUSTY_PROVIDER_ADMIN_KEY"
+```
+
+- **`GET /v1/admin/clients`** — every configured `[[clients]]` entry, its
+  `requests_per_minute`, and (for clients with `budget_usd` set) its
+  current-period `spent_usd` and `budget_period`. A client with no
+  configured budget still appears, with `budget_usd`/`budget_period`/
+  `spent_usd` all `null`.
+- **`POST /v1/admin/clients/{name}/reset-spend`** — zeroes that client's
+  tracked spend for the current period, immediately un-blocking a client
+  that's hit `402`. `404` for a client name that doesn't exist or has no
+  configured budget.
+
+Requests to either route need `Authorization: Bearer <token>` matching
+`admin_key_env`'s resolved value — **not** `server.api_key_env` or any
+`[[clients]]` key, which authenticate chat completions but deliberately
+don't also grant access to every other client's spend data or the ability
+to reset it. Leaving `admin_key_env` unset disables the admin API
+entirely: both routes `404`, as if they didn't exist, rather than
+silently falling open once *any* auth is configured elsewhere.
+
 ## Persistence
 
 By default, cumulative usage/cost stats (`GET /v1/usage`) and each
@@ -345,6 +373,7 @@ sqlite_path = "usage.db"
 [persistence]
 backend = "postgres"
 postgres_url_env = "DATABASE_URL"
+postgres_tls = "require"  # or "disable" (the default) for a plaintext connection
 ```
 
 Either way, the schema (a `usage_stats` table and a `client_spend` table)
@@ -362,8 +391,12 @@ meant for processes spread across different machines over a network
 filesystem. **Postgres** is the way to get that: any number of
 `rusty_provider` processes, on any number of hosts, pointed at the same
 database, see a consistent combined total and enforce budgets
-consistently across the whole fleet. Connections are unencrypted (no TLS
-support yet), so use a trusted network or an external tunnel; the
+consistently across the whole fleet. Connections are unencrypted by
+default (`postgres_tls = "disable"`); set `postgres_tls = "require"` to
+encrypt them, verified against the host's native root certificate store —
+the same trust store `reqwest` already uses for outbound provider calls,
+so there's no separate CA bundle to manage. `"require"` refuses to fall
+back to plaintext even if the server doesn't support TLS. Either way, the
 connection string comes from the environment variable named by
 `postgres_url_env`, the same way provider/client API keys are kept out of
 the config file.

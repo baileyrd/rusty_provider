@@ -19,6 +19,11 @@ pub fn build_app(state: AppState) -> AxumRouter {
         .route("/v1/usage", get(routes::usage_stats))
         .route("/metrics", get(routes::metrics))
         .route("/v1/chat/completions", post(routes::chat_completions))
+        .route("/v1/admin/clients", get(routes::admin_list_clients))
+        .route(
+            "/v1/admin/clients/:name/reset-spend",
+            post(routes::admin_reset_client_spend),
+        )
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
