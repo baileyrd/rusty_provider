@@ -1,7 +1,7 @@
 mod config;
 mod error;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub use config::{Config, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig};
@@ -21,6 +21,8 @@ pub struct Router {
     routes: HashMap<String, Vec<String>>,
     /// "provider/model" -> prompt price per million tokens.
     pricing: HashMap<String, f64>,
+    /// Provider names with `zdr = true` in config.
+    zdr_providers: HashSet<String>,
 }
 
 impl Router {
@@ -62,10 +64,18 @@ impl Router {
             .map(|p| (p.model.clone(), p.prompt_per_million))
             .collect();
 
+        let zdr_providers = config
+            .providers
+            .iter()
+            .filter(|(_, cfg)| cfg.zdr)
+            .map(|(name, _)| name.clone())
+            .collect();
+
         Self {
             providers,
             routes,
             pricing,
+            zdr_providers,
         }
     }
 
@@ -97,8 +107,9 @@ impl Router {
             .collect()
     }
 
-    /// Apply a request's `provider.only`/`provider.ignore`/`provider.sort`
-    /// constraints to a resolved chain, in that order: filter, then sort.
+    /// Apply a request's `provider.only`/`provider.ignore`/`provider.zdr`/
+    /// `provider.sort` constraints to a resolved chain, in that order:
+    /// filter, then sort.
     fn apply_preferences(
         &self,
         model: &str,
@@ -112,6 +123,9 @@ impl Router {
         }
         if let Some(ignore) = &prefs.ignore {
             chain.retain(|(provider, _)| !ignore.iter().any(|p| p == provider));
+        }
+        if prefs.zdr == Some(true) {
+            chain.retain(|(provider, _)| self.zdr_providers.contains(provider));
         }
         if chain.is_empty() {
             return Err(RouterError::NoEligibleProvider(model.to_string()));

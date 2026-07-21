@@ -164,6 +164,13 @@ pub struct ProviderPreferences {
     /// other value (or unset) leaves the chain in its configured order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<String>,
+    /// If `true`, drop every candidate whose provider isn't marked
+    /// `zdr = true` in config — i.e. only route to providers the operator
+    /// has declared a Zero Data Retention agreement with. This is a
+    /// self-declared config flag the router trusts, not something it
+    /// verifies against the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zdr: Option<bool>,
 }
 
 impl ChatRequest {

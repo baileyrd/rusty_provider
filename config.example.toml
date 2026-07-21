@@ -13,16 +13,24 @@ port = 8080
 # "anthropic", or "gemini". A provider is skipped at startup (with a warning)
 # if its api_key_env isn't set, so it's fine to leave providers you don't
 # use in this file.
+#
+# `zdr` (default false) self-declares that you have a Zero Data Retention
+# agreement with this provider — the router trusts this flag and never
+# verifies it against the provider. Only consulted for requests that set
+# `"provider": {"zdr": true}`. Confirm your actual contract terms with the
+# provider before relying on this for anything sensitive.
 
 [providers.openai]
 kind = "openai"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
+# zdr = true
 
 [providers.anthropic]
 kind = "anthropic"
 base_url = "https://api.anthropic.com"
 api_key_env = "ANTHROPIC_API_KEY"
+# zdr = true
 
 [providers.gemini]
 kind = "gemini"
