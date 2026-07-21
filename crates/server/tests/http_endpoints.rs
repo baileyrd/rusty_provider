@@ -298,6 +298,81 @@ async fn chat_completions_rejects_empty_messages_with_400() {
 }
 
 #[tokio::test]
+async fn chat_completions_routes_a_short_prompt_to_the_simple_auto_routing_tier() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+        })))
+        .mount(&server)
+        .await;
+
+    let key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&key_var, "test-key");
+    // Only "openai" is configured -- medium/complex point at "anthropic",
+    // which has no provider entry at all. A short "hi" prompt must land
+    // in the simple tier to succeed; if it were misrouted to medium or
+    // complex, dispatch would fail with 424 (provider not configured)
+    // instead of reaching this mock.
+    let config = format!(
+        r#"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{key_var}"
+
+        [auto_routing]
+        simple_model = "openai/gpt-4o-mini"
+        medium_model = "anthropic/claude-sonnet-5"
+        complex_model = "anthropic/claude-opus-4-8"
+        "#,
+        server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["model"], "openai/gpt-4o-mini");
+}
+
+#[tokio::test]
+async fn chat_completions_returns_400_for_auto_when_auto_routing_is_not_configured() {
+    let base_url = spawn_app("providers = {}").await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
 async fn chat_completions_applies_a_preset_model_override_and_system_prompt() {
     let server = MockServer::start().await;
     // The mock only matches a request whose model is the preset's

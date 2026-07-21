@@ -257,6 +257,44 @@ pub struct Config {
     pub guardrails: Vec<GuardrailConfig>,
     #[serde(default)]
     pub presets: Vec<PresetConfig>,
+    #[serde(default)]
+    pub auto_routing: Option<AutoRoutingConfig>,
+}
+
+/// Configures `model: "auto"` -- a heuristic (not ML) complexity-based
+/// router, roughly mirroring OpenRouter's `openrouter/auto`. Each of the
+/// three tier fields is a "provider/model" string or a `[[routes]]`
+/// alias, exactly like `ChatRequest.model` itself, so a tier can point at
+/// a whole fallback chain rather than one fixed model. Absent entirely
+/// means `model: "auto"` isn't special-cased at all -- it's resolved the
+/// same as any other unrecognized alias (a `400`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct AutoRoutingConfig {
+    /// Used for requests scoring at or below `simple_max_score`.
+    pub simple_model: String,
+    /// Used for requests scoring above `simple_max_score` but at or below
+    /// `medium_max_score`.
+    pub medium_model: String,
+    /// Used for requests scoring above `medium_max_score`.
+    pub complex_model: String,
+    /// Upper (inclusive) complexity-score bound for `simple_model`. The
+    /// score itself has no fixed unit -- it's an estimated-token count
+    /// plus heuristic bonuses (see `estimate_complexity`) -- so these
+    /// thresholds are necessarily something to tune empirically against
+    /// your own traffic, not a universal constant.
+    #[serde(default = "default_simple_max_score")]
+    pub simple_max_score: u32,
+    /// Upper (inclusive) complexity-score bound for `medium_model`.
+    #[serde(default = "default_medium_max_score")]
+    pub medium_max_score: u32,
+}
+
+fn default_simple_max_score() -> u32 {
+    200
+}
+
+fn default_medium_max_score() -> u32 {
+    800
 }
 
 /// A named, reusable bundle of request defaults (`[[presets]]`), applied
@@ -866,6 +904,55 @@ mod tests {
         assert_eq!(preset.model, None);
         assert_eq!(preset.system_prompt, None);
         assert!(preset.provider.is_none());
+    }
+
+    // --- auto_routing ------------------------------------------------------------
+
+    #[test]
+    fn auto_routing_defaults_to_absent() {
+        let config = Config::from_toml_str("providers = {}").unwrap();
+        assert!(config.auto_routing.is_none());
+    }
+
+    #[test]
+    fn auto_routing_parses_the_three_tiers_and_default_thresholds() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [auto_routing]
+            simple_model = "openai/gpt-4o-mini"
+            medium_model = "smart"
+            complex_model = "anthropic/claude-opus-4-8"
+            "#,
+        )
+        .unwrap();
+        let auto_routing = config.auto_routing.unwrap();
+        assert_eq!(auto_routing.simple_model, "openai/gpt-4o-mini");
+        assert_eq!(auto_routing.medium_model, "smart");
+        assert_eq!(auto_routing.complex_model, "anthropic/claude-opus-4-8");
+        assert_eq!(auto_routing.simple_max_score, 200);
+        assert_eq!(auto_routing.medium_max_score, 800);
+    }
+
+    #[test]
+    fn auto_routing_honors_explicit_thresholds() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [auto_routing]
+            simple_model = "fast"
+            medium_model = "smart"
+            complex_model = "anthropic/claude-opus-4-8"
+            simple_max_score = 50
+            medium_max_score = 300
+            "#,
+        )
+        .unwrap();
+        let auto_routing = config.auto_routing.unwrap();
+        assert_eq!(auto_routing.simple_max_score, 50);
+        assert_eq!(auto_routing.medium_max_score, 300);
     }
 
     // --- persistence backend -----------------------------------------------------
