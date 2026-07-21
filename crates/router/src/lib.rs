@@ -1425,6 +1425,101 @@ mod tests {
         assert_eq!(ewma_lookup(&map, "openai", "m2", -1.0), 900.0);
     }
 
+    // --- record_usage ------------------------------------------------------------
+
+    fn usage(prompt_tokens: u32, completion_tokens: u32) -> Usage {
+        Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        }
+    }
+
+    #[test]
+    fn record_usage_computes_cost_from_per_million_token_pricing() {
+        let usage_map = RwLock::new(HashMap::new());
+        let mut pricing = HashMap::new();
+        // $2/1M prompt tokens, $10/1M completion tokens.
+        pricing.insert("anthropic/m1".to_string(), (2.0, 10.0));
+
+        let cost = record_usage(
+            &usage_map,
+            &pricing,
+            "anthropic",
+            "m1",
+            &usage(500_000, 100_000),
+        );
+
+        // (500_000 * 2.0 + 100_000 * 10.0) / 1_000_000 = (1_000_000 + 1_000_000) / 1_000_000.
+        assert!((cost.unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_usage_returns_none_and_leaves_cost_at_zero_when_unpriced() {
+        let usage_map = RwLock::new(HashMap::new());
+        let pricing = HashMap::new();
+
+        let cost = record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(100, 50));
+
+        assert!(cost.is_none());
+        let stats = usage_map.read().unwrap();
+        let entry = &stats["anthropic/m1"];
+        assert_eq!(entry.requests, 1);
+        assert_eq!(entry.prompt_tokens, 100);
+        assert_eq!(entry.completion_tokens, 50);
+        assert_eq!(entry.cost_usd, 0.0, "unpriced usage is unknown, not free");
+    }
+
+    #[test]
+    fn record_usage_zero_tokens_with_pricing_still_returns_some_zero_cost() {
+        let usage_map = RwLock::new(HashMap::new());
+        let mut pricing = HashMap::new();
+        pricing.insert("anthropic/m1".to_string(), (2.0, 10.0));
+
+        let cost = record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(0, 0));
+
+        assert_eq!(
+            cost,
+            Some(0.0),
+            "a priced model with 0 tokens costs $0, not unknown"
+        );
+    }
+
+    #[test]
+    fn record_usage_accumulates_across_multiple_calls_for_the_same_key() {
+        let usage_map = RwLock::new(HashMap::new());
+        let mut pricing = HashMap::new();
+        pricing.insert("anthropic/m1".to_string(), (1.0, 1.0));
+
+        record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(100, 50));
+        record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(200, 100));
+
+        let stats = usage_map.read().unwrap();
+        let entry = &stats["anthropic/m1"];
+        assert_eq!(entry.requests, 2);
+        assert_eq!(entry.prompt_tokens, 300);
+        assert_eq!(entry.completion_tokens, 150);
+        // (100+50)/1e6 + (200+100)/1e6 = 150/1e6 + 300/1e6.
+        assert!((entry.cost_usd - (150.0 + 300.0) / 1_000_000.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn record_usage_keys_are_independent_per_provider_model() {
+        let usage_map = RwLock::new(HashMap::new());
+        let mut pricing = HashMap::new();
+        pricing.insert("anthropic/m1".to_string(), (1.0, 1.0));
+        pricing.insert("openai/m2".to_string(), (5.0, 5.0));
+
+        record_usage(&usage_map, &pricing, "anthropic", "m1", &usage(100, 0));
+        record_usage(&usage_map, &pricing, "openai", "m2", &usage(200, 0));
+
+        let stats = usage_map.read().unwrap();
+        assert_eq!(stats["anthropic/m1"].requests, 1);
+        assert_eq!(stats["anthropic/m1"].prompt_tokens, 100);
+        assert_eq!(stats["openai/m2"].requests, 1);
+        assert_eq!(stats["openai/m2"].prompt_tokens, 200);
+    }
+
     // --- check_outbound_rate_limit ----------------------------------------------
 
     #[test]
@@ -1505,6 +1600,123 @@ mod tests {
 
         assert_eq!(resp.model, "anthropic/claude-sonnet-5");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_stamps_cost_and_records_usage_when_the_model_is_priced() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls,
+        });
+        // MockProvider's Succeed response carries Usage { prompt_tokens: 1,
+        // completion_tokens: 1 }.
+        let router = test_router(
+            vec![("anthropic", mock)],
+            vec![],
+            vec![("anthropic/m1", 1.0, 1.0)],
+            vec![],
+            vec![],
+        );
+
+        let resp = router
+            .dispatch(&test_request("anthropic/m1"))
+            .await
+            .expect("dispatch should succeed");
+
+        let expected_cost = 2.0 / 1_000_000.0;
+        assert!((resp.cost_usd.unwrap() - expected_cost).abs() < 1e-12);
+
+        let snapshot = router.usage_snapshot();
+        let stats = &snapshot["anthropic/m1"];
+        assert_eq!(stats.requests, 1);
+        assert_eq!(stats.prompt_tokens, 1);
+        assert_eq!(stats.completion_tokens, 1);
+        assert!((stats.cost_usd - expected_cost).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn dispatch_leaves_cost_usd_none_but_still_records_usage_when_unpriced() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls,
+        });
+        let router = test_router(vec![("anthropic", mock)], vec![], vec![], vec![], vec![]);
+
+        let resp = router
+            .dispatch(&test_request("anthropic/m1"))
+            .await
+            .expect("dispatch should succeed");
+
+        assert!(resp.cost_usd.is_none());
+        let snapshot = router.usage_snapshot();
+        let stats = &snapshot["anthropic/m1"];
+        assert_eq!(stats.requests, 1);
+        assert_eq!(stats.cost_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_accumulates_across_multiple_dispatches() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls,
+        });
+        let router = test_router(vec![("anthropic", mock)], vec![], vec![], vec![], vec![]);
+        let req = test_request("anthropic/m1");
+
+        router.dispatch(&req).await.unwrap();
+        router.dispatch(&req).await.unwrap();
+        router.dispatch(&req).await.unwrap();
+
+        let snapshot = router.usage_snapshot();
+        let stats = &snapshot["anthropic/m1"];
+        assert_eq!(stats.requests, 3);
+        assert_eq!(stats.prompt_tokens, 3);
+        assert_eq!(stats.completion_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_stamps_cost_and_records_usage_on_the_final_chunk() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls,
+        });
+        // MockProvider's chat_stream yields a single chunk carrying the same
+        // Usage { prompt_tokens: 1, completion_tokens: 1 } as chat().
+        let router = test_router(
+            vec![("anthropic", mock)],
+            vec![],
+            vec![("anthropic/m1", 3.0, 9.0)],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.stream = Some(true);
+
+        let mut stream = router
+            .dispatch_stream(&req)
+            .await
+            .expect("dispatch_stream should succeed");
+        let chunk = stream
+            .next()
+            .await
+            .expect("stream should yield one chunk")
+            .expect("chunk should be Ok");
+
+        let expected_cost = (3.0 + 9.0) / 1_000_000.0;
+        assert!((chunk.cost_usd.unwrap() - expected_cost).abs() < 1e-12);
+
+        let snapshot = router.usage_snapshot();
+        let stats = &snapshot["anthropic/m1"];
+        assert_eq!(stats.requests, 1);
+        assert!((stats.cost_usd - expected_cost).abs() < 1e-12);
     }
 
     #[tokio::test]
