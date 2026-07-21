@@ -854,6 +854,47 @@ globally (every request, regardless of which client sent it), since
 rusty has no workspace/org concept to scope guardrails to individually
 the way OpenRouter's org-level guardrails can be.
 
+## Moderation
+
+`[moderation]` checks every request's message text against an external
+moderation endpoint before it's ever dispatched to a provider, blocking
+anything flagged:
+
+```toml
+[moderation]
+api_key_env = "OPENAI_API_KEY"          # can reuse [providers.openai]'s key
+base_url = "https://api.openai.com/v1"  # optional, this is the default
+model = "omni-moderation-latest"        # optional, this is the default
+```
+
+This is a different axis from [Guardrails](#guardrails) above: a guardrail
+is a regex pattern the operator writes and fully controls (a specific SSN
+format, a specific banned word); moderation defers the actual judgment
+call — hate, violence, self-harm, and whatever other categories the
+backend classifies — to a third-party classifier the operator doesn't
+have to enumerate patterns for. Only OpenAI's `/moderations` endpoint (or
+a compatible one — `base_url` is configurable) is supported; Anthropic
+and Gemini don't expose a public moderation API of their own. Moderation
+runs *after* guardrails, so a guardrail's own redaction is what gets
+checked, not the raw input.
+
+A flagged request is rejected with `400` and the triggering category
+names (also recorded in the `rusty_provider_moderation_blocked_total`
+Prometheus counter, labeled by category). Only plain text is checked —
+the same message-text/text-parts scope as guardrails; a request with no
+text content at all (image-only) skips the check entirely rather than
+making an empty call.
+
+If the moderation backend itself can't be reached, or returns something
+this router can't parse, the request is let through — moderation fails
+*open*, not closed. This is deliberate: an unreachable/misbehaving
+moderation backend is treated the same as this router's other auxiliary
+systems (an unreachable webhook, an unreachable persistence backend, an
+invalid guardrail regex at startup) — logged, not something that should
+take down chat completions entirely. `moderation.api_key_env` set but
+unresolvable at startup disables moderation the same way a misconfigured
+provider is skipped, with a warning.
+
 ## Presets
 
 `[[presets]]` saves a named `(model, provider prefs, system prompt,

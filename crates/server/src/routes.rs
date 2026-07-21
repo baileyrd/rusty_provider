@@ -1192,6 +1192,10 @@ async fn chat_completions_dispatch(
         return router_error_response(e);
     }
 
+    if let Err(e) = state.router.apply_moderation(&req).await {
+        return router_error_response(e);
+    }
+
     let client_name = matched_client_name(state, headers);
     if let Some(name) = &client_name {
         if let Err(exceeded) = state.router.check_client_budget(name).await {

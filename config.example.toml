@@ -274,6 +274,23 @@ completion_per_million = 0.79
 # action = "redact"
 # replacement = "<email>"
 
+# --- Moderation (optional) --------------------------------------------------------
+# Checks every request's message text against an external moderation endpoint
+# before it's ever dispatched to a provider, blocking anything flagged with 400.
+# A different axis from [[guardrails]] above: guardrails are your own regex
+# patterns, this defers the judgment call (hate, violence, self-harm, etc.) to a
+# third-party classifier. Only OpenAI's /moderations endpoint (or a compatible
+# one -- base_url is configurable) is supported today. Runs after guardrails, so
+# a guardrail's own redaction is what gets checked. If the moderation backend
+# itself is unreachable or errors, the request is let through (fail open) and the
+# failure is only logged -- a moderation outage shouldn't take down chat
+# completions entirely.
+
+# [moderation]
+# api_key_env = "OPENAI_API_KEY"  # can reuse [providers.openai]'s key
+# base_url = "https://api.openai.com/v1"  # optional, this is the default
+# model = "omni-moderation-latest"        # optional, this is the default
+
 # --- Presets (optional) ----------------------------------------------------------
 # A named, reusable bundle of request defaults, referenced from a request via
 # `"preset": "<name>"`. Every field here is a per-field default -- whatever the
