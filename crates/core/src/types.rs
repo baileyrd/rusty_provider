@@ -259,6 +259,57 @@ pub struct ChatRequest {
     /// is surfaced back in `ChatMessage.reasoning`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
+    /// Restricts sampling to the `top_k` highest-probability tokens.
+    /// Native to Anthropic and Gemini; not part of OpenAI's own API but
+    /// common on OpenAI-compatible inference servers (Groq, Together,
+    /// Fireworks, vLLM, etc.), so the OpenAI-compatible adapter passes it
+    /// through unconditionally rather than guessing which backend
+    /// supports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Nucleus-style cutoff by minimum token probability (relative to the
+    /// most likely token), rather than `top_p`'s cumulative-probability
+    /// mass. Not supported by Anthropic or Gemini's native APIs -- silently
+    /// ignored there, same rationale as `cache_control` on a provider with
+    /// no cache-breakpoint API: a sampling hint, not a correctness
+    /// requirement, so the request still produces a valid response either
+    /// way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    /// Dynamic nucleus cutoff scaled by the top token's own probability
+    /// (used by some open-source inference servers). Not supported by
+    /// Anthropic or Gemini's native APIs -- silently ignored there, same
+    /// rationale as `min_p`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_a: Option<f32>,
+    /// Penalizes tokens by how often they've already appeared, per the
+    /// OpenAI convention. Native to OpenAI and Gemini; not supported by
+    /// Anthropic's API -- silently ignored there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// Penalizes tokens that have appeared at all, per the OpenAI
+    /// convention. Native to OpenAI and Gemini; not supported by
+    /// Anthropic's API -- silently ignored there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// A multiplicative variant of frequency/presence penalties common on
+    /// open-source inference servers. Not supported by Anthropic or
+    /// Gemini's native APIs -- silently ignored there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+    /// Per-token-ID logit bias, per the OpenAI convention (keys are
+    /// provider-specific token ID strings, so this only round-trips
+    /// meaningfully with the same tokenizer that produced the IDs).
+    /// Native to OpenAI; not supported by Anthropic or Gemini's native
+    /// APIs -- silently ignored there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    /// Best-effort determinism across repeated requests with identical
+    /// parameters, per the OpenAI convention (no provider guarantees
+    /// bit-exact reproducibility). Native to OpenAI and Gemini; not
+    /// supported by Anthropic's API -- silently ignored there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
 }
 
 /// Requests and tunes a model's reasoning/thinking trace. `effort` and

@@ -72,6 +72,8 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stop_sequences: Option<&'a [String]>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,6 +411,7 @@ impl<'a> WireRequest<'a> {
             system,
             temperature: req.temperature,
             top_p: req.top_p,
+            top_k: req.top_k,
             stop_sequences: req.stop.as_deref(),
             stream,
             tools,
@@ -883,6 +886,14 @@ mod tests {
             provider: None,
             response_format,
             reasoning: None,
+            top_k: None,
+            min_p: None,
+            top_a: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            logit_bias: None,
+            seed: None,
         }
     }
 
@@ -1335,6 +1346,14 @@ mod tests {
             provider: None,
             response_format: None,
             reasoning: None,
+            top_k: None,
+            min_p: None,
+            top_a: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            logit_bias: None,
+            seed: None,
         };
         let err = provider.chat(&req, "claude-sonnet-5").await.unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedContent(_)));

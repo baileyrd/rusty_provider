@@ -20,6 +20,14 @@ pub fn simple_request(model: &str) -> ChatRequest {
         provider: None,
         response_format: None,
         reasoning: None,
+        top_k: None,
+        min_p: None,
+        top_a: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        repetition_penalty: None,
+        logit_bias: None,
+        seed: None,
     }
 }
 
@@ -112,6 +120,25 @@ pub fn request_with_json_object(model: &str) -> ChatRequest {
 pub fn request_with_reasoning(model: &str, reasoning: ReasoningConfig) -> ChatRequest {
     let mut req = simple_request(model);
     req.reasoning = Some(reasoning);
+    req
+}
+
+/// Same as [`simple_request`], but with every sampling-parameter field
+/// set, for tests exercising per-provider passthrough/translation/silent-
+/// ignore behavior.
+pub fn request_with_sampling_params(model: &str) -> ChatRequest {
+    let mut req = simple_request(model);
+    req.top_k = Some(40);
+    req.min_p = Some(0.05);
+    req.top_a = Some(0.2);
+    req.frequency_penalty = Some(0.3);
+    req.presence_penalty = Some(0.4);
+    req.repetition_penalty = Some(1.1);
+    req.logit_bias = Some(std::collections::HashMap::from([(
+        "1234".to_string(),
+        -100.0,
+    )]));
+    req.seed = Some(42);
     req
 }
 

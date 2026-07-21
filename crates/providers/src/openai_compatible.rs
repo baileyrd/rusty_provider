@@ -68,6 +68,27 @@ struct WireRequest<'a> {
     /// passthrough from `reasoning.effort`.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    /// Not part of OpenAI's own API, but common on OpenAI-compatible
+    /// inference servers (Groq, Together, Fireworks, vLLM, etc.) -- passed
+    /// through unconditionally rather than guessing which backend
+    /// supports it, matching this adapter's "no translation needed"
+    /// approach elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_a: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repetition_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logit_bias: Option<&'a std::collections::HashMap<String, f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
 }
 
 impl<'a> WireRequest<'a> {
@@ -84,6 +105,14 @@ impl<'a> WireRequest<'a> {
             tool_choice: req.tool_choice.as_ref(),
             response_format: req.response_format.as_ref(),
             reasoning_effort: req.reasoning.as_ref().and_then(|r| r.effort.as_deref()),
+            top_k: req.top_k,
+            min_p: req.min_p,
+            top_a: req.top_a,
+            frequency_penalty: req.frequency_penalty,
+            presence_penalty: req.presence_penalty,
+            repetition_penalty: req.repetition_penalty,
+            logit_bias: req.logit_bias.as_ref(),
+            seed: req.seed,
         }
     }
 }
