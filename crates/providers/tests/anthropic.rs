@@ -33,7 +33,7 @@ async fn chat_success_sends_correct_headers_and_body() {
     let provider = AnthropicProvider::new(server.uri(), "test-key");
     let req = common::simple_request("claude-sonnet-5");
     let resp = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 
@@ -46,6 +46,35 @@ async fn chat_success_sends_correct_headers_and_body() {
     let usage = resp.usage.expect("usage should be present");
     assert_eq!(usage.prompt_tokens, 10);
     assert_eq!(usage.completion_tokens, 5);
+}
+
+#[tokio::test]
+async fn chat_uses_the_byok_override_key_instead_of_the_configured_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", "byok-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_abc",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello there"}],
+            "model": "claude-sonnet-5",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })))
+        .mount(&server)
+        .await;
+
+    // Constructed with "test-key" -- the mock only matches "byok-key", so a
+    // successful response here proves the override won, not the configured
+    // key wiremock would otherwise reject with a 404 (no matching mock).
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::simple_request("claude-sonnet-5");
+    provider
+        .chat(&req, "claude-sonnet-5", Some("byok-key"))
+        .await
+        .expect("chat should succeed with the byok override key");
 }
 
 #[tokio::test]
@@ -69,7 +98,7 @@ async fn chat_uses_default_max_tokens_when_request_leaves_it_unset() {
     // Anthropic requires max_tokens; the mock only matches if the adapter
     // filled in the documented default (4096) rather than omitting it.
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -95,7 +124,7 @@ async fn chat_parses_tool_use_block_and_maps_finish_reason() {
     let provider = AnthropicProvider::new(server.uri(), "test-key");
     let req = common::request_with_tool("claude-sonnet-5");
     let resp = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 
@@ -152,7 +181,7 @@ async fn chat_sends_json_schema_response_format_as_a_forced_tool_call() {
     let provider = AnthropicProvider::new(server.uri(), "test-key");
     let req = common::request_with_json_schema("claude-sonnet-5");
     let resp = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 
@@ -180,7 +209,10 @@ async fn chat_rejects_json_object_response_format_without_contacting_the_server(
     // UnsupportedFeature, proving the check happens before any request.
     let provider = AnthropicProvider::new("http://127.0.0.1:1", "test-key");
     let req = common::request_with_json_object("claude-sonnet-5");
-    let err = provider.chat(&req, "claude-sonnet-5").await.unwrap_err();
+    let err = provider
+        .chat(&req, "claude-sonnet-5", None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ProviderError::UnsupportedFeature(_)));
     assert!(err.is_retryable());
 }
@@ -231,7 +263,7 @@ async fn chat_maps_tool_call_request_into_tool_use_and_tool_result_blocks() {
     ];
 
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -260,7 +292,7 @@ async fn chat_sends_image_content_as_a_base64_image_block() {
     let provider = AnthropicProvider::new(server.uri(), "test-key");
     let req = common::request_with_image("claude-sonnet-5");
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -289,7 +321,7 @@ async fn chat_sends_inline_file_content_as_a_base64_document_block() {
     let provider = AnthropicProvider::new(server.uri(), "test-key");
     let req = common::request_with_file("claude-sonnet-5");
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -318,7 +350,7 @@ async fn chat_sends_remote_file_content_as_a_url_document_block() {
     let provider = AnthropicProvider::new(server.uri(), "test-key");
     let req = common::request_with_remote_file("claude-sonnet-5");
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -334,7 +366,7 @@ async fn chat_rejects_audio_content_without_contacting_the_server() {
     let req = common::request_with_audio("claude-sonnet-5");
 
     let err = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect_err("Anthropic has no audio-input support");
     assert!(matches!(err, ProviderError::UnsupportedContent(_)));
@@ -375,7 +407,7 @@ async fn chat_sends_tools_and_tool_choice_translated_to_wire_format() {
     req.tool_choice = Some(json!({"type": "function", "function": {"name": "get_weather"}}));
 
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -404,7 +436,7 @@ async fn chat_forwards_top_k_but_has_no_field_for_the_rest_of_the_sampling_param
     let req = common::request_with_sampling_params("claude-sonnet-5");
 
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -430,7 +462,7 @@ async fn chat_has_no_wire_field_for_logprobs_and_never_returns_any() {
     let req = common::request_with_logprobs("claude-sonnet-5");
 
     let resp = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
     assert!(resp.choices[0].logprobs.is_none());
@@ -457,7 +489,7 @@ async fn chat_stream_parses_text_deltas_and_final_usage() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -499,7 +531,7 @@ async fn chat_stream_parses_tool_call_deltas_by_index() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -563,7 +595,7 @@ async fn chat_stream_unwraps_a_forced_structured_output_tool_call_into_content_d
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -612,7 +644,7 @@ async fn chat_stream_filters_out_ping_and_content_block_stop_events() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -645,7 +677,7 @@ async fn chat_stream_filters_out_an_unrecognized_future_event_type() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -675,7 +707,7 @@ async fn chat_stream_maps_an_error_event_to_an_upstream_error() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut items = Vec::new();
@@ -713,7 +745,7 @@ async fn chat_stream_yields_a_decode_error_for_malformed_event_json() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut items = Vec::new();
@@ -743,7 +775,7 @@ async fn chat_stream_yields_no_chunks_for_an_empty_stream() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     assert!(stream.next().await.is_none());
@@ -765,7 +797,7 @@ async fn chat_maps_429_to_retryable_rate_limited() {
     let provider = AnthropicProvider::new(server.uri(), "test-key");
     let req = common::simple_request("claude-sonnet-5");
     let err = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect_err("should fail");
 
@@ -811,7 +843,7 @@ async fn chat_sends_extended_thinking_config_derived_from_effort() {
     );
     req.max_tokens = None;
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -847,7 +879,7 @@ async fn chat_clamps_thinking_budget_to_the_anthropic_minimum() {
     );
     req.max_tokens = None;
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -883,7 +915,7 @@ async fn chat_bumps_max_tokens_when_thinking_budget_would_exceed_it() {
     );
     req.max_tokens = Some(500);
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -914,7 +946,7 @@ async fn chat_parses_thinking_blocks_into_the_reasoning_field() {
         },
     );
     let resp = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 
@@ -956,7 +988,7 @@ async fn chat_omits_reasoning_when_the_client_asked_to_exclude_it() {
         },
     );
     let resp = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 
@@ -993,7 +1025,7 @@ async fn chat_stream_emits_thinking_delta_as_reasoning_deltas() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -1043,7 +1075,7 @@ async fn chat_stream_omits_reasoning_deltas_when_excluded() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -1084,7 +1116,7 @@ async fn chat_sends_system_as_a_cache_control_block_array_when_requested() {
     system.cache_control = Some(rp_core::CacheControl::Ephemeral);
     req.messages = vec![system, ChatMessage::user("hi")];
     provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 }
@@ -1110,7 +1142,7 @@ async fn chat_parses_cache_creation_and_cache_read_tokens_into_usage() {
     let provider = AnthropicProvider::new(server.uri(), "test-key");
     let req = common::simple_request("claude-sonnet-5");
     let resp = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 
@@ -1137,7 +1169,7 @@ async fn chat_leaves_cache_usage_fields_none_without_any_caching() {
     let provider = AnthropicProvider::new(server.uri(), "test-key");
     let req = common::simple_request("claude-sonnet-5");
     let resp = provider
-        .chat(&req, "claude-sonnet-5")
+        .chat(&req, "claude-sonnet-5", None)
         .await
         .expect("chat should succeed");
 
@@ -1167,7 +1199,7 @@ async fn chat_stream_reports_cache_tokens_from_message_start_in_the_final_usage(
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "claude-sonnet-5")
+        .chat_stream(&req, "claude-sonnet-5", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();

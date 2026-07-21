@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// The unified request/response schema follows the OpenAI chat completions
@@ -515,6 +517,17 @@ pub struct ProviderPreferences {
     /// provider kind supports all four natively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_parameters: Option<bool>,
+    /// "Bring your own key" -- a provider name (matching a configured
+    /// `[providers.X]` entry, e.g. `"openai"`) mapped to a caller-supplied
+    /// API key to use for *this request's* calls to that provider,
+    /// instead of the operator's own `api_key_env`-resolved key. The
+    /// operator must still have `[providers.X]` configured (its `kind`/
+    /// `base_url` are what the router needs to know how to call it) --
+    /// this swaps the credential only, not the endpoint. A provider name
+    /// with no entry here falls back to the operator's own key as usual.
+    /// Never logged, persisted, or echoed back in any response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byok: Option<HashMap<String, String>>,
 }
 
 impl ChatRequest {

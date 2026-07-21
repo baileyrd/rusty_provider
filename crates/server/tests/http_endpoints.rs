@@ -9,7 +9,7 @@ use rp_router::{Config, Router as ProviderRouter};
 use rp_server::build_app;
 use rp_server::state::AppState;
 use serde_json::{json, Value};
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Generates a unique per-test env var name so parallel tests never race on
@@ -624,6 +624,56 @@ async fn chat_completions_success_roundtrips_through_a_mocked_provider() {
     assert_eq!(generation["prompt_tokens"], 10);
     assert_eq!(generation["completion_tokens"], 5);
     assert_eq!(generation["total_tokens"], 15);
+}
+
+#[tokio::test]
+async fn chat_completions_uses_a_byok_key_from_the_request_instead_of_the_configured_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("Authorization", "Bearer byok-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello there"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(&server)
+        .await;
+
+    let key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&key_var, "operators-own-key");
+    let config = format!(
+        r#"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{key_var}"
+        "#,
+        server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+
+    // The mock only matches "byok-key", not "operators-own-key" -- a 200
+    // here proves the request's own key won, not the configured one.
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider": {"byok": {"openai": "byok-key"}}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]

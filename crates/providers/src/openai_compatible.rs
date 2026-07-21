@@ -232,12 +232,17 @@ impl Provider for OpenAiCompatibleProvider {
         &self.name
     }
 
-    async fn chat(&self, req: &ChatRequest, model: &str) -> Result<ChatResponse, ProviderError> {
+    async fn chat(
+        &self,
+        req: &ChatRequest,
+        model: &str,
+        api_key_override: Option<&str>,
+    ) -> Result<ChatResponse, ProviderError> {
         let body = WireRequest::from_core(req, model, false);
         let resp = self
             .client
             .post(self.endpoint())
-            .bearer_auth(&self.api_key)
+            .bearer_auth(api_key_override.unwrap_or(&self.api_key))
             .json(&body)
             .send()
             .await
@@ -294,12 +299,13 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         req: &ChatRequest,
         model: &str,
+        api_key_override: Option<&str>,
     ) -> Result<ChatStream, ProviderError> {
         let body = WireRequest::from_core(req, model, true);
         let resp = self
             .client
             .post(self.endpoint())
-            .bearer_auth(&self.api_key)
+            .bearer_auth(api_key_override.unwrap_or(&self.api_key))
             .json(&body)
             .send()
             .await

@@ -486,7 +486,12 @@ impl Provider for AnthropicProvider {
         "anthropic"
     }
 
-    async fn chat(&self, req: &ChatRequest, model: &str) -> Result<ChatResponse, ProviderError> {
+    async fn chat(
+        &self,
+        req: &ChatRequest,
+        model: &str,
+        api_key_override: Option<&str>,
+    ) -> Result<ChatResponse, ProviderError> {
         let body = WireRequest::from_core(req, model, false)?;
         let forced_output_tool_name = body.forced_output_tool_name.clone();
         let exclude_reasoning = body.exclude_reasoning;
@@ -494,7 +499,7 @@ impl Provider for AnthropicProvider {
         let resp = self
             .client
             .post(self.endpoint())
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", api_key_override.unwrap_or(&self.api_key))
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body)
             .send()
@@ -591,6 +596,7 @@ impl Provider for AnthropicProvider {
         &self,
         req: &ChatRequest,
         model: &str,
+        api_key_override: Option<&str>,
     ) -> Result<ChatStream, ProviderError> {
         let body = WireRequest::from_core(req, model, true)?;
         let is_forced_structured_output = body.forced_output_tool_name.is_some();
@@ -599,7 +605,7 @@ impl Provider for AnthropicProvider {
         let resp = self
             .client
             .post(self.endpoint())
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", api_key_override.unwrap_or(&self.api_key))
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body)
             .send()
@@ -1384,7 +1390,10 @@ mod tests {
             logprobs: None,
             top_logprobs: None,
         };
-        let err = provider.chat(&req, "claude-sonnet-5").await.unwrap_err();
+        let err = provider
+            .chat(&req, "claude-sonnet-5", None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedContent(_)));
     }
 }

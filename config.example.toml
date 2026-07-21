@@ -43,6 +43,11 @@ port = 8080
 # get 429'd/banned. When the bucket is empty, the router treats it exactly
 # like a retryable provider error and falls back to the next candidate in
 # the chain — it does not queue/wait.
+#
+# A request can bring its own key for a configured provider instead of using
+# this file's api_key_env, via `"provider": {"byok": {"openai": "sk-..."}}`
+# -- the provider still needs a [providers.X] entry here (for kind/base_url),
+# this only swaps the credential. See the README's "BYOK" section.
 
 [providers.openai]
 kind = "openai"
