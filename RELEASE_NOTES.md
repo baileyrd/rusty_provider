@@ -24,6 +24,27 @@ entries are tracked by PR rather than by release.
 
 ---
 
+## PR #84 — Add POST /v1/embeddings endpoint
+**2026-07-21** · [#84](https://github.com/baileyrd/rusty_provider/pull/84)
+
+- **Added:** `POST /v1/embeddings`, OpenAI-compatible request/response
+  shape. Implemented by the OpenAI-compatible adapter (direct
+  passthrough) and Gemini (via `batchEmbedContents`, used even for a
+  single input to avoid a second wire shape). `Router::embeddings`
+  reuses `dispatch`'s chain-resolution and retryable-error fallback.
+- **Known limitation:** Anthropic has no embeddings API at all, so it
+  always returns a retryable `UnsupportedFeature` error — a chain
+  naming it alongside a real embeddings provider falls through rather
+  than failing, but it can never itself serve an embeddings request.
+- **Known limitation:** none of `[[presets]]`, `[[guardrails]]`,
+  `[moderation]`, `[web_search]`, or spend budgets apply to this
+  endpoint yet — only auth and inbound rate-limiting, same as
+  `/v1/chat/completions`'s auth layer. Cost/latency/throughput
+  tracking also don't apply, since there's no established pricing
+  shape for a prompt-only, no-completion-tokens request yet.
+- 20 new/updated unit and integration tests across `rp-core`,
+  `rp-providers`, `rp-router`, and `rp-server`; full suite passing.
+
 ## PR #83 — Add standard governance/docs scaffold
 **2026-07-21** · [#83](https://github.com/baileyrd/rusty_provider/pull/83)
 
