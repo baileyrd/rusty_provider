@@ -109,6 +109,7 @@ pub struct ClientConfig {
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub routes: Vec<RouteAlias>,
@@ -180,11 +181,9 @@ mod tests {
     // --- providers -------------------------------------------------------------
 
     #[test]
-    fn missing_providers_key_is_a_parse_error() {
-        // `providers` has no #[serde(default)], unlike routes/pricing/clients --
-        // this documents that an empty table must be spelled out explicitly.
-        let err = Config::from_toml_str("").unwrap_err();
-        assert!(err.to_string().contains("providers"));
+    fn providers_defaults_to_empty_when_absent() {
+        let config = Config::from_toml_str("").unwrap();
+        assert!(config.providers.is_empty());
     }
 
     #[test]
@@ -286,7 +285,7 @@ mod tests {
 
     #[test]
     fn routes_pricing_and_clients_default_to_empty_when_absent() {
-        let config = Config::from_toml_str("providers = {}").unwrap();
+        let config = Config::from_toml_str("").unwrap();
         assert!(config.routes.is_empty());
         assert!(config.pricing.is_empty());
         assert!(config.clients.is_empty());
