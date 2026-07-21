@@ -431,3 +431,60 @@ async fn chat_completions_enforces_per_client_inbound_rate_limit() {
         .unwrap()
         .contains("rate limit"));
 }
+
+#[tokio::test]
+async fn chat_completions_enforces_default_ip_rate_limit_when_no_client_matches() {
+    let config = r#"
+        providers = {}
+
+        [server]
+        default_rate_limit_rpm = 1
+        "#;
+    let base_url = spawn_app(config).await;
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": "openai/gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    // No bearer token, no matching client -- falls back to the source-IP
+    // bucket (both requests come from 127.0.0.1, so they share one bucket).
+    let first = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(first.status(), 429);
+
+    let second = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 429);
+    assert!(second.headers().get("retry-after").is_some());
+}
+
+#[tokio::test]
+async fn chat_completions_has_no_rate_limit_when_unmatched_and_no_default_configured() {
+    // No clients configured and no default_rate_limit_rpm -- an unmatched
+    // caller has no cap at all, so repeated requests never see a 429.
+    let base_url = spawn_app("providers = {}").await;
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": "openai/gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    for _ in 0..5 {
+        let resp = client
+            .post(format!("{base_url}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), 429);
+    }
+}

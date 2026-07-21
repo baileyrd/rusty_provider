@@ -80,6 +80,154 @@ fn rate_limited_response(state: &AppState, identity: &str, retry_after_secs: f64
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use axum::http::HeaderValue;
+    use rp_core::RateLimiter;
+    use rp_router::{Config, Router};
+
+    fn test_state(
+        client_keys: Vec<(&str, &str, u32)>,
+        default_rate_limit_rpm: Option<u32>,
+    ) -> AppState {
+        let router = Arc::new(Router::from_config(
+            &Config::from_toml_str("providers = {}").unwrap(),
+        ));
+        let client_keys = client_keys
+            .into_iter()
+            .map(|(key, name, rpm)| (key.to_string(), (name.to_string(), rpm)))
+            .collect::<HashMap<_, _>>();
+        AppState {
+            router,
+            api_key: None,
+            client_keys: Arc::new(client_keys),
+            default_rate_limit_rpm,
+            rate_limiter: Arc::new(RateLimiter::new()),
+        }
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    fn addr() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 54321))
+    }
+
+    // --- resolve_rate_limit ----------------------------------------------------
+
+    #[test]
+    fn resolve_rate_limit_is_none_with_no_client_match_and_no_default() {
+        let state = test_state(vec![], None);
+        let result = resolve_rate_limit(&state, &HeaderMap::new(), addr());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_rate_limit_falls_back_to_ip_bucket_when_default_is_configured() {
+        let state = test_state(vec![], Some(60));
+        let result = resolve_rate_limit(&state, &HeaderMap::new(), addr());
+        assert_eq!(result, Some(("ip:127.0.0.1".to_string(), 60)));
+    }
+
+    #[test]
+    fn resolve_rate_limit_uses_client_bucket_when_bearer_token_matches() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None);
+        let result = resolve_rate_limit(&state, &bearer_headers("secret-key"), addr());
+        assert_eq!(result, Some(("client:acme".to_string(), 30)));
+    }
+
+    #[test]
+    fn resolve_rate_limit_prefers_client_bucket_over_ip_fallback() {
+        let state = test_state(vec![("secret-key", "acme", 30)], Some(60));
+        let result = resolve_rate_limit(&state, &bearer_headers("secret-key"), addr());
+        assert_eq!(
+            result,
+            Some(("client:acme".to_string(), 30)),
+            "a matched client key must win over the IP-bucket default"
+        );
+    }
+
+    #[test]
+    fn resolve_rate_limit_falls_back_to_ip_when_bearer_present_but_unmatched() {
+        let state = test_state(vec![("secret-key", "acme", 30)], Some(60));
+        let result = resolve_rate_limit(&state, &bearer_headers("wrong-key"), addr());
+        assert_eq!(result, Some(("ip:127.0.0.1".to_string(), 60)));
+    }
+
+    #[test]
+    fn resolve_rate_limit_is_none_when_bearer_unmatched_and_no_default() {
+        let state = test_state(vec![("secret-key", "acme", 30)], None);
+        let result = resolve_rate_limit(&state, &bearer_headers("wrong-key"), addr());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_rate_limit_ip_bucket_key_reflects_the_caller_address() {
+        let state = test_state(vec![], Some(60));
+        let other_addr = SocketAddr::from(([10, 0, 0, 5], 8080));
+        let result = resolve_rate_limit(&state, &HeaderMap::new(), other_addr);
+        assert_eq!(result, Some(("ip:10.0.0.5".to_string(), 60)));
+    }
+
+    // --- rate_limited_response ---------------------------------------------------
+
+    #[test]
+    fn rate_limited_response_returns_429_with_a_rounded_up_retry_after_header() {
+        let state = test_state(vec![], None);
+        let resp = rate_limited_response(&state, "ip:127.0.0.1", 0.2);
+        assert_eq!(resp.status(), 429);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap(),
+            &HeaderValue::from_static("1"),
+            "0.2s should round up to a minimum of 1s"
+        );
+    }
+
+    #[test]
+    fn rate_limited_response_retry_after_ceils_fractional_seconds() {
+        let state = test_state(vec![], None);
+        let resp = rate_limited_response(&state, "ip:127.0.0.1", 4.1);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap(),
+            &HeaderValue::from_static("5")
+        );
+    }
+
+    #[test]
+    fn rate_limited_response_records_the_rejection_under_the_given_identity() {
+        let state = test_state(vec![], None);
+        rate_limited_response(&state, "client:acme", 1.0);
+        let metrics = state.router.render_prometheus_metrics();
+        assert!(metrics.contains("rusty_provider_inbound_rate_limit_rejections_total"));
+        assert!(metrics.contains(r#"identity="client:acme""#));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_response_body_reports_the_rounded_retry_after_in_the_message() {
+        let state = test_state(vec![], None);
+        let resp = rate_limited_response(&state, "ip:127.0.0.1", 4.1);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], 429);
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("retry after 5s"));
+    }
+}
+
 pub async fn health() -> &'static str {
     "ok"
 }
