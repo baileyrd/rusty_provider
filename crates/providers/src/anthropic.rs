@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
-    ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, ContentPart, FunctionCallDelta, MessageContent, Provider, ProviderError,
+    CacheControl, ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream,
+    Choice, ChunkChoice, ContentPart, FunctionCallDelta, MessageContent, Provider, ProviderError,
     ReasoningConfig, ResponseFormat, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
@@ -66,7 +66,7 @@ struct WireRequest<'a> {
     max_tokens: u32,
     messages: Vec<WireMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,11 +95,31 @@ struct WireRequest<'a> {
     exclude_reasoning: bool,
 }
 
-/// Split messages into Anthropic's shape: a single top-level `system`
-/// string (concatenated from any `Role::System` messages) plus a list of
-/// user/assistant turns, each with content as typed blocks — text,
-/// `tool_use` (an assistant message's `tool_calls`), or `tool_result` (a
-/// `Role::Tool` message answering one).
+/// Stamps a `cache_control` breakpoint (Anthropic's `{"type":"ephemeral"}`
+/// block, serialized straight from `CacheControl` with no translation)
+/// onto the last block in `blocks`, if `cache_control` is set. Anthropic
+/// treats a breakpoint as covering everything up to and including the
+/// block it's on, so the last block is always the right place for one
+/// message's marker.
+fn apply_cache_control(blocks: &mut [Value], cache_control: Option<&CacheControl>) {
+    let Some(cache_control) = cache_control else {
+        return;
+    };
+    if let Some(Value::Object(last)) = blocks.last_mut() {
+        last.insert(
+            "cache_control".to_string(),
+            serde_json::to_value(cache_control).unwrap_or(Value::Null),
+        );
+    }
+}
+
+/// Split messages into Anthropic's shape: a top-level `system` (a plain
+/// string when no system message requests caching, matching prior
+/// behavior exactly; an array of blocks, one per `Role::System` message,
+/// when at least one does -- only the block form can carry
+/// `cache_control`) plus a list of user/assistant turns, each with content
+/// as typed blocks — text, `tool_use` (an assistant message's
+/// `tool_calls`), or `tool_result` (a `Role::Tool` message answering one).
 ///
 /// Errs with `ProviderError::UnsupportedContent` if any user message
 /// contains audio -- Anthropic's Messages API has no audio-input support,
@@ -107,32 +127,37 @@ struct WireRequest<'a> {
 /// that might support it instead of silently dropping it.
 fn build_messages(
     messages: &[ChatMessage],
-) -> Result<(Option<String>, Vec<WireMessage>), ProviderError> {
-    let mut system_parts = Vec::new();
+) -> Result<(Option<Value>, Vec<WireMessage>), ProviderError> {
+    let mut system_blocks: Vec<Value> = Vec::new();
     let mut turns = Vec::new();
 
     for m in messages {
         match m.role {
             Role::System => {
                 if let Some(c) = &m.content {
-                    system_parts.push(c.as_plain_text());
+                    let mut block = json!({"type": "text", "text": c.as_plain_text()});
+                    apply_cache_control(std::slice::from_mut(&mut block), m.cache_control.as_ref());
+                    system_blocks.push(block);
                 }
             }
             Role::Tool => {
+                let mut content = vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "content": m.content.as_ref().map(MessageContent::as_plain_text).unwrap_or_default(),
+                })];
+                apply_cache_control(&mut content, m.cache_control.as_ref());
                 turns.push(WireMessage {
                     role: "user",
-                    content: vec![json!({
-                        "type": "tool_result",
-                        "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
-                        "content": m.content.as_ref().map(MessageContent::as_plain_text).unwrap_or_default(),
-                    })],
+                    content,
                 });
             }
             Role::User => {
-                let content = match &m.content {
+                let mut content = match &m.content {
                     Some(content) => content_to_blocks(content)?,
                     None => vec![json!({"type": "text", "text": ""})],
                 };
+                apply_cache_control(&mut content, m.cache_control.as_ref());
                 turns.push(WireMessage {
                     role: "user",
                     content,
@@ -159,6 +184,7 @@ fn build_messages(
                 if blocks.is_empty() {
                     blocks.push(json!({"type": "text", "text": ""}));
                 }
+                apply_cache_control(&mut blocks, m.cache_control.as_ref());
                 turns.push(WireMessage {
                     role: "assistant",
                     content: blocks,
@@ -167,10 +193,22 @@ fn build_messages(
         }
     }
 
-    let system = if system_parts.is_empty() {
+    let system = if system_blocks.is_empty() {
         None
+    } else if system_blocks
+        .iter()
+        .all(|b| b.get("cache_control").is_none())
+    {
+        // No caching requested anywhere in system -- keep the plain-string
+        // shape every existing caller/test already expects.
+        let text = system_blocks
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Some(Value::String(text))
     } else {
-        Some(system_parts.join("\n\n"))
+        Some(Value::Array(system_blocks))
     };
     Ok((system, turns))
 }
@@ -289,6 +327,25 @@ fn thinking_config(reasoning: &ReasoningConfig, req_max_tokens: Option<u32>) -> 
     json!({"type": "enabled", "budget_tokens": budget})
 }
 
+/// Builds a `Usage` from Anthropic's wire usage object, folding
+/// `input_tokens` (non-cached) and the two cache counters into a single
+/// cache-inclusive `prompt_tokens` total, matching how OpenAI/Gemini
+/// already report it -- so cost accounting and clients can treat
+/// `prompt_tokens` uniformly across providers regardless of whether any of
+/// it came from a cache.
+fn usage_from_wire(wire: &WireUsage) -> Usage {
+    let cached = wire.cache_read_input_tokens;
+    let cache_creation = wire.cache_creation_input_tokens;
+    let prompt_tokens = wire.input_tokens + cached + cache_creation;
+    Usage {
+        prompt_tokens,
+        completion_tokens: wire.output_tokens,
+        total_tokens: prompt_tokens + wire.output_tokens,
+        cached_tokens: (cached > 0).then_some(cached),
+        cache_creation_tokens: (cache_creation > 0).then_some(cache_creation),
+    }
+}
+
 fn map_stop_reason(reason: &str) -> &'static str {
     match reason {
         "end_turn" | "stop_sequence" => "stop",
@@ -384,9 +441,16 @@ struct WireContentBlock {
 
 #[derive(Deserialize)]
 struct WireUsage {
+    /// Non-cached input tokens only -- `prompt_tokens` in our `Usage` adds
+    /// this to the two cache fields below to get the true total, matching
+    /// how OpenAI/Gemini already report a cache-inclusive total.
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -493,14 +557,11 @@ impl Provider for AnthropicProvider {
                     },
                     tool_call_id: None,
                     reasoning,
+                    cache_control: None,
                 },
                 finish_reason,
             }],
-            usage: Some(Usage {
-                prompt_tokens: wire.usage.input_tokens,
-                completion_tokens: wire.usage.output_tokens,
-                total_tokens: wire.usage.input_tokens + wire.usage.output_tokens,
-            }),
+            usage: Some(usage_from_wire(&wire.usage)),
             cost_usd: None,
         })
     }
@@ -530,6 +591,8 @@ impl Provider for AnthropicProvider {
 
         let full_model = format!("anthropic/{model}");
         let mut input_tokens: u32 = 0;
+        let mut cache_creation_tokens: u32 = 0;
+        let mut cached_tokens: u32 = 0;
 
         let stream = resp.bytes_stream().eventsource().filter_map(move |ev| {
             let full_model = full_model.clone();
@@ -549,6 +612,14 @@ impl Provider for AnthropicProvider {
                     "message_start" => {
                         input_tokens = value
                             .pointer("/message/usage/input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as u32;
+                        cache_creation_tokens = value
+                            .pointer("/message/usage/cache_creation_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as u32;
+                        cached_tokens = value
+                            .pointer("/message/usage/cache_read_input_tokens")
                             .and_then(Value::as_u64)
                             .unwrap_or(0) as u32;
                         Some(Ok(empty_chunk(
@@ -694,10 +765,14 @@ impl Provider for AnthropicProvider {
                             .unwrap_or(0) as u32;
                         let mut chunk =
                             empty_chunk(&full_model, ChatMessageDelta::default(), stop_reason);
+                        let prompt_tokens = input_tokens + cache_creation_tokens + cached_tokens;
                         chunk.usage = Some(Usage {
-                            prompt_tokens: input_tokens,
+                            prompt_tokens,
                             completion_tokens: output_tokens,
-                            total_tokens: input_tokens + output_tokens,
+                            total_tokens: prompt_tokens + output_tokens,
+                            cached_tokens: (cached_tokens > 0).then_some(cached_tokens),
+                            cache_creation_tokens: (cache_creation_tokens > 0)
+                                .then_some(cache_creation_tokens),
                         });
                         Some(Ok(chunk))
                     }
@@ -943,6 +1018,37 @@ mod tests {
         assert_eq!(map_stop_reason("unknown_future_reason"), "stop");
     }
 
+    // --- usage_from_wire --------------------------------------------------------
+
+    #[test]
+    fn usage_from_wire_folds_cache_counters_into_a_cache_inclusive_prompt_total() {
+        let wire = WireUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 20,
+            cache_read_input_tokens: 30,
+        };
+        let usage = usage_from_wire(&wire);
+        assert_eq!(usage.prompt_tokens, 150);
+        assert_eq!(usage.total_tokens, 200);
+        assert_eq!(usage.cached_tokens, Some(30));
+        assert_eq!(usage.cache_creation_tokens, Some(20));
+    }
+
+    #[test]
+    fn usage_from_wire_leaves_cache_fields_none_when_nothing_was_cached() {
+        let wire = WireUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let usage = usage_from_wire(&wire);
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.cached_tokens, None);
+        assert_eq!(usage.cache_creation_tokens, None);
+    }
+
     // --- parse_data_uri --------------------------------------------------------
 
     #[test]
@@ -984,6 +1090,87 @@ mod tests {
                 "type": "image",
                 "source": {"type": "url", "url": "https://example.com/a.png"},
             })
+        );
+    }
+
+    // --- apply_cache_control -----------------------------------------------------
+
+    #[test]
+    fn apply_cache_control_is_a_no_op_when_unset() {
+        let mut blocks = vec![json!({"type": "text", "text": "hi"})];
+        apply_cache_control(&mut blocks, None);
+        assert_eq!(blocks, vec![json!({"type": "text", "text": "hi"})]);
+    }
+
+    #[test]
+    fn apply_cache_control_stamps_only_the_last_block() {
+        let mut blocks = vec![
+            json!({"type": "text", "text": "first"}),
+            json!({"type": "text", "text": "second"}),
+        ];
+        apply_cache_control(&mut blocks, Some(&CacheControl::Ephemeral));
+        assert_eq!(blocks[0].get("cache_control"), None);
+        assert_eq!(blocks[1]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn apply_cache_control_on_an_empty_slice_does_nothing() {
+        let mut blocks: Vec<Value> = vec![];
+        apply_cache_control(&mut blocks, Some(&CacheControl::Ephemeral));
+        assert!(blocks.is_empty());
+    }
+
+    // --- build_messages: cache_control -------------------------------------------
+
+    #[test]
+    fn build_messages_leaves_system_as_a_plain_string_without_cache_control() {
+        let messages = vec![ChatMessage::system("be concise"), ChatMessage::user("hi")];
+        let (system, _) = build_messages(&messages).unwrap();
+        assert_eq!(system, Some(json!("be concise")));
+    }
+
+    #[test]
+    fn build_messages_turns_system_into_a_block_array_with_cache_control_when_requested() {
+        let mut system_msg = ChatMessage::system("be concise");
+        system_msg.cache_control = Some(CacheControl::Ephemeral);
+        let messages = vec![system_msg, ChatMessage::user("hi")];
+        let (system, _) = build_messages(&messages).unwrap();
+        assert_eq!(
+            system,
+            Some(json!([{
+                "type": "text",
+                "text": "be concise",
+                "cache_control": {"type": "ephemeral"},
+            }]))
+        );
+    }
+
+    #[test]
+    fn build_messages_stamps_cache_control_on_a_user_turns_last_block() {
+        let mut user_msg = ChatMessage::user("hi");
+        user_msg.cache_control = Some(CacheControl::Ephemeral);
+        let (_, turns) = build_messages(&[user_msg]).unwrap();
+        assert_eq!(
+            turns[0].content,
+            vec![json!({"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}})]
+        );
+    }
+
+    #[test]
+    fn build_messages_stamps_cache_control_on_a_tool_result_block() {
+        let tool_msg = ChatMessage {
+            role: Role::Tool,
+            content: Some(MessageContent::text("42")),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            reasoning: None,
+            cache_control: Some(CacheControl::Ephemeral),
+        };
+        let (_, turns) = build_messages(&[tool_msg]).unwrap();
+        assert_eq!(
+            turns[0].content[0]["cache_control"],
+            json!({"type": "ephemeral"})
         );
     }
 
@@ -1051,6 +1238,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
+            cache_control: None,
         }];
         let (_, turns) = build_messages(&messages).unwrap();
         assert_eq!(turns.len(), 1);
@@ -1075,11 +1263,12 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning: None,
+                cache_control: None,
             },
             ChatMessage::assistant("ok"),
         ];
         let (system, turns) = build_messages(&messages).unwrap();
-        assert_eq!(system, Some("be concise".to_string()));
+        assert_eq!(system, Some(json!("be concise")));
         assert_eq!(
             turns[0].content,
             vec![json!({"type": "text", "text": "ok"})]
@@ -1102,6 +1291,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
+            cache_control: None,
         }];
         let err = build_messages(&messages).unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedContent(_)));
@@ -1132,6 +1322,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning: None,
+                cache_control: None,
             }],
             temperature: None,
             top_p: None,

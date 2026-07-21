@@ -99,11 +99,22 @@ chain = [
 # live pricing feed, so keep these numbers current yourself. Entries with no
 # pricing row sort last. Figures below are illustrative, not guaranteed
 # current — check each provider's own pricing page.
+#
+# `cache_read_per_million`/`cache_write_per_million` are optional, for
+# requests that use prompt caching (see the README's "Prompt caching"
+# section) -- they price the portion of `prompt_tokens` served from, or
+# newly written to, a cache. Both default to `prompt_per_million` (no
+# assumed discount/premium) when left unset.
 
 [[pricing]]
 model = "anthropic/claude-sonnet-5"
 prompt_per_million = 3.0
 completion_per_million = 15.0
+# A cache read costs a tenth of a fresh prompt token; a cache write (5-minute
+# TTL) costs 25% more than one -- check Anthropic's own pricing page for
+# current figures before relying on these.
+cache_read_per_million = 0.3
+cache_write_per_million = 3.75
 
 [[pricing]]
 model = "openai/gpt-4o"

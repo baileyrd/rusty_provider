@@ -632,6 +632,8 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+                cached_tokens: None,
+                cache_creation_tokens: None,
             },
             Some(0.5),
         );
@@ -654,6 +656,8 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            cached_tokens: None,
+            cache_creation_tokens: None,
         };
         persistence.record("anthropic/m1", &usage, Some(0.1));
         persistence.record("anthropic/m1", &usage, Some(0.1));
@@ -678,6 +682,8 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                cached_tokens: None,
+                cache_creation_tokens: None,
             },
             None,
         );
@@ -695,6 +701,8 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            cached_tokens: None,
+            cache_creation_tokens: None,
         };
 
         persistence.record("anthropic/m1", &usage, Some(1.0));
@@ -722,6 +730,8 @@ mod tests {
                     prompt_tokens: 42,
                     completion_tokens: 7,
                     total_tokens: 49,
+                    cached_tokens: None,
+                    cache_creation_tokens: None,
                 },
                 Some(0.9),
             );
@@ -744,6 +754,8 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 5,
                 total_tokens: 10,
+                cached_tokens: None,
+                cache_creation_tokens: None,
             },
             Some(0.3),
         );
@@ -924,6 +936,8 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                cached_tokens: None,
+                cache_creation_tokens: None,
             },
             Some(0.25),
         );
@@ -950,6 +964,8 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            cached_tokens: None,
+            cache_creation_tokens: None,
         };
         persistence.record(&key, &usage, Some(0.1));
         persistence.record(&key, &usage, Some(0.1));
@@ -989,6 +1005,8 @@ mod tests {
                 prompt_tokens: 7,
                 completion_tokens: 3,
                 total_tokens: 10,
+                cached_tokens: None,
+                cache_creation_tokens: None,
             },
             Some(0.4),
         );
@@ -1071,6 +1089,8 @@ mod tests {
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 total_tokens: 5,
+                cached_tokens: None,
+                cache_creation_tokens: None,
             },
             Some(0.05),
         );

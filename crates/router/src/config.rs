@@ -101,6 +101,21 @@ pub struct PricingEntry {
     pub prompt_per_million: f64,
     #[serde(default)]
     pub completion_per_million: f64,
+    /// Price for prompt tokens served from a cache (Anthropic's
+    /// `cache_read_input_tokens`, OpenAI's `prompt_tokens_details.cached_tokens`,
+    /// Gemini's `cachedContentTokenCount`) — typically a steep discount off
+    /// `prompt_per_million`. Defaults to `prompt_per_million` (i.e. no
+    /// assumed discount) when unset, so leaving it out never *under*counts
+    /// cost relative to not tracking caching at all.
+    #[serde(default)]
+    pub cache_read_per_million: Option<f64>,
+    /// Price for prompt tokens newly written into a cache (Anthropic's
+    /// `cache_creation_input_tokens` only — OpenAI/Gemini bill a cache
+    /// write the same as a normal prompt token, no separate rate needed).
+    /// Defaults to `prompt_per_million` when unset, same rationale as
+    /// `cache_read_per_million`.
+    #[serde(default)]
+    pub cache_write_per_million: Option<f64>,
 }
 
 /// A named inbound caller, identified by its own API key, with its own
@@ -443,6 +458,42 @@ mod tests {
     }
 
     #[test]
+    fn pricing_entry_cache_rates_default_to_unset() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[pricing]]
+            model = "anthropic/claude-sonnet-5"
+            prompt_per_million = 3.0
+            completion_per_million = 15.0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.pricing[0].cache_read_per_million, None);
+        assert_eq!(config.pricing[0].cache_write_per_million, None);
+    }
+
+    #[test]
+    fn pricing_entry_cache_rates_are_honored_when_set() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[pricing]]
+            model = "anthropic/claude-sonnet-5"
+            prompt_per_million = 3.0
+            completion_per_million = 15.0
+            cache_read_per_million = 0.3
+            cache_write_per_million = 3.75
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.pricing[0].cache_read_per_million, Some(0.3));
+        assert_eq!(config.pricing[0].cache_write_per_million, Some(3.75));
+    }
+
+    #[test]
     fn client_config_requires_every_field() {
         let config = Config::from_toml_str(
             r#"
@@ -715,6 +766,13 @@ mod tests {
             .pricing
             .iter()
             .any(|p| p.model == "anthropic/claude-sonnet-5" && p.prompt_per_million == 3.0));
+        let anthropic_pricing = config
+            .pricing
+            .iter()
+            .find(|p| p.model == "anthropic/claude-sonnet-5")
+            .unwrap();
+        assert_eq!(anthropic_pricing.cache_read_per_million, Some(0.3));
+        assert_eq!(anthropic_pricing.cache_write_per_million, Some(3.75));
 
         // Every [[clients]] entry in the example is commented out.
         assert!(config.clients.is_empty());

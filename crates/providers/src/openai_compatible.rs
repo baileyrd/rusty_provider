@@ -88,19 +88,39 @@ impl<'a> WireRequest<'a> {
     }
 }
 
+/// The `prompt_tokens_details.cached_tokens` convention OpenAI (and most
+/// OpenAI-compatible backends) report automatic prompt-cache hits under.
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
 #[derive(Deserialize)]
 struct WireUsage {
+    /// Already inclusive of any cached tokens -- `prompt_tokens_details`
+    /// below is a breakdown of this total, not additive on top of it.
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 impl From<WireUsage> for Usage {
     fn from(u: WireUsage) -> Self {
+        let cached_tokens = u
+            .prompt_tokens_details
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
         Usage {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
+            cached_tokens: (cached_tokens > 0).then_some(cached_tokens),
+            // OpenAI-compatible caching is fully automatic -- no separate
+            // cache-write cost/accounting to surface here.
+            cache_creation_tokens: None,
         }
     }
 }
@@ -216,6 +236,7 @@ impl Provider for OpenAiCompatibleProvider {
                         } else {
                             c.message.reasoning_content
                         },
+                        cache_control: None,
                     },
                     finish_reason: c.finish_reason,
                 })

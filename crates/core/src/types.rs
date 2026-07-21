@@ -34,6 +34,14 @@ pub struct ChatMessage {
     /// human-readable trace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Marks this message as the end of a cacheable prefix, à la
+    /// Anthropic's `cache_control` breakpoints. Only meaningful to
+    /// providers with an explicit cache-breakpoint API (Anthropic); others
+    /// (OpenAI-compatible, Gemini) cache automatically with no request-side
+    /// marker, so this is silently a no-op there rather than an error --
+    /// it's a hint/optimization, not a correctness requirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 impl ChatMessage {
@@ -45,6 +53,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
+            cache_control: None,
         }
     }
 
@@ -56,6 +65,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
+            cache_control: None,
         }
     }
 
@@ -67,8 +77,18 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
+            cache_control: None,
         }
     }
+}
+
+/// A cache breakpoint hint on a message, matching Anthropic's
+/// `cache_control` block shape directly (`{"type": "ephemeral"}`) so
+/// Anthropic's adapter can pass it through with no translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CacheControl {
+    Ephemeral,
 }
 
 /// A chat message's `content`, matching the OpenAI wire shape where it may
@@ -331,9 +351,25 @@ impl ChatRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
+    /// Total input tokens, including any served from or written to a
+    /// cache -- `cached_tokens` and `cache_creation_tokens` below are a
+    /// breakdown of this total, not additive on top of it.
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// The portion of `prompt_tokens` served from a cache instead of
+    /// freshly processed, if the provider reports this breakdown. `None`
+    /// when the provider exposes no cache accounting (or nothing was
+    /// cached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// The portion of `prompt_tokens` newly written into a cache by this
+    /// request, billed at a premium over a normal prompt token on
+    /// providers that separately account for it (Anthropic). `None` on
+    /// providers with no separate cache-write cost (OpenAI-compatible,
+    /// Gemini bill a cache write the same as a normal prompt token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,10 +549,65 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
+            cache_control: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let round_tripped: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(round_tripped.content, msg.content);
+    }
+
+    // --- CacheControl ---------------------------------------------------------
+
+    #[test]
+    fn cache_control_ephemeral_serializes_matching_anthropics_wire_shape() {
+        let json = serde_json::to_value(CacheControl::Ephemeral).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn chat_message_cache_control_round_trips_through_json() {
+        let mut msg = ChatMessage::user("hi");
+        msg.cache_control = Some(CacheControl::Ephemeral);
+        let json = serde_json::to_string(&msg).unwrap();
+        let round_tripped: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.cache_control, Some(CacheControl::Ephemeral));
+    }
+
+    #[test]
+    fn chat_message_cache_control_is_absent_from_json_when_unset() {
+        let msg = ChatMessage::user("hi");
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json.get("cache_control").is_none());
+    }
+
+    // --- Usage: cache-token fields ---------------------------------------------
+
+    #[test]
+    fn usage_cache_fields_are_absent_from_json_when_unset() {
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert!(json.get("cached_tokens").is_none());
+        assert!(json.get("cache_creation_tokens").is_none());
+    }
+
+    #[test]
+    fn usage_cache_fields_serialize_when_set() {
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cached_tokens: Some(8),
+            cache_creation_tokens: Some(2),
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["cached_tokens"], 8);
+        assert_eq!(json["cache_creation_tokens"], 2);
     }
 
     // --- MessageContent helpers ---------------------------------------------

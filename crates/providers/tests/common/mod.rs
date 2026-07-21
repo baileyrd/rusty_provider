@@ -45,6 +45,7 @@ pub fn request_with_image(model: &str) -> ChatRequest {
         tool_calls: None,
         tool_call_id: None,
         reasoning: None,
+        cache_control: None,
     }];
     req
 }
@@ -71,6 +72,7 @@ pub fn request_with_audio(model: &str) -> ChatRequest {
         tool_calls: None,
         tool_call_id: None,
         reasoning: None,
+        cache_control: None,
     }];
     req
 }
