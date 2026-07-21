@@ -26,7 +26,7 @@ async fn chat_success_sends_api_key_as_query_param() {
     let provider = GeminiProvider::new(server.uri(), "test-key");
     let req = common::simple_request("gemini-2.0-flash");
     let resp = provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 
@@ -39,6 +39,33 @@ async fn chat_success_sends_api_key_as_query_param() {
     let usage = resp.usage.expect("usage should be present");
     assert_eq!(usage.prompt_tokens, 10);
     assert_eq!(usage.completion_tokens, 5);
+}
+
+#[tokio::test]
+async fn chat_uses_the_byok_override_key_instead_of_the_configured_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .and(query_param("key", "byok-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hello there"}], "role": "model"},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
+        })))
+        .mount(&server)
+        .await;
+
+    // Constructed with "test-key" -- the mock only matches "byok-key", so a
+    // successful response here proves the override won, not the configured
+    // key wiremock would otherwise reject with a 404 (no matching mock).
+    let provider = GeminiProvider::new(server.uri(), "test-key");
+    let req = common::simple_request("gemini-2.0-flash");
+    provider
+        .chat(&req, "gemini-2.0-flash", Some("byok-key"))
+        .await
+        .expect("chat should succeed with the byok override key");
 }
 
 #[tokio::test]
@@ -64,7 +91,7 @@ async fn chat_parses_function_call_and_overrides_finish_reason() {
     let provider = GeminiProvider::new(server.uri(), "test-key");
     let req = common::request_with_tool("gemini-2.0-flash");
     let resp = provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 
@@ -116,7 +143,7 @@ async fn chat_sends_tools_and_tool_choice_translated_to_function_declarations() 
     req.tool_choice = Some(json!({"type": "function", "function": {"name": "get_weather"}}));
 
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -153,7 +180,7 @@ async fn chat_sends_json_schema_response_format_as_response_schema() {
     let req = common::request_with_json_schema("gemini-2.0-flash");
 
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -180,7 +207,7 @@ async fn chat_sends_json_object_response_format_with_no_schema() {
     let req = common::request_with_json_object("gemini-2.0-flash");
 
     let resp = provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
     assert_eq!(
@@ -222,7 +249,7 @@ async fn chat_forwards_its_native_sampling_params_camel_cased_but_has_no_field_f
     let req = common::request_with_sampling_params("gemini-2.0-flash");
 
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -250,7 +277,7 @@ async fn chat_has_no_wire_field_for_logprobs_and_never_returns_any() {
     let req = common::request_with_logprobs("gemini-2.0-flash");
 
     let resp = provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
     assert!(resp.choices[0].logprobs.is_none());
@@ -277,7 +304,7 @@ async fn chat_stream_parses_function_call_delta() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gemini-2.0-flash")
+        .chat_stream(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -358,7 +385,7 @@ async fn chat_tracks_call_id_to_function_name_across_turns_for_tool_result() {
     ];
 
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -386,7 +413,7 @@ async fn chat_sends_image_content_as_inline_data() {
     let provider = GeminiProvider::new(server.uri(), "test-key");
     let req = common::request_with_image("gemini-2.0-flash");
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -414,7 +441,7 @@ async fn chat_sends_audio_content_as_inline_data() {
     let provider = GeminiProvider::new(server.uri(), "test-key");
     let req = common::request_with_audio("gemini-2.0-flash");
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -442,7 +469,7 @@ async fn chat_sends_inline_file_content_as_inline_data() {
     let provider = GeminiProvider::new(server.uri(), "test-key");
     let req = common::request_with_file("gemini-2.0-flash");
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -470,7 +497,7 @@ async fn chat_sends_remote_file_content_as_file_data() {
     let provider = GeminiProvider::new(server.uri(), "test-key");
     let req = common::request_with_remote_file("gemini-2.0-flash");
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -496,7 +523,7 @@ async fn chat_stream_parses_text_parts() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gemini-2.0-flash")
+        .chat_stream(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -538,7 +565,7 @@ async fn chat_stream_handles_a_candidate_with_no_parts_gracefully() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gemini-2.0-flash")
+        .chat_stream(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -573,7 +600,7 @@ async fn chat_stream_yields_a_decode_error_for_malformed_event_json() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gemini-2.0-flash")
+        .chat_stream(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat_stream should succeed");
     let mut items = Vec::new();
@@ -605,7 +632,7 @@ async fn chat_stream_yields_no_chunks_for_an_empty_stream() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gemini-2.0-flash")
+        .chat_stream(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat_stream should succeed");
     assert!(stream.next().await.is_none());
@@ -625,7 +652,7 @@ async fn chat_maps_429_to_retryable_rate_limited() {
     let provider = GeminiProvider::new(server.uri(), "test-key");
     let req = common::simple_request("gemini-2.0-flash");
     let err = provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect_err("should fail");
 
@@ -666,7 +693,7 @@ async fn chat_sends_thinking_config_derived_from_reasoning_effort() {
     );
     req.max_tokens = None;
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -701,7 +728,7 @@ async fn chat_sets_include_thoughts_false_when_excluded() {
         },
     );
     provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 }
@@ -737,7 +764,7 @@ async fn chat_parses_thought_marked_parts_into_the_reasoning_field() {
         },
     );
     let resp = provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 
@@ -779,7 +806,7 @@ async fn chat_stream_emits_thought_parts_as_reasoning_deltas() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gemini-2.0-flash")
+        .chat_stream(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -825,7 +852,7 @@ async fn chat_parses_cached_content_token_count_into_usage() {
     let provider = GeminiProvider::new(server.uri(), "test-key");
     let req = common::simple_request("gemini-2.0-flash");
     let resp = provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 
@@ -854,7 +881,7 @@ async fn chat_leaves_cached_tokens_none_without_any_cache_hit() {
     let provider = GeminiProvider::new(server.uri(), "test-key");
     let req = common::simple_request("gemini-2.0-flash");
     let resp = provider
-        .chat(&req, "gemini-2.0-flash")
+        .chat(&req, "gemini-2.0-flash", None)
         .await
         .expect("chat should succeed");
 

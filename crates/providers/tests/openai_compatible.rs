@@ -34,7 +34,7 @@ async fn chat_success_parses_response_and_sends_correct_request() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::simple_request("gpt-4o-mini");
     let resp = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 
@@ -53,6 +53,38 @@ async fn chat_success_parses_response_and_sends_correct_request() {
         resp.cost_usd.is_none(),
         "providers never set cost_usd themselves"
     );
+}
+
+#[tokio::test]
+async fn chat_uses_the_byok_override_key_instead_of_the_configured_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("Authorization", "Bearer byok-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello there"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(&server)
+        .await;
+
+    // Constructed with "test-key" -- the mock only matches "byok-key", so a
+    // successful response here proves the override won, not the configured
+    // key wiremock would otherwise reject with a 404 (no matching mock).
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::simple_request("gpt-4o-mini");
+    provider
+        .chat(&req, "gpt-4o-mini", Some("byok-key"))
+        .await
+        .expect("chat should succeed with the byok override key");
 }
 
 #[tokio::test]
@@ -86,7 +118,7 @@ async fn chat_parses_tool_calls_in_response() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::request_with_tool("gpt-4o-mini");
     let resp = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 
@@ -123,7 +155,7 @@ async fn chat_stream_parses_delta_chunks_and_stops_at_done() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gpt-4o-mini")
+        .chat_stream(&req, "gpt-4o-mini", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -161,7 +193,7 @@ async fn chat_stream_yields_a_decode_error_for_malformed_event_json() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gpt-4o-mini")
+        .chat_stream(&req, "gpt-4o-mini", None)
         .await
         .expect("chat_stream should succeed");
     let mut items = Vec::new();
@@ -193,7 +225,7 @@ async fn chat_stream_yields_no_chunks_for_an_immediately_done_stream() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gpt-4o-mini")
+        .chat_stream(&req, "gpt-4o-mini", None)
         .await
         .expect("chat_stream should succeed");
     assert!(stream.next().await.is_none());
@@ -215,7 +247,7 @@ async fn chat_maps_429_to_retryable_rate_limited() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::simple_request("gpt-4o-mini");
     let err = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect_err("should fail");
 
@@ -269,7 +301,7 @@ async fn chat_forwards_tools_and_tool_choice_verbatim_in_request_body() {
     req.tool_choice = Some(json!({"type": "function", "function": {"name": "get_weather"}}));
 
     provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 }
@@ -318,7 +350,7 @@ async fn chat_forwards_json_schema_response_format_verbatim_in_request_body() {
     let req = common::request_with_json_schema("gpt-4o-mini");
 
     provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 }
@@ -350,7 +382,7 @@ async fn chat_forwards_json_object_response_format_verbatim_in_request_body() {
     let req = common::request_with_json_object("gpt-4o-mini");
 
     provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 }
@@ -389,7 +421,7 @@ async fn chat_forwards_all_sampling_params_verbatim_in_request_body() {
     let req = common::request_with_sampling_params("gpt-4o-mini");
 
     provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 }
@@ -433,7 +465,7 @@ async fn chat_forwards_logprobs_request_fields_and_parses_the_response() {
     let req = common::request_with_logprobs("gpt-4o-mini");
 
     let resp = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
     let logprobs = resp.choices[0]
@@ -484,7 +516,7 @@ async fn chat_forwards_image_content_verbatim_in_request_body() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::request_with_image("gpt-4o-mini");
     provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 }
@@ -521,7 +553,7 @@ async fn chat_forwards_file_content_verbatim_in_request_body() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::request_with_file("gpt-4o-mini");
     provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 }
@@ -558,7 +590,7 @@ async fn chat_forwards_remote_file_content_verbatim_in_request_body() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::request_with_remote_file("gpt-4o-mini");
     provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 }
@@ -595,7 +627,7 @@ async fn chat_forwards_audio_content_verbatim_in_request_body() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::request_with_audio("gpt-4o-mini");
     provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 }
@@ -622,7 +654,7 @@ async fn chat_stream_parses_tool_call_deltas() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gpt-4o-mini")
+        .chat_stream(&req, "gpt-4o-mini", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -674,7 +706,7 @@ async fn chat_maps_400_to_non_retryable_invalid_request() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::simple_request("gpt-4o-mini");
     let err = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect_err("should fail");
 
@@ -697,7 +729,7 @@ async fn chat_maps_401_and_403_to_non_retryable_auth_errors() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::simple_request("gpt-4o-mini");
     let err = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect_err("should fail");
 
@@ -723,7 +755,7 @@ async fn chat_maps_404_and_422_to_non_retryable_invalid_request() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::simple_request("gpt-4o-mini");
     let err = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect_err("should fail");
 
@@ -746,7 +778,7 @@ async fn chat_maps_an_unclassified_5xx_to_a_retryable_upstream_error() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::simple_request("gpt-4o-mini");
     let err = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect_err("should fail");
 
@@ -772,7 +804,7 @@ async fn chat_falls_back_to_the_raw_body_when_the_error_response_is_not_json() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::simple_request("gpt-4o-mini");
     let err = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect_err("should fail");
 
@@ -818,7 +850,7 @@ async fn chat_sends_reasoning_effort_and_parses_reasoning_content() {
         },
     );
     let resp = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 
@@ -859,7 +891,7 @@ async fn chat_omits_reasoning_content_when_the_client_asked_to_exclude_it() {
         },
     );
     let resp = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 
@@ -895,7 +927,7 @@ async fn chat_stream_parses_reasoning_content_deltas() {
     req.stream = Some(true);
 
     let mut stream = provider
-        .chat_stream(&req, "gpt-4o-mini")
+        .chat_stream(&req, "gpt-4o-mini", None)
         .await
         .expect("chat_stream should succeed");
     let mut chunks = Vec::new();
@@ -943,7 +975,7 @@ async fn chat_parses_prompt_tokens_details_cached_tokens_into_usage() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::simple_request("gpt-4o-mini");
     let resp = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 
@@ -974,7 +1006,7 @@ async fn chat_leaves_cached_tokens_none_without_prompt_tokens_details() {
     let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
     let req = common::simple_request("gpt-4o-mini");
     let resp = provider
-        .chat(&req, "gpt-4o-mini")
+        .chat(&req, "gpt-4o-mini", None)
         .await
         .expect("chat should succeed");
 

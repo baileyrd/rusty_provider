@@ -505,12 +505,17 @@ impl Provider for GeminiProvider {
         "gemini"
     }
 
-    async fn chat(&self, req: &ChatRequest, model: &str) -> Result<ChatResponse, ProviderError> {
+    async fn chat(
+        &self,
+        req: &ChatRequest,
+        model: &str,
+        api_key_override: Option<&str>,
+    ) -> Result<ChatResponse, ProviderError> {
         let body = build_request(req);
         let resp = self
             .client
             .post(self.endpoint(model, "generateContent"))
-            .query(&[("key", self.api_key.as_str())])
+            .query(&[("key", api_key_override.unwrap_or(self.api_key.as_str()))])
             .json(&body)
             .send()
             .await
@@ -575,12 +580,16 @@ impl Provider for GeminiProvider {
         &self,
         req: &ChatRequest,
         model: &str,
+        api_key_override: Option<&str>,
     ) -> Result<ChatStream, ProviderError> {
         let body = build_request(req);
         let resp = self
             .client
             .post(self.endpoint(model, "streamGenerateContent"))
-            .query(&[("key", self.api_key.as_str()), ("alt", "sse")])
+            .query(&[
+                ("key", api_key_override.unwrap_or(self.api_key.as_str())),
+                ("alt", "sse"),
+            ])
             .json(&body)
             .send()
             .await

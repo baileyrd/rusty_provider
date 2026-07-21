@@ -1282,6 +1282,19 @@ impl Router {
         req.model.clone()
     }
 
+    /// The caller-supplied BYOK key for `provider_name`, if
+    /// `req.provider.byok` set one (see
+    /// `rp_core::ProviderPreferences::byok`). `None` falls through to the
+    /// operator's own `[providers.X].api_key_env`-resolved key, same as
+    /// before this field existed.
+    fn byok_key_for<'a>(&self, req: &'a ChatRequest, provider_name: &str) -> Option<&'a str> {
+        req.provider
+            .as_ref()
+            .and_then(|p| p.byok.as_ref())
+            .and_then(|m| m.get(provider_name))
+            .map(|s| s.as_str())
+    }
+
     pub async fn dispatch(&self, req: &ChatRequest) -> Result<ChatResponse, RouterError> {
         let target_model = self.resolve_target_model(req);
         let chain = self.resolve_chain(&target_model, req.models.as_deref())?;
@@ -1312,9 +1325,13 @@ impl Router {
             let truncated_req =
                 maybe_apply_middle_out(req, provider_name, model_name, &self.pricing);
             let req_to_send = truncated_req.as_ref().unwrap_or(req);
+            let api_key_override = self.byok_key_for(req, provider_name);
 
             let started_at = Instant::now();
-            match provider.chat(req_to_send, model_name).await {
+            match provider
+                .chat(req_to_send, model_name, api_key_override)
+                .await
+            {
                 Ok(mut resp) => {
                     let elapsed_secs = started_at.elapsed().as_secs_f64();
                     ewma_record(
@@ -1419,9 +1436,13 @@ impl Router {
             let truncated_req =
                 maybe_apply_middle_out(req, provider_name, model_name, &self.pricing);
             let req_to_send = truncated_req.as_ref().unwrap_or(req);
+            let api_key_override = self.byok_key_for(req, provider_name);
 
             let started_at = Instant::now();
-            match provider.chat_stream(req_to_send, model_name).await {
+            match provider
+                .chat_stream(req_to_send, model_name, api_key_override)
+                .await
+            {
                 Ok(stream) => {
                     let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
                     ewma_record(
@@ -1620,6 +1641,7 @@ mod tests {
             &self,
             _req: &ChatRequest,
             model: &str,
+            _api_key_override: Option<&str>,
         ) -> Result<ChatResponse, ProviderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
@@ -1651,6 +1673,7 @@ mod tests {
             &self,
             _req: &ChatRequest,
             model: &str,
+            _api_key_override: Option<&str>,
         ) -> Result<ChatStream, ProviderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
@@ -1706,6 +1729,7 @@ mod tests {
             &self,
             _req: &ChatRequest,
             _model: &str,
+            _api_key_override: Option<&str>,
         ) -> Result<ChatResponse, ProviderError> {
             unreachable!("ScriptedStreamProvider only implements chat_stream")
         }
@@ -1714,6 +1738,7 @@ mod tests {
             &self,
             _req: &ChatRequest,
             _model: &str,
+            _api_key_override: Option<&str>,
         ) -> Result<ChatStream, ProviderError> {
             let chunks = self.chunks.clone();
             Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
@@ -1752,6 +1777,55 @@ mod tests {
         ChatChunk {
             usage: None,
             ..scripted_chunk(0, 0)
+        }
+    }
+
+    /// A `Provider` that records the `api_key_override` it was called
+    /// with, so BYOK plumbing (`Router::byok_key_for` actually reaching
+    /// the `Provider::chat`/`chat_stream` call) can be asserted without a
+    /// real HTTP call.
+    struct KeyCapturingProvider {
+        name: String,
+        seen_key: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for KeyCapturingProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn chat(
+            &self,
+            _req: &ChatRequest,
+            model: &str,
+            api_key_override: Option<&str>,
+        ) -> Result<ChatResponse, ProviderError> {
+            *self.seen_key.lock().unwrap() = api_key_override.map(str::to_string);
+            Ok(ChatResponse {
+                id: "test-id".to_string(),
+                object: "chat.completion",
+                created: 0,
+                model: format!("{}/{model}", self.name),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ChatMessage::assistant("ok"),
+                    finish_reason: Some("stop".to_string()),
+                    logprobs: None,
+                }],
+                usage: None,
+                cost_usd: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: &ChatRequest,
+            _model: &str,
+            api_key_override: Option<&str>,
+        ) -> Result<ChatStream, ProviderError> {
+            *self.seen_key.lock().unwrap() = api_key_override.map(str::to_string);
+            Ok(Box::pin(stream::empty::<Result<ChatChunk, ProviderError>>()))
         }
     }
 
@@ -4725,6 +4799,127 @@ mod tests {
         let stats = &snapshot["anthropic/m1"];
         assert_eq!(stats.requests, 1);
         assert!((stats.cost_usd - expected_cost).abs() < 1e-12);
+    }
+
+    // --- BYOK (provider.byok) -------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatch_passes_the_matching_byok_key_to_the_provider() {
+        let provider = Arc::new(KeyCapturingProvider {
+            name: "anthropic".to_string(),
+            seen_key: Mutex::new(None),
+        });
+        let router = test_router(
+            vec![("anthropic", provider.clone())],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.provider = Some(rp_core::ProviderPreferences {
+            byok: Some(HashMap::from([(
+                "anthropic".to_string(),
+                "sk-byok-key".to_string(),
+            )])),
+            ..Default::default()
+        });
+
+        router
+            .dispatch(&req)
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(
+            provider.seen_key.lock().unwrap().as_deref(),
+            Some("sk-byok-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_none_when_byok_has_no_entry_for_the_dispatched_provider() {
+        let provider = Arc::new(KeyCapturingProvider {
+            name: "anthropic".to_string(),
+            seen_key: Mutex::new(None),
+        });
+        let router = test_router(
+            vec![("anthropic", provider.clone())],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.provider = Some(rp_core::ProviderPreferences {
+            byok: Some(HashMap::from([(
+                "openai".to_string(),
+                "sk-someone-elses-key".to_string(),
+            )])),
+            ..Default::default()
+        });
+
+        router
+            .dispatch(&req)
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(*provider.seen_key.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_none_when_byok_is_unset() {
+        let provider = Arc::new(KeyCapturingProvider {
+            name: "anthropic".to_string(),
+            seen_key: Mutex::new(None),
+        });
+        let router = test_router(
+            vec![("anthropic", provider.clone())],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        router
+            .dispatch(&test_request("anthropic/m1"))
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(*provider.seen_key.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn dispatch_stream_passes_the_matching_byok_key_to_the_provider() {
+        let provider = Arc::new(KeyCapturingProvider {
+            name: "anthropic".to_string(),
+            seen_key: Mutex::new(None),
+        });
+        let router = test_router(
+            vec![("anthropic", provider.clone())],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut req = test_request("anthropic/m1");
+        req.stream = Some(true);
+        req.provider = Some(rp_core::ProviderPreferences {
+            byok: Some(HashMap::from([(
+                "anthropic".to_string(),
+                "sk-byok-key".to_string(),
+            )])),
+            ..Default::default()
+        });
+
+        let _stream = router
+            .dispatch_stream(&req)
+            .await
+            .expect("dispatch_stream should succeed");
+
+        assert_eq!(
+            provider.seen_key.lock().unwrap().as_deref(),
+            Some("sk-byok-key")
+        );
     }
 
     // --- dispatch_stream usage instrumentation ------------------------------

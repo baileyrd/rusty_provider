@@ -950,6 +950,43 @@ when `model` is `"auto"`.
 Without `[auto_routing]` configured, `"auto"` isn't special-cased at all
 — it resolves like any other unrecognized alias, a `400`.
 
+## BYOK (bring your own key)
+
+A request can supply its own API key for a configured provider, used for
+that request's own calls instead of the operator's `api_key_env`-resolved
+one:
+
+```jsonc
+{
+  "model": "openai/gpt-4o-mini",
+  "messages": [{"role": "user", "content": "..."}],
+  "provider": {
+    "byok": {
+      "openai": "sk-the-callers-own-openai-key"
+    }
+  }
+}
+```
+
+`byok` maps a provider name to the key to use for it, for this request
+only — never written to config, logged, or echoed back in any response.
+The operator still needs a `[providers.X]` entry for that provider (its
+`kind`/`base_url` are what the router needs to know how to call it at
+all); `byok` only swaps the credential, not the endpoint. A chain that
+spans multiple providers can mix and match — a provider name present in
+`byok` uses that key, any other candidate in the same chain falls back to
+its own configured key as usual. A provider name in `byok` that doesn't
+match any candidate actually tried is simply never used, not an error.
+
+This is a credential swap only, not a separate billing mode: `cost_usd`
+and every other cost/budget/usage figure this router tracks are computed
+and recorded exactly the same regardless of whose key served the request
+— rusty_provider has no visibility into (and makes no attempt to reduce)
+what the provider itself bills the caller's own account for a BYOK
+request. The outbound self-throttle (`[providers.X].requests_per_minute`)
+still applies too, since that protects this router process's own call
+pattern to the provider's endpoint, independent of which key is paying.
+
 ## Admin API
 
 Setting `server.admin_key_env` unlocks a small admin API for inspecting
