@@ -158,6 +158,41 @@ pub struct ClientConfig {
     /// `budget_usd` set.
     #[serde(default)]
     pub budget_period: BudgetPeriod,
+    /// Groups this client under a named organization, for admin-API
+    /// scoping (see `role`) and the `GET /v1/admin/organizations` rollup.
+    /// Purely a label otherwise -- it has no effect on chat completions.
+    /// Unset is its own bucket ("no organization"), distinct from every
+    /// named one.
+    #[serde(default)]
+    pub organization: Option<String>,
+    /// Sub-groups this client within `organization`, for the
+    /// `GET /v1/admin/organizations` rollup only -- never consulted for
+    /// authorization, which scopes by `organization` alone.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Whether this client's own API key can also authenticate to
+    /// `/v1/admin/*`, in addition to `server.admin_key_env`. An admin-role
+    /// client's access is scoped to clients sharing its `organization`
+    /// (matching only other clients with the identical `organization`,
+    /// including the shared "unset" bucket) -- unlike `server.admin_key_env`,
+    /// which always sees every client regardless of organization.
+    /// `Member` (the default) grants no admin access, same as before this
+    /// field existed.
+    #[serde(default)]
+    pub role: ClientRole,
+}
+
+/// Whether a client's own API key also unlocks `/v1/admin/*`, and if so,
+/// how broadly.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientRole {
+    /// Chat-completions access only.
+    #[default]
+    Member,
+    /// Also grants admin API access, scoped to this client's own
+    /// `organization`.
+    Admin,
 }
 
 /// How a client's `budget_usd` cap resets.
@@ -767,6 +802,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("budget_period"));
+    }
+
+    #[test]
+    fn client_organization_workspace_and_role_default_to_absent_and_member() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[clients]]
+            name = "acme"
+            api_key_env = "ACME_KEY"
+            requests_per_minute = 60
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.clients[0].organization, None);
+        assert_eq!(config.clients[0].workspace, None);
+        assert_eq!(config.clients[0].role, ClientRole::Member);
+    }
+
+    #[test]
+    fn client_organization_workspace_and_role_are_honored_when_set() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[clients]]
+            name = "acme"
+            api_key_env = "ACME_KEY"
+            requests_per_minute = 60
+            organization = "acme-corp"
+            workspace = "prod"
+            role = "admin"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.clients[0].organization,
+            Some("acme-corp".to_string())
+        );
+        assert_eq!(config.clients[0].workspace, Some("prod".to_string()));
+        assert_eq!(config.clients[0].role, ClientRole::Admin);
+    }
+
+    #[test]
+    fn client_role_rejects_unknown_value() {
+        let err = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[clients]]
+            name = "acme"
+            api_key_env = "ACME_KEY"
+            requests_per_minute = 60
+            role = "owner"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("role"));
     }
 
     // --- guardrails ----------------------------------------------------------------

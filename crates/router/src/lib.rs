@@ -14,9 +14,9 @@ use std::time::Instant;
 
 use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
-    AutoRoutingConfig, BudgetPeriod, ClientConfig, Config, GuardrailAction, GuardrailConfig,
-    PersistenceBackend, PersistenceConfig, PostgresTlsMode, PresetConfig, PricingEntry,
-    ProviderConfig, ProviderKind, RouteAlias, ServerConfig, WebhookConfig,
+    AutoRoutingConfig, BudgetPeriod, ClientConfig, ClientRole, Config, GuardrailAction,
+    GuardrailConfig, PersistenceBackend, PersistenceConfig, PostgresTlsMode, PresetConfig,
+    PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig, WebhookConfig,
 };
 pub use error::RouterError;
 use guardrails::Guardrail;

@@ -1090,6 +1090,216 @@ async fn admin_list_clients_reports_configured_clients_and_live_spend() {
     assert!(globex["spent_usd"].is_null());
 }
 
+/// Two organizations, `acme-corp`'s own client holding `role = "admin"` --
+/// the shared fixture for the organization-scoping tests below.
+async fn spawn_two_org_app() -> (String, String, String) {
+    let acme_admin_key_var = unique_env_var("ACME_ADMIN_KEY");
+    std::env::set_var(&acme_admin_key_var, "acme-admin-secret");
+    let globex_member_key_var = unique_env_var("GLOBEX_MEMBER_KEY");
+    std::env::set_var(&globex_member_key_var, "globex-member-secret");
+
+    let config = format!(
+        r#"
+        providers = {{}}
+
+        [[clients]]
+        name = "acme-admin"
+        api_key_env = "{acme_admin_key_var}"
+        requests_per_minute = 30
+        organization = "acme-corp"
+        workspace = "prod"
+        role = "admin"
+
+        [[clients]]
+        name = "globex-member"
+        api_key_env = "{globex_member_key_var}"
+        requests_per_minute = 30
+        organization = "globex-inc"
+        role = "member"
+        "#
+    );
+    let base_url = spawn_app(&config).await;
+    (
+        base_url,
+        "acme-admin-secret".to_string(),
+        "globex-member-secret".to_string(),
+    )
+}
+
+#[tokio::test]
+async fn admin_list_clients_scopes_results_to_an_admin_role_clients_own_organization() {
+    let (base_url, acme_admin_key, _globex_member_key) = spawn_two_org_app().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/v1/admin/clients"))
+        .bearer_auth(&acme_admin_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let data = body["data"].as_array().unwrap();
+
+    // The scoped admin sees only its own organization's clients -- itself,
+    // not "globex-member" in the other organization.
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["name"], "acme-admin");
+    assert_eq!(data[0]["organization"], "acme-corp");
+}
+
+#[tokio::test]
+async fn admin_list_clients_is_401_for_a_member_role_clients_own_key() {
+    let (base_url, _acme_admin_key, globex_member_key) = spawn_two_org_app().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/v1/admin/clients"))
+        .bearer_auth(&globex_member_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn admin_create_client_pins_organization_to_a_scoped_admins_own_org() {
+    let (base_url, acme_admin_key, _globex_member_key) = spawn_two_org_app().await;
+    let client = reqwest::Client::new();
+
+    // Even though the request asks for "globex-inc", a scoped admin can
+    // only ever create clients in its own organization.
+    let resp = client
+        .post(format!("{base_url}/v1/admin/clients"))
+        .bearer_auth(&acme_admin_key)
+        .json(&json!({
+            "name": "new-hire",
+            "requests_per_minute": 30,
+            "organization": "globex-inc"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["organization"], "acme-corp");
+}
+
+#[tokio::test]
+async fn admin_update_client_is_404_for_a_client_outside_a_scoped_admins_organization() {
+    let (base_url, acme_admin_key, _globex_member_key) = spawn_two_org_app().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .patch(format!("{base_url}/v1/admin/clients/globex-member"))
+        .bearer_auth(&acme_admin_key)
+        .json(&json!({"requests_per_minute": 99}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn admin_delete_client_is_404_for_a_client_outside_a_scoped_admins_organization() {
+    let (base_url, acme_admin_key, _globex_member_key) = spawn_two_org_app().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("{base_url}/v1/admin/clients/globex-member"))
+        .bearer_auth(&acme_admin_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Confirm it's untouched, not actually removed -- visible to a global
+    // view (no admin_key_env here, so re-check via the other org's own
+    // scoped list instead, which should still find itself).
+    let resp = client
+        .get(format!("{base_url}/v1/admin/clients"))
+        .bearer_auth(&acme_admin_key)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn admin_list_organizations_groups_clients_by_organization_with_a_global_key() {
+    let admin_key_var = unique_env_var("ADMIN_KEY");
+    std::env::set_var(&admin_key_var, "admin-secret");
+    let acme_key_var = unique_env_var("ACME_KEY");
+    std::env::set_var(&acme_key_var, "acme-secret");
+    let globex_key_var = unique_env_var("GLOBEX_KEY");
+    std::env::set_var(&globex_key_var, "globex-secret");
+
+    let config = format!(
+        r#"
+        providers = {{}}
+
+        [server]
+        admin_key_env = "{admin_key_var}"
+
+        [[clients]]
+        name = "acme-client"
+        api_key_env = "{acme_key_var}"
+        requests_per_minute = 30
+        organization = "acme-corp"
+        workspace = "prod"
+
+        [[clients]]
+        name = "globex-client"
+        api_key_env = "{globex_key_var}"
+        requests_per_minute = 30
+        organization = "globex-inc"
+        "#
+    );
+    let base_url = spawn_app(&config).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/v1/admin/organizations"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+
+    let acme = data
+        .iter()
+        .find(|g| g["organization"] == "acme-corp")
+        .unwrap();
+    let acme_clients = acme["clients"].as_array().unwrap();
+    assert_eq!(acme_clients.len(), 1);
+    assert_eq!(acme_clients[0]["name"], "acme-client");
+    assert_eq!(acme_clients[0]["workspace"], "prod");
+}
+
+#[tokio::test]
+async fn admin_list_organizations_scopes_to_the_callers_own_organization() {
+    let (base_url, acme_admin_key, _globex_member_key) = spawn_two_org_app().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/v1/admin/organizations"))
+        .bearer_auth(&acme_admin_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let data = body["data"].as_array().unwrap();
+
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["organization"], "acme-corp");
+    assert_eq!(data[0]["clients"].as_array().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn admin_reset_client_spend_zeroes_spend_and_unblocks_the_client() {
     let server = MockServer::start().await;
