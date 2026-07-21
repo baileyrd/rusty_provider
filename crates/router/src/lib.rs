@@ -523,3 +523,578 @@ impl Router {
         Err(last_err.unwrap_or_else(|| RouterError::InvalidModel(req.model.clone())))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use futures::stream;
+    use rp_core::{ChatChunk, ChatMessage, ChatMessageDelta, Choice, ChunkChoice, Role};
+
+    use super::*;
+
+    /// Directly construct a `Router` with arbitrary private-field state,
+    /// bypassing `from_config` (which only ever builds real provider
+    /// adapters from env vars) so tests can inject `MockProvider`s and
+    /// pre-seed pricing/zdr/rate-limit state without any network I/O.
+    fn test_router(
+        providers: Vec<(&str, Arc<dyn Provider>)>,
+        routes: Vec<(&str, Vec<&str>)>,
+        pricing: Vec<(&str, f64, f64)>,
+        zdr_providers: Vec<&str>,
+        provider_rpm: Vec<(&str, u32)>,
+    ) -> Router {
+        Router {
+            providers: providers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            routes: routes
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
+                .collect(),
+            pricing: Arc::new(
+                pricing
+                    .into_iter()
+                    .map(|(k, p, c)| (k.to_string(), (p, c)))
+                    .collect(),
+            ),
+            zdr_providers: zdr_providers.into_iter().map(String::from).collect(),
+            latency: RwLock::new(HashMap::new()),
+            throughput: Arc::new(RwLock::new(HashMap::new())),
+            usage: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Metrics::new(),
+            provider_rpm: provider_rpm
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            outbound_limiter: RateLimiter::new(),
+        }
+    }
+
+    fn chain(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(p, m)| (p.to_string(), m.to_string()))
+            .collect()
+    }
+
+    fn test_request(model: &str) -> ChatRequest {
+        ChatRequest {
+            model: model.to_string(),
+            messages: vec![ChatMessage::user("hi")],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: None,
+            stream: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            provider: None,
+        }
+    }
+
+    enum MockBehavior {
+        Succeed,
+        FailRetryable,
+        FailFatal,
+    }
+
+    /// A `Provider` with scripted, network-free behavior and a call
+    /// counter, so dispatch/fallback logic can be tested in isolation from
+    /// any real adapter or HTTP call.
+    struct MockProvider {
+        name: String,
+        behavior: MockBehavior,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockProvider {
+        fn canned_error(&self) -> ProviderError {
+            match self.behavior {
+                MockBehavior::FailRetryable => ProviderError::Upstream {
+                    status: 503,
+                    message: "mock retryable failure".to_string(),
+                },
+                MockBehavior::FailFatal => {
+                    ProviderError::InvalidRequest("mock fatal failure".to_string())
+                }
+                MockBehavior::Succeed => {
+                    unreachable!("canned_error only called for failure behaviors")
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn chat(
+            &self,
+            _req: &ChatRequest,
+            model: &str,
+        ) -> Result<ChatResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                MockBehavior::Succeed => Ok(ChatResponse {
+                    id: "test-id".to_string(),
+                    object: "chat.completion",
+                    created: 0,
+                    model: format!("{}/{model}", self.name),
+                    choices: vec![Choice {
+                        index: 0,
+                        message: ChatMessage::assistant("ok"),
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    }),
+                    cost_usd: None,
+                }),
+                _ => Err(self.canned_error()),
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: &ChatRequest,
+            model: &str,
+        ) -> Result<ChatStream, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                MockBehavior::Succeed => {
+                    let chunk = ChatChunk {
+                        id: "test-id".to_string(),
+                        object: "chat.completion.chunk",
+                        created: 0,
+                        model: format!("{}/{model}", self.name),
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: ChatMessageDelta {
+                                role: Some(Role::Assistant),
+                                content: Some("ok".to_string()),
+                                tool_calls: None,
+                            },
+                            finish_reason: Some("stop".to_string()),
+                        }],
+                        usage: Some(Usage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            total_tokens: 2,
+                        }),
+                        cost_usd: None,
+                    };
+                    Ok(Box::pin(stream::once(async { Ok(chunk) })))
+                }
+                _ => Err(self.canned_error()),
+            }
+        }
+    }
+
+    // --- resolve_chain -----------------------------------------------------
+
+    #[test]
+    fn resolve_chain_direct_model_string() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let result = router.resolve_chain("anthropic/claude-sonnet-5").unwrap();
+        assert_eq!(result, chain(&[("anthropic", "claude-sonnet-5")]));
+    }
+
+    #[test]
+    fn resolve_chain_alias_returns_configured_order() {
+        let router = test_router(
+            vec![],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let result = router.resolve_chain("smart").unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
+    }
+
+    #[test]
+    fn resolve_chain_rejects_model_without_a_slash() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let err = router.resolve_chain("not-a-valid-model").unwrap_err();
+        assert!(matches!(err, RouterError::InvalidModel(_)));
+    }
+
+    // --- apply_preferences ---------------------------------------------------
+
+    #[test]
+    fn apply_preferences_no_prefs_is_a_no_op() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), None)
+            .unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn apply_preferences_only_filters_chain() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            only: Some(vec!["openai".to_string()]),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2")]));
+    }
+
+    #[test]
+    fn apply_preferences_ignore_filters_chain() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            ignore: Some(vec!["anthropic".to_string()]),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2")]));
+    }
+
+    #[test]
+    fn apply_preferences_empty_after_filter_is_an_error() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            only: Some(vec!["gemini".to_string()]),
+            ..Default::default()
+        };
+        let err = router
+            .apply_preferences("smart", chain(&[("anthropic", "m1")]), Some(&prefs))
+            .unwrap_err();
+        assert!(matches!(err, RouterError::NoEligibleProvider(_)));
+    }
+
+    #[test]
+    fn apply_preferences_zdr_filters_to_flagged_providers_only() {
+        let router = test_router(vec![], vec![], vec![], vec!["anthropic"], vec![]);
+        let prefs = ProviderPreferences {
+            zdr: Some(true),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_sorts_ascending_by_price() {
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![("anthropic/m1", 3.0, 15.0), ("openai/m2", 1.0, 5.0)],
+            vec![],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_sorts_ascending_by_latency() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router
+            .latency
+            .write()
+            .unwrap()
+            .insert("anthropic/m1".to_string(), 2000.0);
+        router
+            .latency
+            .write()
+            .unwrap()
+            .insert("openai/m2".to_string(), 500.0);
+        let prefs = ProviderPreferences {
+            sort: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_sorts_descending_by_throughput() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router
+            .throughput
+            .write()
+            .unwrap()
+            .insert("anthropic/m1".to_string(), 20.0);
+        router
+            .throughput
+            .write()
+            .unwrap()
+            .insert("openai/m2".to_string(), 80.0);
+        let prefs = ProviderPreferences {
+            sort: Some("throughput".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_unobserved_latency_sorts_last() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router
+            .latency
+            .write()
+            .unwrap()
+            .insert("anthropic/m1".to_string(), 500.0);
+        // "openai/m2" has no observed latency -- despite being first in the
+        // chain, it should sort after the entry with real data.
+        let prefs = ProviderPreferences {
+            sort: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("openai", "m2"), ("anthropic", "m1")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
+    }
+
+    // --- dispatch ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatch_returns_success_from_first_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = test_router(vec![("anthropic", mock)], vec![], vec![], vec![], vec![]);
+
+        let resp = router
+            .dispatch(&test_request("anthropic/claude-sonnet-5"))
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(resp.model, "anthropic/claude-sonnet-5");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_falls_back_to_next_candidate_on_retryable_error() {
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let failing = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: calls_a.clone(),
+        });
+        let succeeding = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_b.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", failing), ("openai", succeeding)],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let resp = router
+            .dispatch(&test_request("smart"))
+            .await
+            .expect("should fall through to openai");
+
+        assert_eq!(resp.model, "openai/m2");
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_aborts_immediately_on_fatal_error() {
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let failing = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::FailFatal,
+            calls: calls_a.clone(),
+        });
+        let never_called = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls_b.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", failing), ("openai", never_called)],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let err = router.dispatch(&test_request("smart")).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            RouterError::Provider(ProviderError::InvalidRequest(_))
+        ));
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            calls_b.load(Ordering::SeqCst),
+            0,
+            "a fatal error must not fall through to the next candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_last_error_when_every_candidate_fails() {
+        let a = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let b = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::FailRetryable,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let router = test_router(
+            vec![("anthropic", a), ("openai", b)],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let err = router.dispatch(&test_request("smart")).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            RouterError::Provider(ProviderError::Upstream { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_a_chain_entry_with_no_registered_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let configured = Arc::new(MockProvider {
+            name: "openai".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        // "anthropic" is referenced by the alias but never registered.
+        let router = test_router(
+            vec![("openai", configured)],
+            vec![("smart", vec!["anthropic/m1", "openai/m2"])],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let resp = router
+            .dispatch(&test_request("smart"))
+            .await
+            .expect("should fall through to the configured provider");
+
+        assert_eq!(resp.model, "openai/m2");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_respects_outbound_rate_limit_and_reports_it_as_retryable() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = test_router(
+            vec![("anthropic", mock)],
+            vec![],
+            vec![],
+            vec![],
+            vec![("anthropic", 1)],
+        );
+        let req = test_request("anthropic/m1");
+
+        router
+            .dispatch(&req)
+            .await
+            .expect("first request is within the 1/min budget");
+        let err = router.dispatch(&req).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            RouterError::Provider(ProviderError::RateLimited { .. })
+        ));
+        assert!(err.retry_after_secs().is_some());
+        // The mock was only actually invoked once -- the second dispatch
+        // was stopped by the outbound limiter before ever calling it.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // --- RouterError -----------------------------------------------------------
+
+    #[test]
+    fn retry_after_secs_extracts_from_rate_limited_provider_error() {
+        let err = RouterError::Provider(ProviderError::RateLimited {
+            retry_after_secs: Some(42),
+        });
+        assert_eq!(err.retry_after_secs(), Some(42));
+    }
+
+    #[test]
+    fn retry_after_secs_is_none_for_other_errors() {
+        assert_eq!(
+            RouterError::InvalidModel("x".to_string()).retry_after_secs(),
+            None
+        );
+    }
+}
