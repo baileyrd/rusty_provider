@@ -38,3 +38,59 @@ impl RouterError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_model_maps_to_400() {
+        assert_eq!(
+            RouterError::InvalidModel("bogus".to_string()).status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn provider_not_configured_maps_to_424() {
+        assert_eq!(
+            RouterError::ProviderNotConfigured("openai".to_string()).status_code(),
+            424
+        );
+    }
+
+    #[test]
+    fn no_eligible_provider_maps_to_400() {
+        assert_eq!(
+            RouterError::NoEligibleProvider("anthropic/claude".to_string()).status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn provider_variant_delegates_to_the_wrapped_providererror_status_code() {
+        let cases: [(ProviderError, u16); 6] = [
+            (ProviderError::Auth("x".to_string()), 401),
+            (ProviderError::InvalidRequest("x".to_string()), 400),
+            (
+                ProviderError::RateLimited {
+                    retry_after_secs: Some(10),
+                },
+                429,
+            ),
+            (
+                ProviderError::Upstream {
+                    status: 503,
+                    message: "x".to_string(),
+                },
+                503,
+            ),
+            (ProviderError::Timeout, 504),
+            (ProviderError::ModelNotFound("x".to_string()), 404),
+        ];
+        for (provider_err, expected) in cases {
+            let router_err = RouterError::from(provider_err);
+            assert_eq!(router_err.status_code(), expected);
+        }
+    }
+}
