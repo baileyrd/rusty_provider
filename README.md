@@ -901,6 +901,55 @@ request left that specific field unset. An unknown `preset` name is a
 [Guardrails](#guardrails), so a preset's own `system_prompt` is still
 scanned by whatever guardrails are configured.
 
+## Auto-routing
+
+`model: "auto"` in a request routes it to one of three tiers, picked by a
+heuristic (not ML) complexity score — roughly OpenRouter's
+`openrouter/auto`:
+
+```toml
+[auto_routing]
+simple_model = "openai/gpt-4o-mini"                      # can be a [[routes]] alias
+medium_model = "smart"
+complex_model = "anthropic/claude-opus-4-8"
+simple_max_score = 200                                    # optional, defaults shown
+medium_max_score = 800
+```
+
+```jsonc
+{
+  "model": "auto",
+  "messages": [{"role": "user", "content": "..."}]
+}
+```
+
+Each tier's model is a `"provider/model"` string or a `[[routes]]` alias,
+exactly like `model` anywhere else, so a tier can point at a whole
+fallback chain rather than one fixed model. The complexity score is an
+estimated prompt-token count (the same tokenizer-free `chars / 4`
+estimate used elsewhere in this router, e.g. for
+[context compression](#context-compression)) summed across every
+message, plus flat bonuses for signals that tend to mean a harder task:
+multi-turn context, code in the conversation, tool use, requested
+reasoning, or a JSON-schema output constraint. The score has no fixed
+unit or universal threshold — `simple_max_score`/`medium_max_score` are
+something to tune against your own traffic: a request scoring at or
+below `simple_max_score` goes to `simple_model`, at or below
+`medium_max_score` goes to `medium_model`, and anything higher goes to
+`complex_model`.
+
+A request can set `"provider": {"auto_bias": "cost"}` or `"quality"` to
+shift both thresholds for just that request, without touching the
+operator's configured defaults: `"cost"` doubles both thresholds (a
+request has to score higher before escalating into a pricier tier, so it
+stays on the cheaper tiers longer), `"quality"` halves them (escalating
+into a pricier tier sooner). Unset, or any other value, is `"balanced"`
+— the thresholds apply as configured. `auto_bias` only has any effect
+when `model` is `"auto"`.
+
+Without `[auto_routing]` configured, `"auto"` isn't special-cased at all
+— it resolves like any other unrecognized alias, a `400`.
+
 ## Admin API
 
 Setting `server.admin_key_env` unlocks a small admin API for inspecting

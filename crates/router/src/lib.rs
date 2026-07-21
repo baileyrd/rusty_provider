@@ -1,3 +1,4 @@
+mod auto_routing;
 mod client_budget;
 mod config;
 mod error;
@@ -13,9 +14,9 @@ use std::time::Instant;
 
 use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
-    BudgetPeriod, ClientConfig, Config, GuardrailAction, GuardrailConfig, PersistenceBackend,
-    PersistenceConfig, PostgresTlsMode, PresetConfig, PricingEntry, ProviderConfig, ProviderKind,
-    RouteAlias, ServerConfig, WebhookConfig,
+    AutoRoutingConfig, BudgetPeriod, ClientConfig, Config, GuardrailAction, GuardrailConfig,
+    PersistenceBackend, PersistenceConfig, PostgresTlsMode, PresetConfig, PricingEntry,
+    ProviderConfig, ProviderKind, RouteAlias, ServerConfig, WebhookConfig,
 };
 pub use error::RouterError;
 use guardrails::Guardrail;
@@ -252,7 +253,7 @@ fn active_params(req: &ChatRequest) -> Vec<&'static str> {
 /// substitute for the provider's own accounting.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-fn estimate_tokens(message: &ChatMessage) -> usize {
+pub(crate) fn estimate_tokens(message: &ChatMessage) -> usize {
     message
         .content
         .as_ref()
@@ -409,6 +410,9 @@ pub struct Router {
     /// last entry, same "last one wins" convention as `[[routes]]`
     /// aliases.
     presets: HashMap<String, PresetConfig>,
+    /// `[auto_routing]`, if configured -- backs `model: "auto"`. `None`
+    /// means `"auto"` isn't special-cased at all.
+    auto_routing: Option<AutoRoutingConfig>,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -651,6 +655,8 @@ impl Router {
             .map(|cfg| (cfg.name.clone(), cfg.clone()))
             .collect();
 
+        let auto_routing = config.auto_routing.clone();
+
         Self {
             providers,
             provider_kinds,
@@ -672,6 +678,7 @@ impl Router {
             webhook,
             guardrails,
             presets,
+            auto_routing,
         }
     }
 
@@ -1259,10 +1266,27 @@ impl Router {
         Box::pin(instrumented)
     }
 
+    /// Resolves `model: "auto"` to a concrete `[auto_routing]` tier's
+    /// model string (a "provider/model" or a `[[routes]]` alias, exactly
+    /// like `req.model` itself) before the rest of chain resolution runs.
+    /// Every other `req.model` value, or `"auto"` when `[auto_routing]`
+    /// isn't configured at all, passes through unchanged -- an
+    /// unconfigured `"auto"` then resolves exactly like any other
+    /// unrecognized alias (a `400`), not a special error.
+    fn resolve_target_model(&self, req: &ChatRequest) -> String {
+        if req.model == "auto" {
+            if let Some(config) = &self.auto_routing {
+                return auto_routing::resolve_tier(config, req);
+            }
+        }
+        req.model.clone()
+    }
+
     pub async fn dispatch(&self, req: &ChatRequest) -> Result<ChatResponse, RouterError> {
-        let chain = self.resolve_chain(&req.model, req.models.as_deref())?;
-        let chain = self.apply_preferences(&req.model, chain, req.provider.as_ref())?;
-        let chain = self.filter_by_required_parameters(&req.model, chain, req)?;
+        let target_model = self.resolve_target_model(req);
+        let chain = self.resolve_chain(&target_model, req.models.as_deref())?;
+        let chain = self.apply_preferences(&target_model, chain, req.provider.as_ref())?;
+        let chain = self.filter_by_required_parameters(&target_model, chain, req)?;
         let mut last_err: Option<RouterError> = None;
 
         for (provider_name, model_name) in &chain {
@@ -1362,13 +1386,14 @@ impl Router {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| RouterError::InvalidModel(req.model.clone())))
+        Err(last_err.unwrap_or_else(|| RouterError::InvalidModel(target_model.clone())))
     }
 
     pub async fn dispatch_stream(&self, req: &ChatRequest) -> Result<ChatStream, RouterError> {
-        let chain = self.resolve_chain(&req.model, req.models.as_deref())?;
-        let chain = self.apply_preferences(&req.model, chain, req.provider.as_ref())?;
-        let chain = self.filter_by_required_parameters(&req.model, chain, req)?;
+        let target_model = self.resolve_target_model(req);
+        let chain = self.resolve_chain(&target_model, req.models.as_deref())?;
+        let chain = self.apply_preferences(&target_model, chain, req.provider.as_ref())?;
+        let chain = self.filter_by_required_parameters(&target_model, chain, req)?;
         let mut last_err: Option<RouterError> = None;
 
         for (provider_name, model_name) in &chain {
@@ -1437,7 +1462,7 @@ impl Router {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| RouterError::InvalidModel(req.model.clone())))
+        Err(last_err.unwrap_or_else(|| RouterError::InvalidModel(target_model.clone())))
     }
 }
 
@@ -1511,6 +1536,7 @@ mod tests {
             webhook: None,
             guardrails: Vec::new(),
             presets: HashMap::new(),
+            auto_routing: None,
         }
     }
 
@@ -2436,6 +2462,55 @@ mod tests {
         req.preset = Some("support-bot".to_string());
         router.apply_preset(&mut req).unwrap();
         assert_eq!(req.model, "anthropic/claude-sonnet-5");
+    }
+
+    // --- resolve_target_model ("auto") ----------------------------------------
+
+    fn auto_routing_config() -> AutoRoutingConfig {
+        AutoRoutingConfig {
+            simple_model: "openai/gpt-4o-mini".to_string(),
+            medium_model: "smart".to_string(),
+            complex_model: "anthropic/claude-opus-4-8".to_string(),
+            simple_max_score: 20,
+            medium_max_score: 80,
+        }
+    }
+
+    #[test]
+    fn resolve_target_model_passes_through_a_non_auto_model_unchanged() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let req = test_request("anthropic/claude-sonnet-5");
+        assert_eq!(
+            router.resolve_target_model(&req),
+            "anthropic/claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn resolve_target_model_passes_auto_through_unchanged_when_unconfigured() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let req = test_request("auto");
+        assert_eq!(router.resolve_target_model(&req), "auto");
+    }
+
+    #[test]
+    fn resolve_target_model_resolves_auto_to_the_simple_tier_for_a_short_prompt() {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.auto_routing = Some(auto_routing_config());
+        let req = test_request("auto");
+        assert_eq!(router.resolve_target_model(&req), "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn resolve_target_model_resolves_auto_to_the_complex_tier_for_a_long_prompt() {
+        let mut router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.auto_routing = Some(auto_routing_config());
+        let mut req = test_request("auto");
+        req.messages = vec![ChatMessage::user("word ".repeat(1000))];
+        assert_eq!(
+            router.resolve_target_model(&req),
+            "anthropic/claude-opus-4-8"
+        );
     }
 
     // --- resolve_chain -----------------------------------------------------

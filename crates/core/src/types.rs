@@ -485,6 +485,16 @@ pub struct ProviderPreferences {
     /// Same self-declared, unverified trust model as `zdr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_collection: Option<bool>,
+    /// Only meaningful when `model` is `"auto"` (see the top-level
+    /// `[auto_routing]` config): biases which complexity tier this
+    /// request lands in. `"cost"` doubles both configured score
+    /// thresholds (routes more requests to the cheaper tiers, staying on
+    /// them longer), `"quality"` halves them (routes more to the pricier
+    /// tiers, escalating sooner), and `"balanced"` (the default when
+    /// unset) leaves them as configured. Any other value is treated as
+    /// `"balanced"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_bias: Option<String>,
     /// Drop every candidate priced above this, in USD per million prompt
     /// tokens -- the same `prompt_per_million` figure `sort: "price"`
     /// consults from `[[pricing]]`. A candidate with no configured price

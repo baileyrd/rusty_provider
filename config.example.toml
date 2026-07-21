@@ -270,3 +270,27 @@ completion_per_million = 0.79
 #
 # [presets.provider]
 # only = ["anthropic", "openai"]
+
+# --- Auto-routing (optional) ------------------------------------------------------
+# `model: "auto"` in a request routes it to one of three tiers, picked by a
+# heuristic (not ML) complexity score -- roughly OpenRouter's `openrouter/auto`.
+# Each tier's model can be a "provider/model" string or a [[routes]] alias, same
+# as `model` anywhere else. The score is an estimated-token count (same
+# tokenizer-free `chars / 4` heuristic used elsewhere in this router) plus flat
+# bonuses for signals that tend to mean a harder task -- multi-turn context, code
+# in the conversation, tool use, requested reasoning, or a JSON-schema output
+# constraint. There's no fixed unit or universal threshold: simple_max_score/
+# medium_max_score are something to tune against your own traffic. Without
+# [auto_routing] configured, "auto" isn't special-cased -- it resolves like any
+# other unrecognized alias (400).
+#
+# A request can also set `"provider": {"auto_bias": "cost"}` or `"quality"` to
+# shift both thresholds for just that request (doubled for "cost", halved for
+# "quality") without touching the operator's own configured defaults.
+
+# [auto_routing]
+# simple_model = "openai/gpt-4o-mini"
+# medium_model = "smart"
+# complex_model = "anthropic/claude-opus-4-8"
+# simple_max_score = 200
+# medium_max_score = 800
