@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -486,6 +486,26 @@ pub async fn provider_stats(State(state): State<AppState>, headers: HeaderMap) -
         .collect();
 
     Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct GenerationQuery {
+    id: String,
+}
+
+pub async fn generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GenerationQuery>,
+) -> Response {
+    if let Some(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+
+    match state.router.generation(&query.id) {
+        Some(record) => Json(record).into_response(),
+        None => json_error(404, "no generation found for that id"),
+    }
 }
 
 pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {

@@ -371,6 +371,31 @@ async fn chat_completions_success_roundtrips_through_a_mocked_provider() {
             >= 0.0
     );
     assert_eq!(stats_entries[0]["uptime"], 1.0);
+
+    // The router should also have recorded this request for per-id lookup
+    // via /v1/generation?id=, keyed by the response's own `id` (assigned
+    // by this router's adapter, not the mocked upstream body's "id").
+    let id = body["id"].as_str().unwrap();
+    let generation_resp = reqwest::get(format!("{base_url}/v1/generation?id={id}"))
+        .await
+        .unwrap();
+    assert_eq!(generation_resp.status(), 200);
+    let generation: Value = generation_resp.json().await.unwrap();
+    assert_eq!(generation["id"], id);
+    assert_eq!(generation["model"], "openai/gpt-4o-mini");
+    assert_eq!(generation["prompt_tokens"], 10);
+    assert_eq!(generation["completion_tokens"], 5);
+    assert_eq!(generation["total_tokens"], 15);
+}
+
+#[tokio::test]
+async fn generation_endpoint_returns_404_for_an_unknown_id() {
+    let base_url = spawn_app("providers = {}").await;
+
+    let resp = reqwest::get(format!("{base_url}/v1/generation?id=chatcmpl-unknown"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]

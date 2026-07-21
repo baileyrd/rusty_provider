@@ -47,6 +47,58 @@ pub struct ProviderStats {
     pub uptime: Option<f64>,
 }
 
+/// Max number of individual request records `GenerationCache` retains for
+/// `GET /v1/generation?id=` lookups before evicting the oldest -- a
+/// recent-history cache, not a durable audit log, so an unbounded size
+/// isn't the right tradeoff here.
+const GENERATION_CACHE_CAPACITY: usize = 1000;
+
+/// One completed request's token/cost breakdown, as returned by
+/// `GET /v1/generation?id=` -- the OpenAI-shaped `id` from that request's
+/// `ChatResponse`/final `ChatChunk` is the lookup key.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GenerationRecord {
+    pub id: String,
+    /// The fully-qualified "provider/model" that served this request.
+    pub model: String,
+    pub created: i64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    /// Same unpriced-means-absent convention as `ChatResponse::cost_usd`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// Fixed-capacity, insertion-order-evicting cache of recent
+/// `GenerationRecord`s, keyed by request id. Not a general-purpose LRU --
+/// only insertion order is tracked, so a lookup doesn't refresh an
+/// entry's position; that's the right tradeoff for "how long ago was this
+/// requested," which is monotonic with insertion order anyway.
+#[derive(Debug, Default)]
+struct GenerationCache {
+    order: std::collections::VecDeque<String>,
+    by_id: HashMap<String, GenerationRecord>,
+}
+
+impl GenerationCache {
+    fn insert(&mut self, record: GenerationRecord) {
+        if !self.by_id.contains_key(&record.id) {
+            self.order.push_back(record.id.clone());
+            if self.order.len() > GENERATION_CACHE_CAPACITY {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.by_id.remove(&oldest);
+                }
+            }
+        }
+        self.by_id.insert(record.id.clone(), record);
+    }
+
+    fn get(&self, id: &str) -> Option<GenerationRecord> {
+        self.by_id.get(id).cloned()
+    }
+}
+
 /// Cumulative request/token/cost counters for one "provider/model", as
 /// returned by `GET /v1/usage`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -312,6 +364,14 @@ pub struct Router {
     /// `usage` above resets on restart and is never shared across
     /// processes.
     persistence: Option<Arc<Persistence>>,
+    /// Most recent individual request records, for `GET /v1/generation?id=`
+    /// lookups -- bounded to `GENERATION_CACHE_CAPACITY`, oldest evicted
+    /// first once full. `Arc`-wrapped for the same reason as `usage`: a
+    /// streaming response's instrumentation outlives `dispatch_stream`
+    /// itself. Always in-memory only, with no `persistence` backing (unlike
+    /// `usage`) -- this is a short-lived "what did my last request cost"
+    /// lookup, not a durable audit log.
+    generations: Arc<RwLock<GenerationCache>>,
     /// Prometheus counters/histograms/gauges for `GET /metrics`, updated at
     /// the same points as `latency`/`throughput`/`usage` above. Always
     /// per-process, even when `persistence` is configured — Prometheus
@@ -570,6 +630,7 @@ impl Router {
             throughput: Arc::new(RwLock::new(HashMap::new())),
             usage: Arc::new(RwLock::new(usage)),
             persistence,
+            generations: Arc::new(RwLock::new(GenerationCache::default())),
             metrics,
             provider_rpm,
             outbound_limiter: RateLimiter::new(),
@@ -670,6 +731,20 @@ impl Router {
             }
         }
         self.usage.read().unwrap().clone()
+    }
+
+    /// Records one completed request's token/cost breakdown for later
+    /// `GET /v1/generation?id=` lookup.
+    fn record_generation(&self, record: GenerationRecord) {
+        self.generations.write().unwrap().insert(record);
+    }
+
+    /// Looks up a single completed request's token/cost breakdown by its
+    /// response `id`, for `GET /v1/generation?id=`. `None` if this
+    /// process never served that id, or served it long enough ago to have
+    /// been evicted from the bounded cache (see `GENERATION_CACHE_CAPACITY`).
+    pub fn generation(&self, id: &str) -> Option<GenerationRecord> {
+        self.generations.read().unwrap().get(id)
     }
 
     /// `Ok(())` if `client_name` has no configured `budget_usd`, or
@@ -1086,6 +1161,7 @@ impl Router {
         let persistence = self.persistence.clone();
         let pricing = self.pricing.clone();
         let metrics = self.metrics.clone();
+        let generations = self.generations.clone();
 
         let instrumented = stream.map(move |mut item| {
             if let Ok(chunk) = &mut item {
@@ -1101,6 +1177,15 @@ impl Router {
                         let cost = record_usage(&usage_map, persistence.as_deref(), &pricing, &provider_name, &model_name, &usage);
                         metrics.record_tokens_and_cost(&provider_name, &model_name, usage.prompt_tokens, usage.completion_tokens, cost);
                         chunk.cost_usd = cost;
+                        generations.write().unwrap().insert(GenerationRecord {
+                            id: chunk.id.clone(),
+                            model: chunk.model.clone(),
+                            created: chunk.created,
+                            prompt_tokens: usage.prompt_tokens as u64,
+                            completion_tokens: usage.completion_tokens as u64,
+                            total_tokens: usage.total_tokens as u64,
+                            cost_usd: cost,
+                        });
                     }
                 }
             }
@@ -1183,6 +1268,15 @@ impl Router {
                             cost,
                         );
                         resp.cost_usd = cost;
+                        self.record_generation(GenerationRecord {
+                            id: resp.id.clone(),
+                            model: resp.model.clone(),
+                            created: resp.created,
+                            prompt_tokens: usage.prompt_tokens as u64,
+                            completion_tokens: usage.completion_tokens as u64,
+                            total_tokens: usage.total_tokens as u64,
+                            cost_usd: cost,
+                        });
                     }
 
                     return Ok(resp);
@@ -1340,6 +1434,7 @@ mod tests {
             throughput: Arc::new(RwLock::new(HashMap::new())),
             usage: Arc::new(RwLock::new(HashMap::new())),
             persistence: None,
+            generations: Arc::new(RwLock::new(GenerationCache::default())),
             metrics: Metrics::new(),
             provider_rpm: provider_rpm
                 .into_iter()
@@ -2159,6 +2254,66 @@ mod tests {
         assert_eq!(openai.latency_ms, Some(100.0));
         assert_eq!(openai.throughput_tokens_per_sec, None);
         assert_eq!(openai.uptime, None);
+    }
+
+    // --- generation / GenerationCache -----------------------------------------
+
+    fn generation_record(id: &str) -> GenerationRecord {
+        GenerationRecord {
+            id: id.to_string(),
+            model: "anthropic/m1".to_string(),
+            created: 1_700_000_000,
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cost_usd: Some(0.001),
+        }
+    }
+
+    #[test]
+    fn generation_is_none_for_an_unknown_id() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        assert!(router.generation("chatcmpl-unknown").is_none());
+    }
+
+    #[test]
+    fn generation_returns_a_previously_recorded_record() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router.record_generation(generation_record("chatcmpl-abc"));
+
+        let record = router.generation("chatcmpl-abc").expect("should be found");
+        assert_eq!(record.model, "anthropic/m1");
+        assert_eq!(record.prompt_tokens, 10);
+        assert_eq!(record.completion_tokens, 5);
+        assert_eq!(record.total_tokens, 15);
+        assert_eq!(record.cost_usd, Some(0.001));
+    }
+
+    #[test]
+    fn generation_cache_evicts_the_oldest_entry_once_over_capacity() {
+        let mut cache = GenerationCache::default();
+        for i in 0..GENERATION_CACHE_CAPACITY {
+            cache.insert(generation_record(&format!("id-{i}")));
+        }
+        assert!(cache.get("id-0").is_some());
+
+        // One more insert past capacity must evict the oldest ("id-0").
+        cache.insert(generation_record("id-overflow"));
+        assert!(cache.get("id-0").is_none());
+        assert!(cache.get("id-1").is_some());
+        assert!(cache.get("id-overflow").is_some());
+    }
+
+    #[test]
+    fn generation_cache_reinserting_an_existing_id_does_not_evict() {
+        let mut cache = GenerationCache::default();
+        cache.insert(generation_record("id-a"));
+        cache.insert(generation_record("id-b"));
+        // Re-inserting an already-present id must overwrite in place, not
+        // consume another slot toward the eviction count.
+        cache.insert(generation_record("id-a"));
+        assert!(cache.get("id-a").is_some());
+        assert!(cache.get("id-b").is_some());
     }
 
     // --- resolve_chain -----------------------------------------------------
