@@ -130,3 +130,18 @@ completion_per_million = 0.79
 # name = "openclaw"
 # api_key_env = "CLIENT_OPENCLAW_API_KEY"
 # requests_per_minute = 120
+
+# --- Persistence (optional) ---------------------------------------------------
+# By default, GET /v1/usage's cumulative request/token/cost totals live only
+# in memory: they reset on restart and each process only knows about its own
+# traffic. Uncomment this to persist them to a SQLite file instead (created
+# automatically if it doesn't exist) -- restarts keep their history, and
+# multiple rusty_provider processes pointed at the same file report a
+# consistent combined total. This is a single file, not a distributed
+# database: fine for multiple processes on one host or a shared local volume,
+# not for processes spread across different machines over a network
+# filesystem. An invalid path is a startup warning, not a hard failure -- the
+# router falls back to in-memory-only tracking rather than refusing to start.
+
+# [persistence]
+# sqlite_path = "usage.db"

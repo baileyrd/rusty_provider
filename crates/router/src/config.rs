@@ -105,6 +105,19 @@ pub struct ClientConfig {
     pub requests_per_minute: u32,
 }
 
+/// Durable storage for cumulative usage/cost stats, so they survive a
+/// restart and stay consistent across multiple router processes sharing
+/// the same file (e.g. on one host, or a shared local volume — this is a
+/// single SQLite file, not a distributed/multi-host store). Omit this
+/// section entirely to keep the original in-memory-only behavior, which
+/// resets on every restart and is never shared across processes.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PersistenceConfig {
+    /// Path to a SQLite database file. Created (along with the
+    /// `usage_stats` table) on first use if it doesn't already exist.
+    pub sqlite_path: String,
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
     #[serde(default)]
@@ -117,6 +130,8 @@ pub struct Config {
     pub pricing: Vec<PricingEntry>,
     #[serde(default)]
     pub clients: Vec<ClientConfig>,
+    #[serde(default)]
+    pub persistence: Option<PersistenceConfig>,
 }
 
 impl Config {

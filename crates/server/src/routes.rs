@@ -270,6 +270,7 @@ pub async fn usage_stats(State(state): State<AppState>, headers: HeaderMap) -> R
     let data: Vec<UsageEntry> = state
         .router
         .usage_snapshot()
+        .await
         .into_iter()
         .map(|(model, stats)| UsageEntry { model, stats })
         .collect();

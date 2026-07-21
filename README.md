@@ -154,8 +154,10 @@ since the process started:
 }
 ```
 
-Like the latency/throughput metrics, this is in-memory only — it resets on
-restart and isn't persisted or shared across processes. `cost_usd` only
+Like the latency/throughput metrics, this is in-memory only by default —
+it resets on restart and isn't shared across processes, unless you
+configure `[persistence]` (see below), in which case it survives restarts
+and reflects every process sharing the same database. `cost_usd` only
 accumulates for models with a `[[pricing]]` entry; it stays `0.0` for
 everything else (which means "unpriced," not "free" — `requests` and
 `*_tokens` still count normally regardless of pricing).
@@ -239,6 +241,40 @@ up in `GET /metrics` (`rusty_provider_dispatch_attempts_total` with
 the same in-memory, per-process, resets-on-restart token buckets as
 everything else this router tracks itself.
 
+## Persistence
+
+By default, cumulative usage/cost stats (`GET /v1/usage`) live only in
+memory — they reset on restart and each process only knows about its own
+traffic. Setting `[persistence]` in config switches that to a durable
+SQLite file:
+
+```toml
+[persistence]
+sqlite_path = "usage.db"
+```
+
+The file (and its `usage_stats` table) is created automatically if it
+doesn't exist. Every completed request/streamed response persists its
+usage delta to it, and `GET /v1/usage` reads fresh from the file rather
+than an in-memory cache — so restarting the process doesn't lose history,
+and multiple `rusty_provider` processes pointed at the same file (e.g. on
+one host, behind a load balancer) report a consistent combined total
+rather than each only seeing its own slice of traffic.
+
+This is a single SQLite file, not a distributed database — it works well
+for multiple processes on one host or a shared local volume, but isn't
+meant for processes spread across different machines over a network
+filesystem. Persisting is best-effort and asynchronous: if the database
+becomes briefly unavailable, requests still succeed and `GET /v1/usage`
+falls back to that process's in-memory view rather than erroring. An
+invalid `sqlite_path` (e.g. the parent directory doesn't exist) is a
+startup warning, not a hard failure — the router falls back to
+in-memory-only tracking rather than refusing to start.
+
+`GET /metrics` (Prometheus) is unaffected by this setting and always
+stays per-process — Prometheus aggregates across processes at scrape
+time via its own query layer, not here.
+
 ## Config
 
 See `config.example.toml`. Provider API keys are always read from
@@ -274,10 +310,12 @@ rather than fail loudly.
 
 ## Not yet implemented
 
-- Billing / spend-based limits (cost estimation, cumulative usage
-  tracking, and requests-per-minute rate limiting are supported — see
-  `cost_usd`, `GET /v1/usage`, and Rate limiting above — but there's no
-  persistence, multi-process aggregation, or spend-based enforcement, e.g.
-  cutting a client off once they've cost you $X rather than once they've
-  sent N requests/minute)
+- Spend-based enforcement (cost estimation, cumulative usage tracking —
+  now optionally persisted across restarts and processes, see
+  Persistence above — and requests-per-minute rate limiting are
+  supported, but there's no cutting a client off once they've cost you
+  $X rather than once they've sent N requests/minute)
+- Multi-host/distributed usage aggregation (persistence is a single
+  SQLite file shared by processes on one host or a shared volume, not a
+  networked database multiple machines can write to)
 - Multi-turn image or audio content
