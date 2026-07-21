@@ -29,6 +29,7 @@ toml = "0.8"
 axum = { version = "0.7", features = ["json"] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
+prometheus = "0.13"
 
 rp-core = { path = "crates/core" }
 rp-providers = { path = "crates/providers" }

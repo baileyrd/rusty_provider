@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod metrics;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -7,6 +8,7 @@ use std::time::Instant;
 
 pub use config::{Config, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig};
 pub use error::RouterError;
+pub use metrics::Metrics;
 
 use futures::stream::StreamExt;
 use rp_core::{ChatRequest, ChatResponse, ChatStream, Provider, ProviderPreferences, Usage};
@@ -35,10 +37,10 @@ pub struct UsageStats {
 /// API key env var was set), the named fallback-chain aliases, static
 /// per-model pricing (used for `provider.sort: "price"` and for computing
 /// each response's `cost_usd`), and running metrics — latency/throughput
-/// averages and cumulative usage/cost — from this router's own observed
-/// traffic. Model strings are resolved to a chain of (provider, model)
-/// pairs and tried in order, falling back on retryable errors (rate
-/// limits, timeouts, 5xxs).
+/// averages, cumulative usage/cost, and the Prometheus registry backing
+/// them — from this router's own observed traffic. Model strings are
+/// resolved to a chain of (provider, model) pairs and tried in order,
+/// falling back on retryable errors (rate limits, timeouts, 5xxs).
 pub struct Router {
     providers: HashMap<String, Arc<dyn Provider>>,
     routes: HashMap<String, Vec<String>>,
@@ -59,6 +61,9 @@ pub struct Router {
     /// `dispatch_stream` itself — the router hands the stream off to the
     /// HTTP layer rather than consuming it.
     usage: Arc<RwLock<HashMap<String, UsageStats>>>,
+    /// Prometheus counters/histograms/gauges for `GET /metrics`, updated at
+    /// the same points as `latency`/`throughput`/`usage` above.
+    metrics: Metrics,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -116,6 +121,7 @@ fn record_usage(
 
 impl Router {
     pub fn from_config(config: &Config) -> Self {
+        let metrics = Metrics::new();
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
 
         for (name, cfg) in &config.providers {
@@ -123,6 +129,7 @@ impl Router {
                 Ok(k) if !k.is_empty() => k,
                 _ => {
                     tracing::warn!(provider = %name, env_var = %cfg.api_key_env, "skipping provider: API key env var not set");
+                    metrics.set_provider_configured(name, false);
                     continue;
                 }
             };
@@ -138,6 +145,7 @@ impl Router {
                 }
                 ProviderKind::Gemini => Arc::new(GeminiProvider::new(cfg.base_url.clone(), key)),
             };
+            metrics.set_provider_configured(name, true);
             providers.insert(name.clone(), provider);
         }
 
@@ -173,6 +181,7 @@ impl Router {
             latency: RwLock::new(HashMap::new()),
             throughput: Arc::new(RwLock::new(HashMap::new())),
             usage: Arc::new(RwLock::new(HashMap::new())),
+            metrics,
         }
     }
 
@@ -188,6 +197,12 @@ impl Router {
     /// `GET /v1/usage`.
     pub fn usage_snapshot(&self) -> HashMap<String, UsageStats> {
         self.usage.read().unwrap().clone()
+    }
+
+    /// Every registered metric rendered in the Prometheus text exposition
+    /// format, for `GET /metrics`.
+    pub fn render_prometheus_metrics(&self) -> String {
+        self.metrics.render()
     }
 
     /// Resolve a client-supplied `model` string into an ordered chain of
@@ -276,9 +291,10 @@ impl Router {
 
     /// Wrap a streaming response so that whichever chunk carries the final
     /// `usage` (completion token count) also records a throughput sample
-    /// and cumulative usage/cost, stamping the chunk's own `cost_usd` in
-    /// the process — the router hands the stream off to the HTTP layer to
-    /// consume, so this is the only point where it gets to touch it.
+    /// and cumulative usage/cost/metrics, stamping the chunk's own
+    /// `cost_usd` in the process — the router hands the stream off to the
+    /// HTTP layer to consume, so this is the only point where it gets to
+    /// touch it.
     fn instrument_stream(
         &self,
         provider_name: String,
@@ -289,6 +305,7 @@ impl Router {
         let throughput = self.throughput.clone();
         let usage_map = self.usage.clone();
         let pricing = self.pricing.clone();
+        let metrics = self.metrics.clone();
 
         let instrumented = stream.map(move |mut item| {
             if let Ok(chunk) = &mut item {
@@ -298,9 +315,12 @@ impl Router {
                         if elapsed_secs > 0.0 {
                             let tps = usage.completion_tokens as f64 / elapsed_secs;
                             ewma_record(&throughput, format!("{provider_name}/{model_name}"), tps);
+                            metrics.observe_throughput_tps(&provider_name, &model_name, tps);
                             tracing::debug!(provider = %provider_name, model = %model_name, tokens_per_sec = tps, "recorded throughput");
                         }
-                        chunk.cost_usd = record_usage(&usage_map, &pricing, &provider_name, &model_name, &usage);
+                        let cost = record_usage(&usage_map, &pricing, &provider_name, &model_name, &usage);
+                        metrics.record_tokens_and_cost(&provider_name, &model_name, usage.prompt_tokens, usage.completion_tokens, cost);
+                        chunk.cost_usd = cost;
                     }
                 }
             }
@@ -319,6 +339,8 @@ impl Router {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(provider = %provider_name, "skipping candidate: {e}");
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "not_configured");
                     last_err = Some(e);
                     continue;
                 }
@@ -333,6 +355,10 @@ impl Router {
                         format!("{provider_name}/{model_name}"),
                         elapsed_secs * 1000.0,
                     );
+                    self.metrics
+                        .observe_latency_seconds(provider_name, model_name, elapsed_secs);
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "success");
                     tracing::debug!(provider = %provider_name, model = %model_name, elapsed_ms = elapsed_secs * 1000.0, "recorded latency");
 
                     if let Some(usage) = resp.usage.clone() {
@@ -343,24 +369,40 @@ impl Router {
                                 format!("{provider_name}/{model_name}"),
                                 tps,
                             );
+                            self.metrics
+                                .observe_throughput_tps(provider_name, model_name, tps);
                             tracing::debug!(provider = %provider_name, model = %model_name, tokens_per_sec = tps, "recorded throughput");
                         }
-                        resp.cost_usd = record_usage(
+                        let cost = record_usage(
                             &self.usage,
                             &self.pricing,
                             provider_name,
                             model_name,
                             &usage,
                         );
+                        self.metrics.record_tokens_and_cost(
+                            provider_name,
+                            model_name,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            cost,
+                        );
+                        resp.cost_usd = cost;
                     }
 
                     return Ok(resp);
                 }
                 Err(e) if e.is_retryable() => {
                     tracing::warn!(provider = %provider_name, model = %model_name, "provider failed, falling back: {e}");
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "retryable_error");
                     last_err = Some(RouterError::Provider(e));
                 }
-                Err(e) => return Err(RouterError::Provider(e)),
+                Err(e) => {
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "error");
+                    return Err(RouterError::Provider(e));
+                }
             }
         }
 
@@ -377,6 +419,8 @@ impl Router {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(provider = %provider_name, "skipping candidate: {e}");
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "not_configured");
                     last_err = Some(e);
                     continue;
                 }
@@ -391,6 +435,13 @@ impl Router {
                         format!("{provider_name}/{model_name}"),
                         elapsed_ms,
                     );
+                    self.metrics.observe_latency_seconds(
+                        provider_name,
+                        model_name,
+                        elapsed_ms / 1000.0,
+                    );
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "success");
                     tracing::debug!(provider = %provider_name, model = %model_name, elapsed_ms, "recorded latency (time to first byte)");
 
                     return Ok(self.instrument_stream(
@@ -402,9 +453,15 @@ impl Router {
                 }
                 Err(e) if e.is_retryable() => {
                     tracing::warn!(provider = %provider_name, model = %model_name, "provider failed, falling back: {e}");
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "retryable_error");
                     last_err = Some(RouterError::Provider(e));
                 }
-                Err(e) => return Err(RouterError::Provider(e)),
+                Err(e) => {
+                    self.metrics
+                        .record_attempt(provider_name, model_name, "error");
+                    return Err(RouterError::Provider(e));
+                }
             }
         }
 
