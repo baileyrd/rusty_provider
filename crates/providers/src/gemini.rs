@@ -194,6 +194,7 @@ fn content_to_parts(content: &MessageContent) -> Vec<Value> {
                 ContentPart::Text { text } => json!({"text": text}),
                 ContentPart::ImageUrl { image_url } => image_part(&image_url.url),
                 ContentPart::InputAudio { input_audio } => audio_part(input_audio),
+                ContentPart::File { file } => file_part(&file.file_data),
             })
             .collect(),
     }
@@ -212,6 +213,19 @@ fn image_part(url: &str) -> Value {
         }),
         None => json!({
             "fileData": {"mimeType": guess_mime_type(url), "fileUri": url},
+        }),
+    }
+}
+
+/// Same `inlineData`/`fileData` split as `image_part`, for a `file`
+/// content part (currently only exercised for PDFs).
+fn file_part(url: &str) -> Value {
+    match parse_data_uri(url) {
+        Some((mime_type, data)) => json!({
+            "inlineData": {"mimeType": mime_type, "data": data},
+        }),
+        None => json!({
+            "fileData": {"mimeType": guess_file_mime_type(url), "fileUri": url},
         }),
     }
 }
@@ -235,6 +249,18 @@ fn guess_mime_type(url: &str) -> &'static str {
         "gif" => "image/gif",
         "webp" => "image/webp",
         _ => "image/jpeg",
+    }
+}
+
+/// Same idea as `guess_mime_type`, but for a `file` part -- defaults to
+/// `application/pdf` rather than an image type, since PDF is the only
+/// document kind this router's `file` content part is exercised for today.
+fn guess_file_mime_type(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "txt" => "text/plain",
+        _ => "application/pdf",
     }
 }
 

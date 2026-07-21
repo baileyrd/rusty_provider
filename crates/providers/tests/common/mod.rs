@@ -1,6 +1,6 @@
 use rp_core::{
-    ChatMessage, ChatRequest, ContentPart, ImageUrl, InputAudio, JsonSchemaFormat, MessageContent,
-    ReasoningConfig, ResponseFormat, Role, Tool,
+    ChatMessage, ChatRequest, ContentPart, FileData, ImageUrl, InputAudio, JsonSchemaFormat,
+    MessageContent, ReasoningConfig, ResponseFormat, Role, Tool,
 };
 
 /// A minimal single-user-turn request, for tests that don't care about the
@@ -74,6 +74,60 @@ pub fn request_with_audio(model: &str) -> ChatRequest {
                 input_audio: InputAudio {
                     data: "aGVsbG8=".to_string(),
                     format: "wav".to_string(),
+                },
+            },
+        ])),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning: None,
+        cache_control: None,
+    }];
+    req
+}
+
+/// Same as [`simple_request`], but the user turn's content is a
+/// multimodal parts array (text + a base64 `data:` PDF), for tests
+/// exercising file content translation.
+pub fn request_with_file(model: &str) -> ChatRequest {
+    let mut req = simple_request(model);
+    req.messages = vec![ChatMessage {
+        role: Role::User,
+        content: Some(MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "summarize this document".to_string(),
+            },
+            ContentPart::File {
+                file: FileData {
+                    file_data: "data:application/pdf;base64,aGVsbG8=".to_string(),
+                    filename: Some("doc.pdf".to_string()),
+                },
+            },
+        ])),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning: None,
+        cache_control: None,
+    }];
+    req
+}
+
+/// Same as [`request_with_file`], but the file is a remote URL rather than
+/// inline base64 data, for tests exercising the other half of each
+/// adapter's data-URI-vs-URL translation split.
+pub fn request_with_remote_file(model: &str) -> ChatRequest {
+    let mut req = simple_request(model);
+    req.messages = vec![ChatMessage {
+        role: Role::User,
+        content: Some(MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "summarize this document".to_string(),
+            },
+            ContentPart::File {
+                file: FileData {
+                    file_data: "https://example.com/doc.pdf".to_string(),
+                    filename: None,
                 },
             },
         ])),

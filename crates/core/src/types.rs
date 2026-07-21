@@ -125,7 +125,9 @@ impl MessageContent {
                 .iter()
                 .filter_map(|part| match part {
                     ContentPart::Text { text } => Some(text.as_str()),
-                    ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => None,
+                    ContentPart::ImageUrl { .. }
+                    | ContentPart::InputAudio { .. }
+                    | ContentPart::File { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join(""),
@@ -135,13 +137,14 @@ impl MessageContent {
 
 /// One part of a multimodal message's content array, in the OpenAI
 /// `content: [{"type": "text", ...}, {"type": "image_url", ...},
-/// {"type": "input_audio", ...}]` shape.
+/// {"type": "input_audio", ...}, {"type": "file", ...}]` shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrl },
     InputAudio { input_audio: InputAudio },
+    File { file: FileData },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +154,16 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// A file attachment (currently only exercised for PDFs), per the OpenAI
+/// convention -- same shape as `ImageUrl`: `file_data` is either a
+/// `data:<mime>;base64,<data>` URI or an `https://` URL.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileData {
+    pub file_data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
