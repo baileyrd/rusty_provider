@@ -517,7 +517,8 @@ async fn chat_completions_enforces_per_client_inbound_rate_limit() {
     });
 
     // First request passes the rate limiter (no provider is configured, so
-    // it still fails downstream, but not with a rate-limit response).
+    // it still fails downstream, but not with a rate-limit response) --
+    // and, having consumed its only token, carries X-RateLimit-Remaining: 0.
     let first = client
         .post(format!("{base_url}/v1/chat/completions"))
         .bearer_auth("client-secret")
@@ -526,6 +527,9 @@ async fn chat_completions_enforces_per_client_inbound_rate_limit() {
         .await
         .unwrap();
     assert_ne!(first.status(), 429);
+    assert_eq!(first.headers().get("x-ratelimit-limit").unwrap(), "1");
+    assert_eq!(first.headers().get("x-ratelimit-remaining").unwrap(), "0");
+    assert!(first.headers().get("x-ratelimit-reset").is_some());
 
     // Second request within the same minute is rejected by the limiter
     // before it ever reaches dispatch.
@@ -538,6 +542,9 @@ async fn chat_completions_enforces_per_client_inbound_rate_limit() {
         .unwrap();
     assert_eq!(second.status(), 429);
     assert!(second.headers().get("retry-after").is_some());
+    assert_eq!(second.headers().get("x-ratelimit-limit").unwrap(), "1");
+    assert_eq!(second.headers().get("x-ratelimit-remaining").unwrap(), "0");
+    assert!(second.headers().get("x-ratelimit-reset").is_some());
 
     let err: Value = second.json().await.unwrap();
     assert!(err["error"]["message"]

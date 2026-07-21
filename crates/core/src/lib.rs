@@ -5,7 +5,7 @@ mod types;
 
 pub use error::ProviderError;
 pub use provider::{ChatStream, Provider};
-pub use rate_limit::RateLimiter;
+pub use rate_limit::{RateLimitStatus, RateLimiter};
 pub use types::{
     CacheControl, ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, Choice,
     ChoiceLogprobs, ChunkChoice, ContentPart, FileData, FunctionCall, FunctionCallDelta,
