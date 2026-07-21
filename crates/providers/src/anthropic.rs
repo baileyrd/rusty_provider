@@ -305,6 +305,7 @@ impl Provider for AnthropicProvider {
                 completion_tokens: wire.usage.output_tokens,
                 total_tokens: wire.usage.input_tokens + wire.usage.output_tokens,
             }),
+            cost_usd: None,
         })
     }
 
@@ -490,5 +491,6 @@ fn empty_chunk(model: &str, delta: ChatMessageDelta, finish_reason: Option<Strin
             finish_reason,
         }],
         usage: None,
+        cost_usd: None,
     }
 }

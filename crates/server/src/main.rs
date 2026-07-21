@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let app = AxumRouter::new()
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::list_models))
+        .route("/v1/usage", get(routes::usage_stats))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())

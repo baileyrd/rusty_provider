@@ -193,6 +193,7 @@ impl Provider for OpenAiCompatibleProvider {
                 })
                 .collect(),
             usage: wire.usage.map(Into::into),
+            cost_usd: None,
         })
     }
 
@@ -249,6 +250,7 @@ impl Provider for OpenAiCompatibleProvider {
                         })
                         .collect(),
                     usage: wire.usage.map(Into::into),
+                    cost_usd: None,
                 }))
             }
         });

@@ -9,7 +9,7 @@ pub use config::{Config, PricingEntry, ProviderConfig, ProviderKind, RouteAlias,
 pub use error::RouterError;
 
 use futures::stream::StreamExt;
-use rp_core::{ChatRequest, ChatResponse, ChatStream, Provider, ProviderPreferences};
+use rp_core::{ChatRequest, ChatResponse, ChatStream, Provider, ProviderPreferences, Usage};
 use rp_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatibleProvider};
 
 /// Weight given to each new latency/throughput sample in its running
@@ -17,19 +17,33 @@ use rp_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatibleProvider};
 /// noise.
 const EWMA_ALPHA: f64 = 0.3;
 
+/// Cumulative request/token/cost counters for one "provider/model", as
+/// returned by `GET /v1/usage`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UsageStats {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Sum of every response's estimated cost. Only accumulates for
+    /// responses whose model had a `[[pricing]]` entry — requests to an
+    /// unpriced model still count toward `requests`/`*_tokens` but leave
+    /// this at 0.0, which is "unknown," not "free."
+    pub cost_usd: f64,
+}
+
 /// Holds every provider adapter that could be built from config (i.e. its
 /// API key env var was set), the named fallback-chain aliases, static
-/// per-model pricing (used only for `provider.sort: "price"` requests),
-/// and running averages of this router's own observed per-model response
-/// latency and generation throughput (used for `provider.sort: "latency"`
-/// / `"throughput"` requests). Model strings are resolved to a chain of
-/// (provider, model) pairs and tried in order, falling back on retryable
-/// errors (rate limits, timeouts, 5xxs).
+/// per-model pricing (used for `provider.sort: "price"` and for computing
+/// each response's `cost_usd`), and running metrics — latency/throughput
+/// averages and cumulative usage/cost — from this router's own observed
+/// traffic. Model strings are resolved to a chain of (provider, model)
+/// pairs and tried in order, falling back on retryable errors (rate
+/// limits, timeouts, 5xxs).
 pub struct Router {
     providers: HashMap<String, Arc<dyn Provider>>,
     routes: HashMap<String, Vec<String>>,
-    /// "provider/model" -> prompt price per million tokens.
-    pricing: HashMap<String, f64>,
+    /// "provider/model" -> (prompt price, completion price) per million tokens.
+    pricing: Arc<HashMap<String, (f64, f64)>>,
     /// Provider names with `zdr = true` in config.
     zdr_providers: HashSet<String>,
     /// "provider/model" -> EWMA response latency in milliseconds, measured
@@ -37,11 +51,14 @@ pub struct Router {
     /// resets on restart and isn't a live external feed.
     latency: RwLock<HashMap<String, f64>>,
     /// "provider/model" -> EWMA completion tokens/sec, measured the same
-    /// way. `Arc`-wrapped (unlike `latency`) so it can be shared into a
-    /// streaming response's instrumentation, which outlives `dispatch_stream`
-    /// itself — the router hands the stream off to the HTTP layer rather
-    /// than consuming it.
+    /// way.
     throughput: Arc<RwLock<HashMap<String, f64>>>,
+    /// "provider/model" -> cumulative usage/cost. `Arc`-wrapped (like
+    /// `throughput`, unlike `latency`) so it can be shared into a
+    /// streaming response's instrumentation, which outlives
+    /// `dispatch_stream` itself — the router hands the stream off to the
+    /// HTTP layer rather than consuming it.
+    usage: Arc<RwLock<HashMap<String, UsageStats>>>,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -66,6 +83,35 @@ fn ewma_lookup(
         .get(&format!("{provider}/{model}"))
         .copied()
         .unwrap_or(missing)
+}
+
+/// Compute a response's estimated USD cost (if `pricing` has an entry for
+/// "provider/model") and fold it, along with the raw token counts, into
+/// that entry's cumulative `UsageStats`. Returns the computed cost so the
+/// caller can attach it to the response/chunk sent back to the client.
+fn record_usage(
+    usage_map: &RwLock<HashMap<String, UsageStats>>,
+    pricing: &HashMap<String, (f64, f64)>,
+    provider: &str,
+    model: &str,
+    usage: &Usage,
+) -> Option<f64> {
+    let key = format!("{provider}/{model}");
+    let cost = pricing.get(&key).map(|(prompt_ppm, completion_ppm)| {
+        (usage.prompt_tokens as f64 * prompt_ppm + usage.completion_tokens as f64 * completion_ppm)
+            / 1_000_000.0
+    });
+
+    let mut map = usage_map.write().unwrap();
+    let stats = map.entry(key).or_default();
+    stats.requests += 1;
+    stats.prompt_tokens += usage.prompt_tokens as u64;
+    stats.completion_tokens += usage.completion_tokens as u64;
+    if let Some(cost) = cost {
+        stats.cost_usd += cost;
+    }
+
+    cost
 }
 
 impl Router {
@@ -104,7 +150,12 @@ impl Router {
         let pricing = config
             .pricing
             .iter()
-            .map(|p| (p.model.clone(), p.prompt_per_million))
+            .map(|p| {
+                (
+                    p.model.clone(),
+                    (p.prompt_per_million, p.completion_per_million),
+                )
+            })
             .collect();
 
         let zdr_providers = config
@@ -117,10 +168,11 @@ impl Router {
         Self {
             providers,
             routes,
-            pricing,
+            pricing: Arc::new(pricing),
             zdr_providers,
             latency: RwLock::new(HashMap::new()),
             throughput: Arc::new(RwLock::new(HashMap::new())),
+            usage: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -130,6 +182,12 @@ impl Router {
 
     pub fn route_aliases(&self) -> impl Iterator<Item = &str> {
         self.routes.keys().map(String::as_str)
+    }
+
+    /// Snapshot of cumulative usage/cost per "provider/model", for
+    /// `GET /v1/usage`.
+    pub fn usage_snapshot(&self) -> HashMap<String, UsageStats> {
+        self.usage.read().unwrap().clone()
     }
 
     /// Resolve a client-supplied `model` string into an ordered chain of
@@ -181,7 +239,7 @@ impl Router {
                 let price_of = |entry: &(String, String)| {
                     self.pricing
                         .get(&format!("{}/{}", entry.0, entry.1))
-                        .copied()
+                        .map(|(prompt_ppm, _)| *prompt_ppm)
                         .unwrap_or(f64::MAX)
                 };
                 price_of(a).total_cmp(&price_of(b))
@@ -217,10 +275,11 @@ impl Router {
     }
 
     /// Wrap a streaming response so that whichever chunk carries the final
-    /// `usage` (completion token count) also records a throughput sample,
-    /// without otherwise touching the stream — the router hands the stream
-    /// off to the HTTP layer to consume, it doesn't read it itself.
-    fn instrument_throughput(
+    /// `usage` (completion token count) also records a throughput sample
+    /// and cumulative usage/cost, stamping the chunk's own `cost_usd` in
+    /// the process — the router hands the stream off to the HTTP layer to
+    /// consume, so this is the only point where it gets to touch it.
+    fn instrument_stream(
         &self,
         provider_name: String,
         model_name: String,
@@ -228,19 +287,24 @@ impl Router {
         stream: ChatStream,
     ) -> ChatStream {
         let throughput = self.throughput.clone();
-        let instrumented = stream.inspect(move |item| {
-            let Ok(chunk) = item else { return };
-            let Some(usage) = &chunk.usage else { return };
-            if usage.completion_tokens == 0 {
-                return;
+        let usage_map = self.usage.clone();
+        let pricing = self.pricing.clone();
+
+        let instrumented = stream.map(move |mut item| {
+            if let Ok(chunk) = &mut item {
+                if let Some(usage) = chunk.usage.clone() {
+                    if usage.completion_tokens > 0 {
+                        let elapsed_secs = started_at.elapsed().as_secs_f64();
+                        if elapsed_secs > 0.0 {
+                            let tps = usage.completion_tokens as f64 / elapsed_secs;
+                            ewma_record(&throughput, format!("{provider_name}/{model_name}"), tps);
+                            tracing::debug!(provider = %provider_name, model = %model_name, tokens_per_sec = tps, "recorded throughput");
+                        }
+                        chunk.cost_usd = record_usage(&usage_map, &pricing, &provider_name, &model_name, &usage);
+                    }
+                }
             }
-            let elapsed_secs = started_at.elapsed().as_secs_f64();
-            if elapsed_secs <= 0.0 {
-                return;
-            }
-            let tps = usage.completion_tokens as f64 / elapsed_secs;
-            ewma_record(&throughput, format!("{provider_name}/{model_name}"), tps);
-            tracing::debug!(provider = %provider_name, model = %model_name, tokens_per_sec = tps, "recorded throughput");
+            item
         });
         Box::pin(instrumented)
     }
@@ -262,7 +326,7 @@ impl Router {
 
             let started_at = Instant::now();
             match provider.chat(req, model_name).await {
-                Ok(resp) => {
+                Ok(mut resp) => {
                     let elapsed_secs = started_at.elapsed().as_secs_f64();
                     ewma_record(
                         &self.latency,
@@ -271,7 +335,7 @@ impl Router {
                     );
                     tracing::debug!(provider = %provider_name, model = %model_name, elapsed_ms = elapsed_secs * 1000.0, "recorded latency");
 
-                    if let Some(usage) = &resp.usage {
+                    if let Some(usage) = resp.usage.clone() {
                         if usage.completion_tokens > 0 && elapsed_secs > 0.0 {
                             let tps = usage.completion_tokens as f64 / elapsed_secs;
                             ewma_record(
@@ -281,6 +345,13 @@ impl Router {
                             );
                             tracing::debug!(provider = %provider_name, model = %model_name, tokens_per_sec = tps, "recorded throughput");
                         }
+                        resp.cost_usd = record_usage(
+                            &self.usage,
+                            &self.pricing,
+                            provider_name,
+                            model_name,
+                            &usage,
+                        );
                     }
 
                     return Ok(resp);
@@ -322,7 +393,7 @@ impl Router {
                     );
                     tracing::debug!(provider = %provider_name, model = %model_name, elapsed_ms, "recorded latency (time to first byte)");
 
-                    return Ok(self.instrument_throughput(
+                    return Ok(self.instrument_stream(
                         provider_name.clone(),
                         model_name.clone(),
                         started_at,

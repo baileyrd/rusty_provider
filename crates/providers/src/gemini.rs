@@ -360,6 +360,7 @@ impl Provider for GeminiProvider {
                 completion_tokens: wire.usage_metadata.candidates_token_count,
                 total_tokens: wire.usage_metadata.total_token_count,
             }),
+            cost_usd: None,
         })
     }
 
@@ -428,6 +429,7 @@ impl Provider for GeminiProvider {
                         finish_reason,
                     }],
                     usage,
+                    cost_usd: None,
                 }))
             }
         });

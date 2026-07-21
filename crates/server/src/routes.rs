@@ -7,6 +7,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::{stream, StreamExt};
 use rp_core::{ChatRequest, ModelInfo};
+use rp_router::UsageStats;
+use serde::Serialize;
 use serde_json::json;
 
 use crate::errors::{json_error, router_error_response};
@@ -50,6 +52,28 @@ pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> R
             object: "model",
             owned_by: p.to_string(),
         }))
+        .collect();
+
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+#[derive(Serialize)]
+struct UsageEntry {
+    model: String,
+    #[serde(flatten)]
+    stats: UsageStats,
+}
+
+pub async fn usage_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+
+    let data: Vec<UsageEntry> = state
+        .router
+        .usage_snapshot()
+        .into_iter()
+        .map(|(model, stats)| UsageEntry { model, stats })
         .collect();
 
     Json(json!({ "object": "list", "data": data })).into_response()
