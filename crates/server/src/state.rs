@@ -4,10 +4,13 @@ use std::sync::Arc;
 use rp_core::RateLimiter;
 use rp_router::Router;
 
-use crate::budget::ClientBudgets;
-
 #[derive(Clone)]
 pub struct AppState {
+    /// Owns per-client spend budget tracking (`Router::check_client_budget`/
+    /// `record_client_spend`) in addition to dispatch -- there's no
+    /// separate client-budget type in this crate anymore, since sharing
+    /// state with `[persistence]` requires living alongside it in
+    /// `rp-router`.
     pub router: Arc<Router>,
     /// Bearer token clients must present to this router's own API, if
     /// `server.api_key_env` was set in config and the env var resolved.
@@ -23,7 +26,4 @@ pub struct AppState {
     /// bucketed by source IP. `None` means no limit for such callers.
     pub default_rate_limit_rpm: Option<u32>,
     pub rate_limiter: Arc<RateLimiter>,
-    /// Per-client spend tracking against each `[[clients]].budget_usd`, if
-    /// configured. A client with no configured budget is unrestricted.
-    pub client_budgets: Arc<ClientBudgets>,
 }

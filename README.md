@@ -317,40 +317,65 @@ cutoff — so the client's actual spend can end up somewhat over
 This only applies to named `[[clients]]`, the same as the rate-limiting
 client bucket — there's no budget for the IP-bucketed fallback used by
 unmatched callers, since there's no stable identity to track spend
-against. Like the rate limiter, this is in-memory, per-process, and
-resets on restart — it doesn't share state with `[persistence]`'s
-`GET /v1/usage` totals, even though both are derived from the same
-per-response `cost_usd`. Rejections show up in `GET /metrics` as
+against. Like the rest of this router's own tracking, spend is in-memory
+and per-process by default (resets on restart, not shared across
+processes) unless `[persistence]` is configured, in which case it's
+backed by the same SQLite file or Postgres database as `GET /v1/usage` —
+see Persistence below — and every process/host sharing that backend
+enforces the same budget consistently instead of each tracking its own
+slice of a client's traffic. Rejections show up in `GET /metrics` as
 `rusty_provider_client_budget_rejections_total`, labeled by client name.
 
 ## Persistence
 
-By default, cumulative usage/cost stats (`GET /v1/usage`) live only in
-memory — they reset on restart and each process only knows about its own
-traffic. Setting `[persistence]` in config switches that to a durable
-SQLite file:
+By default, cumulative usage/cost stats (`GET /v1/usage`) and each
+client's `budget_usd` spend tracking (see Spend budgets above) both live
+only in memory — they reset on restart and each process only knows about
+its own traffic. Setting `[persistence]` in config switches both to a
+durable, shared backend — either a single SQLite file, or a networked
+Postgres database:
 
 ```toml
+# Option 1: a single SQLite file.
 [persistence]
+backend = "sqlite"
 sqlite_path = "usage.db"
+
+# Option 2: a shared Postgres database.
+[persistence]
+backend = "postgres"
+postgres_url_env = "DATABASE_URL"
 ```
 
-The file (and its `usage_stats` table) is created automatically if it
-doesn't exist. Every completed request/streamed response persists its
-usage delta to it, and `GET /v1/usage` reads fresh from the file rather
-than an in-memory cache — so restarting the process doesn't lose history,
-and multiple `rusty_provider` processes pointed at the same file (e.g. on
-one host, behind a load balancer) report a consistent combined total
-rather than each only seeing its own slice of traffic.
+Either way, the schema (a `usage_stats` table and a `client_spend` table)
+is created automatically on first use if it doesn't exist. Every completed request/streamed response persists its usage delta
+(and, for budgeted clients, its spend delta) to the backend, and both
+`GET /v1/usage` and `check_client_budget` read fresh from it rather than
+an in-memory cache — so restarting a process doesn't lose history, and
+every `rusty_provider` process pointed at the same backend reports a
+consistent combined total and enforces the same budget, rather than each
+only seeing its own slice of traffic.
 
-This is a single SQLite file, not a distributed database — it works well
+**SQLite** is a single file, not a distributed database — it works well
 for multiple processes on one host or a shared local volume, but isn't
 meant for processes spread across different machines over a network
-filesystem. Persisting is best-effort and asynchronous: if the database
-becomes briefly unavailable, requests still succeed and `GET /v1/usage`
-falls back to that process's in-memory view rather than erroring. An
-invalid `sqlite_path` (e.g. the parent directory doesn't exist) is a
-startup warning, not a hard failure — the router falls back to
+filesystem. **Postgres** is the way to get that: any number of
+`rusty_provider` processes, on any number of hosts, pointed at the same
+database, see a consistent combined total and enforce budgets
+consistently across the whole fleet. Connections are unencrypted (no TLS
+support yet), so use a trusted network or an external tunnel; the
+connection string comes from the environment variable named by
+`postgres_url_env`, the same way provider/client API keys are kept out of
+the config file.
+
+Persisting is best-effort and asynchronous: if the database becomes
+briefly unavailable, requests still succeed, `GET /v1/usage` falls back
+to that process's in-memory view rather than erroring, and a client
+budget check treats an unreadable backend as "unspent" for that one
+check rather than blocking the request. An invalid/unreachable backend at
+startup (e.g. `sqlite_path`'s parent directory doesn't exist, or
+`postgres_url_env` names an unset env var or an unreachable database) is
+a startup warning, not a hard failure — the router falls back to
 in-memory-only tracking rather than refusing to start.
 
 `GET /metrics` (Prometheus) is unaffected by this setting and always
@@ -389,10 +414,3 @@ actually supports tool use, and that your `[[routes]]` fallback chain (if
 you use one) only includes models that do — a chain that silently falls
 back to a model without tool support will make the agent behave oddly
 rather than fail loudly.
-
-## Not yet implemented
-
-- Multi-host/distributed spend/usage aggregation (both `[[clients]].budget_usd`
-  and `[persistence]`'s `GET /v1/usage` totals are single-process or
-  single-SQLite-file, not a networked store multiple machines can share —
-  see Spend budgets and Persistence above)

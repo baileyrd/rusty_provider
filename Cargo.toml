@@ -32,6 +32,7 @@ tower-http = { version = "0.5", features = ["trace", "cors"] }
 prometheus = "0.13"
 wiremock = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-postgres = "0.7"
 
 rp-core = { path = "crates/core" }
 rp-providers = { path = "crates/providers" }

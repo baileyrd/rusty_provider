@@ -6,7 +6,6 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use rp_core::RateLimiter;
 use rp_router::{Config, Router as ProviderRouter};
-use rp_server::budget::ClientBudgets;
 use rp_server::build_app;
 use rp_server::state::AppState;
 use serde_json::{json, Value};
@@ -29,7 +28,7 @@ fn unique_env_var(label: &str) -> String {
 /// base URL to hit with a plain HTTP client.
 async fn spawn_app(config_toml: &str) -> String {
     let config = Config::from_toml_str(config_toml).expect("valid test config");
-    let router = Arc::new(ProviderRouter::from_config(&config));
+    let router = Arc::new(ProviderRouter::from_config(&config).await);
 
     let api_key = config
         .server
@@ -52,7 +51,6 @@ async fn spawn_app(config_toml: &str) -> String {
         client_keys: Arc::new(client_keys),
         default_rate_limit_rpm: config.server.default_rate_limit_rpm,
         rate_limiter: Arc::new(RateLimiter::new()),
-        client_budgets: Arc::new(ClientBudgets::from_clients(&config.clients)),
     };
 
     let app = build_app(state);

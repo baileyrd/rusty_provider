@@ -13,6 +13,21 @@ jobs:
   test:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    services:
+      # Backs the [persistence] backend = "postgres" tests in rp-router --
+      # they skip gracefully (not fail) if TEST_POSTGRES_URL isn't set, so
+      # this service is what makes them actually run in CI.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -32,3 +47,5 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+        env:
+          TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
