@@ -71,6 +71,31 @@ them into each provider's own tool-use convention (Anthropic's `tool_use`/
 parts) and translates `tool_calls` back into the OpenAI shape in the
 response — both streamed and non-streamed.
 
+A request can also constrain and order the resolved fallback chain with a
+`provider` field, independent of whether `model` was a direct
+`"provider/model"` or a route alias:
+
+```jsonc
+{
+  "model": "smart",
+  "provider": {
+    "only": ["anthropic", "openai"],   // drop every other candidate in the chain
+    "ignore": ["openai"],              // and then drop these too
+    "sort": "price"                    // stable-sort what's left, cheapest prompt price first
+  },
+  "messages": [{"role": "user", "content": "..."}]
+}
+```
+
+- `only` / `ignore` take provider names matching your `[providers.*]` config
+  keys (e.g. `"anthropic"`, `"groq"`) — `only` is applied first, then
+  `ignore`. If nothing survives, the request fails fast with `400` rather
+  than silently falling through to an unfiltered chain.
+- `sort: "price"` stable-sorts the remaining candidates ascending by the
+  prompt-token price configured in `[[pricing]]` (see `config.example.toml`)
+  — entries with no configured price sort last, keeping their relative
+  order. This is a static, operator-maintained price table, not a live feed.
+
 ### `GET /v1/models`
 
 Lists configured route aliases and `provider/*` for every provider with a
@@ -84,7 +109,8 @@ Liveness check.
 
 See `config.example.toml`. Provider API keys are always read from
 environment variables (named by `api_key_env`) — never stored in the
-config file itself.
+config file itself. `[[pricing]]` entries are optional and only affect
+requests that opt into `"provider": {"sort": "price"}`.
 
 ## Using with local agent tools (Hermes, OpenClaw, etc.)
 
@@ -112,7 +138,7 @@ rather than fail loudly.
 
 ## Not yet implemented
 
-- Per-request cost/latency-based routing (only manual model selection and
-  ordered fallback chains today)
+- Latency/throughput-based routing (price-based sort via `[[pricing]]` is
+  supported; there's no live latency/throughput telemetry to sort by)
 - Usage metering / billing
 - Multi-turn image or audio content

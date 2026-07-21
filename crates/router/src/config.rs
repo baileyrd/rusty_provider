@@ -60,6 +60,18 @@ pub struct RouteAlias {
     pub chain: Vec<String>,
 }
 
+/// Prompt/completion token pricing for one "provider/model" entry, used
+/// only for `provider.sort: "price"` requests — this is operator-supplied
+/// static data, not a live pricing feed, so keep it current by hand.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PricingEntry {
+    /// "provider/model", matching a `[[routes]]` chain entry.
+    pub model: String,
+    pub prompt_per_million: f64,
+    #[serde(default)]
+    pub completion_per_million: f64,
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
     #[serde(default)]
@@ -67,6 +79,8 @@ pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub routes: Vec<RouteAlias>,
+    #[serde(default)]
+    pub pricing: Vec<PricingEntry>,
 }
 
 impl Config {
