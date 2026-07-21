@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod metrics;
 mod persistence;
+mod webhook;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -11,11 +12,12 @@ use std::time::Instant;
 use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
     BudgetPeriod, ClientConfig, Config, PersistenceBackend, PersistenceConfig, PostgresTlsMode,
-    PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig,
+    PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig, WebhookConfig,
 };
 pub use error::RouterError;
 pub use metrics::Metrics;
 use persistence::{Persistence, PersistenceTarget};
+use webhook::WebhookNotifier;
 
 use futures::stream::StreamExt;
 use rp_core::{
@@ -181,6 +183,10 @@ pub struct Router {
     /// `client_spend` table is the source of truth instead and this map
     /// goes unused, mirroring how `usage`/`persistence` split their roles.
     client_spend: Mutex<HashMap<String, SpendState>>,
+    /// `[webhook]` delivery, if configured. `None` means budget events are
+    /// never pushed anywhere -- same as today, a `402` and a Prometheus
+    /// counter are all a client/operator sees.
+    webhook: Option<Arc<WebhookNotifier>>,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -381,6 +387,19 @@ impl Router {
 
         let client_budgets = client_budget::settings_from_clients(&config.clients);
 
+        let webhook = config.webhook.as_ref().map(|cfg| {
+            let auth_header = cfg.auth_header_env.as_ref().and_then(|var| {
+                match std::env::var(var) {
+                    Ok(v) if !v.is_empty() => Some(v),
+                    _ => {
+                        tracing::warn!(env_var = %var, "webhook auth_header_env is set but not resolvable; sending webhook requests with no Authorization header");
+                        None
+                    }
+                }
+            });
+            Arc::new(WebhookNotifier::new(cfg.url.clone(), auth_header))
+        });
+
         Self {
             providers,
             provider_kinds,
@@ -396,6 +415,7 @@ impl Router {
             outbound_limiter: RateLimiter::new(),
             client_budgets: RwLock::new(client_budgets),
             client_spend: Mutex::new(HashMap::new()),
+            webhook,
         }
     }
 
@@ -553,6 +573,9 @@ impl Router {
                 },
             );
         }
+        if let Some(webhook) = &self.webhook {
+            webhook.notify_budget_reset(client_name, setting.budget_usd, setting.period);
+        }
         true
     }
 
@@ -560,6 +583,15 @@ impl Router {
     /// `budget_period`. A no-op for clients with no configured budget —
     /// there's nothing to track against. Never blocks the caller on I/O
     /// when `[persistence]` is configured, the same as `record_usage`.
+    ///
+    /// If a `[webhook]` is configured and this call looks like it just
+    /// pushed `client_name` from under its budget to at-or-over it, fires
+    /// a `budget_exceeded` event (delivery itself never blocks the
+    /// caller). Under `[persistence]`, "just crossed" is a best-effort,
+    /// eventually-consistent read-back rather than an atomic
+    /// check-and-set, so concurrent requests to the same client near the
+    /// boundary could both fire (or, rarely, neither) -- same class of
+    /// caveat as the spend total itself already carries.
     pub fn record_client_spend(&self, client_name: &str, cost_usd: f64) {
         let Some(setting) = self
             .client_budgets
@@ -574,11 +606,46 @@ impl Router {
 
         if let Some(persistence) = &self.persistence {
             persistence.record_client_spend(client_name, current_key, cost_usd);
+            if let Some(webhook) = self.webhook.clone() {
+                let persistence = persistence.clone();
+                let client_name = client_name.to_string();
+                tokio::spawn(async move {
+                    if let Ok(Some((period_key, spent_usd))) =
+                        persistence.client_spend(&client_name).await
+                    {
+                        let before = spent_usd - cost_usd;
+                        if period_key == current_key
+                            && before < setting.budget_usd
+                            && spent_usd >= setting.budget_usd
+                        {
+                            webhook.notify_budget_exceeded(
+                                &client_name,
+                                spent_usd,
+                                setting.budget_usd,
+                                setting.period,
+                            );
+                        }
+                    }
+                });
+            }
         } else {
             let mut spend = self.client_spend.lock().unwrap();
             let state = spend.entry(client_name.to_string()).or_default();
             client_budget::roll_period_if_needed(state, current_key);
+            let before = state.spent_usd;
             state.spent_usd += cost_usd;
+            let after = state.spent_usd;
+            drop(spend);
+            if before < setting.budget_usd && after >= setting.budget_usd {
+                if let Some(webhook) = &self.webhook {
+                    webhook.notify_budget_exceeded(
+                        client_name,
+                        after,
+                        setting.budget_usd,
+                        setting.period,
+                    );
+                }
+            }
         }
     }
 
@@ -962,6 +1029,9 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream;
     use rp_core::{ChatChunk, ChatMessage, ChatMessageDelta, Choice, ChunkChoice, Role};
+    use serde_json::json;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
 
@@ -1016,6 +1086,7 @@ mod tests {
             outbound_limiter: RateLimiter::new(),
             client_budgets: RwLock::new(HashMap::new()),
             client_spend: Mutex::new(HashMap::new()),
+            webhook: None,
         }
     }
 
@@ -1415,6 +1486,149 @@ mod tests {
             router.client_spend_status("acme").await.unwrap().spent_usd,
             0.0
         );
+    }
+
+    // --- webhook -----------------------------------------------------------
+
+    fn router_with_budgeted_client_and_webhook(
+        budget_usd: f64,
+        webhook_url: String,
+        auth_header: Option<String>,
+    ) -> Router {
+        let router = router_with_budgeted_client(budget_usd, BudgetPeriod::Total);
+        Router {
+            webhook: Some(Arc::new(WebhookNotifier::new(webhook_url, auth_header))),
+            ..router
+        }
+    }
+
+    #[tokio::test]
+    async fn record_client_spend_fires_budget_exceeded_on_the_crossing_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_json(json!({
+                "event": "budget_exceeded",
+                "client": "acme",
+                "spent_usd": 12.0,
+                "budget_usd": 10.0,
+                "period": "total",
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let router = router_with_budgeted_client_and_webhook(10.0, server.uri(), None);
+        router.record_client_spend("acme", 8.0);
+        router.record_client_spend("acme", 4.0);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn record_client_spend_does_not_refire_once_already_over_budget() {
+        // `.expect(1)` on the mock means a second delivery would fail
+        // verification -- proving the second, already-over-budget request
+        // doesn't fire another event.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let router = router_with_budgeted_client_and_webhook(10.0, server.uri(), None);
+        router.record_client_spend("acme", 12.0);
+        router.record_client_spend("acme", 3.0);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn record_client_spend_sends_no_webhook_when_the_budget_is_not_crossed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let router = router_with_budgeted_client_and_webhook(10.0, server.uri(), None);
+        router.record_client_spend("acme", 4.0);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn record_client_spend_sends_the_configured_authorization_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("authorization", "Bearer s3cret"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let router = router_with_budgeted_client_and_webhook(
+            10.0,
+            server.uri(),
+            Some("Bearer s3cret".to_string()),
+        );
+        router.record_client_spend("acme", 12.0);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn reset_client_spend_fires_budget_reset() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_json(json!({
+                "event": "budget_reset",
+                "client": "acme",
+                "budget_usd": 10.0,
+                "period": "total",
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let router = router_with_budgeted_client_and_webhook(10.0, server.uri(), None);
+        assert!(router.reset_client_spend("acme"));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn reset_client_spend_sends_no_webhook_for_a_client_with_no_configured_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let router = Router {
+            webhook: Some(Arc::new(WebhookNotifier::new(server.uri(), None))),
+            ..router
+        };
+        assert!(!router.reset_client_spend("acme"));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        server.verify().await;
     }
 
     #[tokio::test]

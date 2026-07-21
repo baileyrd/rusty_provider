@@ -204,3 +204,17 @@ completion_per_million = 0.79
 # backend = "postgres"
 # postgres_url_env = "DATABASE_URL"
 # postgres_tls = "require"
+
+# --- Webhook (optional) --------------------------------------------------------
+# Without this, a client crossing its budget_usd only surfaces as a 402 on its
+# next request and the client_budget_rejections_total Prometheus counter -- no
+# push notification an operator can wire up proactively. Uncomment to have this
+# router POST a JSON event to `url` whenever a client's spend crosses its budget
+# ("budget_exceeded") or an operator manually resets a client's spend via the
+# admin API ("budget_reset"). Delivery is fire-and-forget: a slow or
+# unreachable receiver never adds latency to the request that triggered the
+# event, and a delivery failure is only logged, never surfaced to the client.
+
+# [webhook]
+# url = "https://hooks.example.com/rusty-provider"
+# auth_header_env = "WEBHOOK_AUTH_HEADER"  # e.g. set to "Bearer <token>"
