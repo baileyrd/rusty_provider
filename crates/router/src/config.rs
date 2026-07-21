@@ -232,6 +232,24 @@ pub struct Config {
     pub clients: Vec<ClientConfig>,
     #[serde(default)]
     pub persistence: Option<PersistenceConfig>,
+    #[serde(default)]
+    pub webhook: Option<WebhookConfig>,
+}
+
+/// Outbound webhook fired on budget-exceeded/reset events -- a proactive
+/// push notification on top of the `402` a client already sees on its next
+/// request and the `client_budget_rejections_total` Prometheus counter, so
+/// an operator can wire up alerting without polling either.
+#[derive(Debug, Deserialize, Clone)]
+pub struct WebhookConfig {
+    /// URL this router POSTs a JSON event payload to.
+    pub url: String,
+    /// Name of the environment variable holding the exact value to send
+    /// as this POST's `Authorization` header (e.g. `"Bearer <token>"`),
+    /// so the receiver can verify the request came from this router.
+    /// Unset means no `Authorization` header is sent.
+    #[serde(default)]
+    pub auth_header_env: Option<String>,
 }
 
 impl Config {

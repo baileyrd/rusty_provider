@@ -593,6 +593,43 @@ enforces the same budget consistently instead of each tracking its own
 slice of a client's traffic. Rejections show up in `GET /metrics` as
 `rusty_provider_client_budget_rejections_total`, labeled by client name.
 
+### Webhook notifications
+
+Without more, a client crossing its budget only surfaces as the `402`
+above and that Prometheus counter — nothing an operator can act on
+proactively. `[webhook]` adds a push notification on top:
+
+```toml
+[webhook]
+url = "https://hooks.example.com/rusty-provider"
+auth_header_env = "WEBHOOK_AUTH_HEADER"   # optional; e.g. "Bearer <token>"
+```
+
+This router POSTs a JSON body to `url` on two events:
+
+```jsonc
+// A client's tracked spend just reached or passed its budget.
+{"event": "budget_exceeded", "client": "hermes", "spent_usd": 51.20, "budget_usd": 50.0, "period": "monthly"}
+// An operator manually reset a client's spend via the admin API.
+{"event": "budget_reset", "client": "hermes", "budget_usd": 50.0, "period": "monthly"}
+```
+
+`budget_exceeded` fires on the specific request that pushes tracked spend
+from under budget to at-or-over it, not on every subsequent over-budget
+request — the request that crossed it is still charged and let through
+before this fires, same as the `402` only starting on the *next* request.
+Under `[persistence]`, "just crossed" is a best-effort, eventually-consistent
+read-back rather than an atomic check-and-set, so two concurrent requests
+to the same client right at the boundary could both fire (or, rarely,
+neither) — same class of caveat the tracked spend total itself already
+carries. `auth_header_env` names an env var holding the exact value to
+send as this POST's `Authorization` header (e.g. `"Bearer <token>"`), so
+the receiver can verify the request came from this router; leaving it
+unset sends no `Authorization` header at all. Delivery is fire-and-forget
+— a slow or unreachable receiver never adds latency to the request that
+triggered the event, and a delivery failure is only logged, never
+surfaced to the client.
+
 ## Admin API
 
 Setting `server.admin_key_env` unlocks a small admin API for inspecting
