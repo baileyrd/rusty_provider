@@ -307,6 +307,36 @@ pricing, so don't read a missing field as "this was free." Every request
 also adds to a running per-model total queryable at `GET /v1/usage`
 (below), whether or not pricing is configured for it.
 
+### Context compression
+
+By default, a request whose messages don't fit the target model's context
+window just fails at the provider. `transforms: ["middle-out"]` opts into
+automatic truncation instead:
+
+```jsonc
+{
+  "model": "smart",
+  "transforms": ["middle-out"],
+  "messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, "..."]
+}
+```
+
+If the resolved candidate has a `context_length` set in its `[[pricing]]`
+entry (see `GET /v1/models`) and the request's messages are estimated to
+exceed it, messages are dropped from the middle of the conversation
+(oldest-first among the middle) until it's estimated to fit — the first
+message (typically `system`) and the most recent one are always kept
+intact, since both ends carry the most load-bearing context. The budget
+reserves room for the response using `max_tokens` (or a default of `4096`
+when unset), and "estimated to fit" is a crude, tokenizer-free heuristic
+(`chars / 4`) rather than each provider's actual tokenizer — good enough
+for a rough "will this fit" call, not an exact accounting. Truncation is
+evaluated per fallback-chain candidate (since different models can have
+different `context_length`s), so a request might get truncated for one
+candidate but sent unmodified to another. Without a `context_length` on
+record for the candidate, or without `transforms` set at all, the request
+goes out unmodified — same as today.
+
 ### Sampling parameters
 
 Beyond `temperature`, `top_p`, `max_tokens`, and `stop`, a request can set a

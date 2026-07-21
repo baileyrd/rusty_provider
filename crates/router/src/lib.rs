@@ -21,8 +21,8 @@ use webhook::WebhookNotifier;
 
 use futures::stream::StreamExt;
 use rp_core::{
-    ChatRequest, ChatResponse, ChatStream, ModelInfo, ModelPricing, Provider, ProviderError,
-    ProviderPreferences, RateLimiter, Usage,
+    ChatMessage, ChatRequest, ChatResponse, ChatStream, ModelInfo, ModelPricing, Provider,
+    ProviderError, ProviderPreferences, RateLimiter, Usage,
 };
 use rp_providers::{AnthropicProvider, GeminiProvider, OpenAiCompatibleProvider};
 
@@ -168,6 +168,78 @@ fn active_params(req: &ChatRequest) -> Vec<&'static str> {
         params.push("cache_control");
     }
     params
+}
+
+/// Characters per estimated token -- a crude, tokenizer-free heuristic
+/// (this router has no real tokenizer for any of the three providers'
+/// models), close enough for "will this roughly fit" decisions but not a
+/// substitute for the provider's own accounting.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+fn estimate_tokens(message: &ChatMessage) -> usize {
+    message
+        .content
+        .as_ref()
+        .map(|c| c.as_plain_text().len() / CHARS_PER_TOKEN_ESTIMATE)
+        .unwrap_or(0)
+}
+
+/// Applies `transforms: ["middle-out"]`: drops messages from the middle of
+/// the conversation (oldest-first among the middle) until the estimated
+/// total fits `budget_tokens`, or nothing more can be dropped. Always
+/// keeps the first message (typically `system`) and the last one (the
+/// current turn) intact -- both ends carry the most load-bearing context,
+/// which is the whole point of "middle-out" over just truncating from one
+/// end. A no-op when already within budget or when there are 2 or fewer
+/// messages (nothing "middle" to drop).
+fn apply_middle_out(messages: &[ChatMessage], budget_tokens: usize) -> Vec<ChatMessage> {
+    let mut kept = messages.to_vec();
+    let mut total: usize = kept.iter().map(estimate_tokens).sum();
+    while total > budget_tokens && kept.len() > 2 {
+        total -= estimate_tokens(&kept[1]);
+        kept.remove(1);
+    }
+    kept
+}
+
+/// If `req` opts into `"middle-out"` and the resolved candidate has a
+/// `context_length` on record (from `[[pricing]]`), estimates whether
+/// `req.messages` fits and, if not, returns a truncated copy to send
+/// instead. Returns `None` when no truncation is needed or possible
+/// (transform not requested, or no known `context_length` for this
+/// candidate to fit against), in which case the caller sends `req`
+/// unmodified, same as today.
+fn maybe_apply_middle_out(
+    req: &ChatRequest,
+    provider_name: &str,
+    model_name: &str,
+    pricing: &HashMap<String, PriceRates>,
+) -> Option<ChatRequest> {
+    let wants_middle_out = req
+        .transforms
+        .as_ref()
+        .is_some_and(|t| t.iter().any(|s| s == "middle-out"));
+    if !wants_middle_out {
+        return None;
+    }
+    let context_length = pricing
+        .get(&format!("{provider_name}/{model_name}"))
+        .and_then(|rates| rates.context_length)? as usize;
+    // Leave room for the response -- default reservation mirrors this
+    // router's own default max_tokens fallback used elsewhere (Anthropic's
+    // required-field default), a reasonable stand-in when the client
+    // didn't ask for a specific completion length either.
+    let reserved_for_completion = req.max_tokens.unwrap_or(4096) as usize;
+    let budget_tokens = context_length.saturating_sub(reserved_for_completion);
+
+    let total: usize = req.messages.iter().map(estimate_tokens).sum();
+    if total <= budget_tokens {
+        return None;
+    }
+
+    let mut truncated = req.clone();
+    truncated.messages = apply_middle_out(&req.messages, budget_tokens);
+    Some(truncated)
 }
 
 /// Holds every provider adapter that could be built from config (i.e. its
@@ -997,8 +1069,12 @@ impl Router {
                 continue;
             }
 
+            let truncated_req =
+                maybe_apply_middle_out(req, provider_name, model_name, &self.pricing);
+            let req_to_send = truncated_req.as_ref().unwrap_or(req);
+
             let started_at = Instant::now();
-            match provider.chat(req, model_name).await {
+            match provider.chat(req_to_send, model_name).await {
                 Ok(mut resp) => {
                     let elapsed_secs = started_at.elapsed().as_secs_f64();
                     ewma_record(
@@ -1090,8 +1166,12 @@ impl Router {
                 continue;
             }
 
+            let truncated_req =
+                maybe_apply_middle_out(req, provider_name, model_name, &self.pricing);
+            let req_to_send = truncated_req.as_ref().unwrap_or(req);
+
             let started_at = Instant::now();
-            match provider.chat_stream(req, model_name).await {
+            match provider.chat_stream(req_to_send, model_name).await {
                 Ok(stream) => {
                     let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
                     ewma_record(
@@ -1236,6 +1316,7 @@ mod tests {
             repetition_penalty: None,
             logit_bias: None,
             seed: None,
+            transforms: None,
         }
     }
 
@@ -3190,6 +3271,184 @@ mod tests {
         let uptime = router.uptime.read().unwrap();
         assert_eq!(*uptime.get("anthropic/m1").unwrap(), 0.0);
         assert_eq!(*uptime.get("openai/m2").unwrap(), 1.0);
+    }
+
+    // --- middle-out --------------------------------------------------------
+
+    fn msg(role_text: &str, chars: usize) -> ChatMessage {
+        let text = "x".repeat(chars);
+        if role_text == "system" {
+            ChatMessage::system(text)
+        } else {
+            ChatMessage::user(text)
+        }
+    }
+
+    #[test]
+    fn apply_middle_out_is_a_no_op_within_budget() {
+        let messages = vec![msg("system", 40), msg("user", 40), msg("user", 40)];
+        let result = apply_middle_out(&messages, 1000);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn apply_middle_out_keeps_first_and_last_and_drops_the_middle() {
+        // Each message is ~10 estimated tokens (40 chars / 4). A budget of
+        // 15 forces dropping the middle two, leaving just system + last.
+        let messages = vec![
+            msg("system", 40),
+            msg("user", 40),
+            msg("user", 40),
+            msg("user", 40),
+        ];
+        let result = apply_middle_out(&messages, 15);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].content, messages[0].content);
+        assert_eq!(result[1].content, messages[3].content);
+    }
+
+    #[test]
+    fn apply_middle_out_never_drops_below_two_messages() {
+        // Even an impossibly small budget leaves the first and last
+        // message in place rather than dropping everything.
+        let messages = vec![msg("system", 40), msg("user", 40), msg("user", 40)];
+        let result = apply_middle_out(&messages, 0);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn apply_middle_out_drops_oldest_middle_message_first() {
+        let messages = vec![
+            msg("system", 40),
+            msg("user", 40), // oldest middle -- should go first
+            msg("user", 40), // newest middle -- should survive longer
+            msg("user", 40),
+        ];
+        // Budget for 3 messages' worth (~30 tokens) -- only one middle
+        // message needs to be dropped.
+        let result = apply_middle_out(&messages, 30);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].content, messages[0].content);
+        assert_eq!(result[1].content, messages[2].content);
+        assert_eq!(result[2].content, messages[3].content);
+    }
+
+    #[test]
+    fn maybe_apply_middle_out_is_none_when_transform_not_requested() {
+        let mut req = test_request("anthropic/claude-sonnet-5");
+        req.messages = vec![msg("system", 4000), msg("user", 4000)];
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "anthropic/claude-sonnet-5".to_string(),
+            PriceRates {
+                prompt_ppm: 3.0,
+                completion_ppm: 15.0,
+                cache_read_ppm: 3.0,
+                cache_write_ppm: 3.0,
+                context_length: Some(100),
+            },
+        );
+        assert!(maybe_apply_middle_out(&req, "anthropic", "claude-sonnet-5", &pricing).is_none());
+    }
+
+    #[test]
+    fn maybe_apply_middle_out_is_none_without_a_known_context_length() {
+        let mut req = test_request("anthropic/claude-sonnet-5");
+        req.transforms = Some(vec!["middle-out".to_string()]);
+        req.messages = vec![msg("system", 4000), msg("user", 4000)];
+        // No [[pricing]] entry at all for this candidate.
+        let pricing = HashMap::new();
+        assert!(maybe_apply_middle_out(&req, "anthropic", "claude-sonnet-5", &pricing).is_none());
+    }
+
+    #[test]
+    fn maybe_apply_middle_out_is_none_when_already_within_budget() {
+        let mut req = test_request("anthropic/claude-sonnet-5");
+        req.transforms = Some(vec!["middle-out".to_string()]);
+        req.max_tokens = Some(100);
+        req.messages = vec![msg("system", 40), msg("user", 40)];
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "anthropic/claude-sonnet-5".to_string(),
+            PriceRates {
+                prompt_ppm: 3.0,
+                completion_ppm: 15.0,
+                cache_read_ppm: 3.0,
+                cache_write_ppm: 3.0,
+                context_length: Some(200_000),
+            },
+        );
+        assert!(maybe_apply_middle_out(&req, "anthropic", "claude-sonnet-5", &pricing).is_none());
+    }
+
+    #[test]
+    fn maybe_apply_middle_out_truncates_an_over_length_request() {
+        let mut req = test_request("anthropic/claude-sonnet-5");
+        req.transforms = Some(vec!["middle-out".to_string()]);
+        req.max_tokens = Some(100);
+        req.messages = vec![
+            msg("system", 40),
+            msg("user", 4000),
+            msg("user", 4000),
+            msg("user", 40),
+        ];
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "anthropic/claude-sonnet-5".to_string(),
+            PriceRates {
+                prompt_ppm: 3.0,
+                completion_ppm: 15.0,
+                cache_read_ppm: 3.0,
+                cache_write_ppm: 3.0,
+                // Budget after reserving max_tokens is small relative to
+                // the ~2000-estimated-token middle messages.
+                context_length: Some(300),
+            },
+        );
+        let truncated = maybe_apply_middle_out(&req, "anthropic", "claude-sonnet-5", &pricing)
+            .expect("should truncate");
+        assert!(truncated.messages.len() < req.messages.len());
+        assert_eq!(truncated.messages[0].content, req.messages[0].content);
+        assert_eq!(
+            truncated.messages.last().unwrap().content,
+            req.messages.last().unwrap().content
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_sends_a_middle_out_truncated_request_body() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let mut router = test_router(vec![("anthropic", mock)], vec![], vec![], vec![], vec![]);
+        router.pricing = Arc::new(HashMap::from([(
+            "anthropic/claude-sonnet-5".to_string(),
+            PriceRates {
+                prompt_ppm: 3.0,
+                completion_ppm: 15.0,
+                cache_read_ppm: 3.0,
+                cache_write_ppm: 3.0,
+                context_length: Some(300),
+            },
+        )]));
+        let mut req = test_request("anthropic/claude-sonnet-5");
+        req.transforms = Some(vec!["middle-out".to_string()]);
+        req.max_tokens = Some(100);
+        req.messages = vec![
+            msg("system", 40),
+            msg("user", 4000),
+            msg("user", 4000),
+            msg("user", 40),
+        ];
+
+        router
+            .dispatch(&req)
+            .await
+            .expect("dispatch should succeed even though the request was truncated");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     // --- active_params / filter_by_required_parameters ------------------------

@@ -912,6 +912,7 @@ mod tests {
             repetition_penalty: None,
             logit_bias: None,
             seed: None,
+            transforms: None,
         }
     }
 
@@ -1373,6 +1374,7 @@ mod tests {
             repetition_penalty: None,
             logit_bias: None,
             seed: None,
+            transforms: None,
         };
         let err = provider.chat(&req, "claude-sonnet-5").await.unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedContent(_)));

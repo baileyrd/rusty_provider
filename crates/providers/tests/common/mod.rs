@@ -29,6 +29,7 @@ pub fn simple_request(model: &str) -> ChatRequest {
         repetition_penalty: None,
         logit_bias: None,
         seed: None,
+        transforms: None,
     }
 }
 

@@ -332,6 +332,19 @@ pub struct ChatRequest {
     /// supported by Anthropic's API -- silently ignored there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
+    /// Opt-in prompt-compression strategies, à la OpenRouter's `transforms`
+    /// field. The only value this router recognizes today is
+    /// `"middle-out"`: when the resolved candidate has a `context_length`
+    /// configured (see `[[pricing]]`) and the request's messages are
+    /// estimated to exceed it, messages are dropped from the middle of the
+    /// conversation (oldest-first among the middle, keeping the first
+    /// message -- typically `system` -- and the most recent one intact)
+    /// until it's estimated to fit, or nothing more can be safely dropped.
+    /// Unrecognized values are ignored. Unset or `[]` means no compression
+    /// -- an over-length request is sent as-is and fails at the provider,
+    /// same as today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transforms: Option<Vec<String>>,
 }
 
 /// Requests and tunes a model's reasoning/thinking trace. `effort` and
