@@ -804,6 +804,143 @@ mod tests {
     }
 
     #[test]
+    fn apply_preferences_zdr_false_is_a_no_op() {
+        let router = test_router(vec![], vec![], vec![], vec!["anthropic"], vec![]);
+        let prefs = ProviderPreferences {
+            zdr: Some(false),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(
+            result, input,
+            "zdr: false must not filter out non-ZDR providers"
+        );
+    }
+
+    #[test]
+    fn apply_preferences_zdr_unset_is_a_no_op() {
+        let router = test_router(vec![], vec![], vec![], vec!["anthropic"], vec![]);
+        // `zdr` left unset within an otherwise-present preferences object,
+        // as opposed to `prefs` being `None` entirely.
+        let prefs = ProviderPreferences {
+            only: Some(vec!["anthropic".to_string(), "openai".to_string()]),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn apply_preferences_zdr_keeps_every_flagged_provider() {
+        let router = test_router(vec![], vec![], vec![], vec!["anthropic", "gemini"], vec![]);
+        let prefs = ProviderPreferences {
+            zdr: Some(true),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1"), ("gemini", "m3")]));
+    }
+
+    #[test]
+    fn apply_preferences_zdr_with_no_flagged_providers_empties_the_chain_and_errors() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            zdr: Some(true),
+            ..Default::default()
+        };
+        let err = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                Some(&prefs),
+            )
+            .unwrap_err();
+        assert!(matches!(err, RouterError::NoEligibleProvider(_)));
+    }
+
+    #[test]
+    fn apply_preferences_zdr_combines_with_only_filter() {
+        // "openai" passes `only` but isn't ZDR-flagged, so it must still be
+        // dropped -- the two filters are independent, not either/or.
+        let router = test_router(vec![], vec![], vec![], vec!["anthropic"], vec![]);
+        let prefs = ProviderPreferences {
+            only: Some(vec!["anthropic".to_string(), "openai".to_string()]),
+            zdr: Some(true),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_zdr_combines_with_ignore_filter() {
+        // Both "anthropic" and "gemini" are ZDR-flagged, but "ignore" drops
+        // "anthropic" first, leaving only "gemini".
+        let router = test_router(vec![], vec![], vec![], vec!["anthropic", "gemini"], vec![]);
+        let prefs = ProviderPreferences {
+            ignore: Some(vec!["anthropic".to_string()]),
+            zdr: Some(true),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("gemini", "m3")]));
+    }
+
+    #[test]
+    fn apply_preferences_zdr_filters_before_price_sort() {
+        // The cheapest candidate ("gemini") isn't ZDR-flagged and must be
+        // dropped before price sorting ever sees it, not merely sorted last.
+        let router = test_router(
+            vec![],
+            vec![],
+            vec![
+                ("anthropic/m1", 3.0, 15.0),
+                ("openai/m2", 1.0, 5.0),
+                ("gemini/m3", 0.1, 0.4),
+            ],
+            vec!["anthropic", "openai"],
+            vec![],
+        );
+        let prefs = ProviderPreferences {
+            zdr: Some(true),
+            sort: Some("price".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
     fn apply_preferences_sorts_ascending_by_price() {
         let router = test_router(
             vec![],
