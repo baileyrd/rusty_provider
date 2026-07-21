@@ -1,6 +1,7 @@
 mod client_budget;
 mod config;
 mod error;
+mod guardrails;
 mod metrics;
 mod persistence;
 mod webhook;
@@ -11,10 +12,12 @@ use std::time::Instant;
 
 use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
-    BudgetPeriod, ClientConfig, Config, PersistenceBackend, PersistenceConfig, PostgresTlsMode,
-    PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig, WebhookConfig,
+    BudgetPeriod, ClientConfig, Config, GuardrailAction, GuardrailConfig, PersistenceBackend,
+    PersistenceConfig, PostgresTlsMode, PricingEntry, ProviderConfig, ProviderKind, RouteAlias,
+    ServerConfig, WebhookConfig,
 };
 pub use error::RouterError;
+use guardrails::Guardrail;
 pub use metrics::Metrics;
 use persistence::{Persistence, PersistenceTarget};
 use webhook::WebhookNotifier;
@@ -398,6 +401,9 @@ pub struct Router {
     /// never pushed anywhere -- same as today, a `402` and a Prometheus
     /// counter are all a client/operator sees.
     webhook: Option<Arc<WebhookNotifier>>,
+    /// Compiled `[[guardrails]]` entries, in config order. Empty means no
+    /// guardrails configured -- every request passes through unchanged.
+    guardrails: Vec<Guardrail>,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -618,6 +624,22 @@ impl Router {
             Arc::new(WebhookNotifier::new(cfg.url.clone(), auth_header))
         });
 
+        // A guardrail with an invalid regex is a soft failure -- skipped
+        // with a warning, same as a misconfigured provider or client,
+        // rather than refusing to start the whole router over one bad
+        // pattern.
+        let guardrails = config
+            .guardrails
+            .iter()
+            .filter_map(|cfg| match Guardrail::compile(cfg) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    tracing::warn!(guardrail = %cfg.name, "invalid guardrail pattern, skipping: {e}");
+                    None
+                }
+            })
+            .collect();
+
         Self {
             providers,
             provider_kinds,
@@ -637,6 +659,7 @@ impl Router {
             client_budgets: RwLock::new(client_budgets),
             client_spend: Mutex::new(HashMap::new()),
             webhook,
+            guardrails,
         }
     }
 
@@ -1084,6 +1107,18 @@ impl Router {
         Ok(chain)
     }
 
+    /// Runs every configured `[[guardrails]]` entry against `req`'s
+    /// message text, in config order -- redacting matches in place for a
+    /// `"redact"` guardrail, or failing the whole request for a
+    /// `"block"` guardrail that matches anywhere. A no-op when no
+    /// guardrails are configured. Intended to run before dispatch, on the
+    /// caller's own mutable copy of the request (this router never
+    /// mutates the caller's original), so a redaction actually reaches
+    /// whichever provider ends up serving it.
+    pub fn apply_guardrails(&self, req: &mut ChatRequest) -> Result<(), RouterError> {
+        guardrails::apply(&self.guardrails, req).map_err(RouterError::GuardrailBlocked)
+    }
+
     /// When `req.provider.require_parameters` is `true`, drops every
     /// candidate whose provider kind doesn't actually give an effect to
     /// every field `req` sets (see `active_params`/`supported_params`) --
@@ -1445,6 +1480,7 @@ mod tests {
             client_budgets: RwLock::new(HashMap::new()),
             client_spend: Mutex::new(HashMap::new()),
             webhook: None,
+            guardrails: Vec::new(),
         }
     }
 

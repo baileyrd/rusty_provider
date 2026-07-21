@@ -14,6 +14,9 @@ pub enum RouterError {
     )]
     NoEligibleProvider(String),
 
+    #[error("request blocked by guardrail \"{0}\"")]
+    GuardrailBlocked(String),
+
     #[error(transparent)]
     Provider(#[from] ProviderError),
 }
@@ -24,6 +27,7 @@ impl RouterError {
             RouterError::InvalidModel(_) => 400,
             RouterError::ProviderNotConfigured(_) => 424,
             RouterError::NoEligibleProvider(_) => 400,
+            RouterError::GuardrailBlocked(_) => 400,
             RouterError::Provider(e) => e.status_code(),
         }
     }
@@ -65,6 +69,14 @@ mod tests {
     fn no_eligible_provider_maps_to_400() {
         assert_eq!(
             RouterError::NoEligibleProvider("anthropic/claude".to_string()).status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn guardrail_blocked_maps_to_400() {
+        assert_eq!(
+            RouterError::GuardrailBlocked("no-ssn".to_string()).status_code(),
             400
         );
     }

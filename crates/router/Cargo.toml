@@ -22,6 +22,7 @@ tokio-postgres-rustls.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 reqwest.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

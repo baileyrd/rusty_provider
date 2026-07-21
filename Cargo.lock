@@ -1338,6 +1338,7 @@ dependencies = [
  "async-trait",
  "futures",
  "prometheus",
+ "regex",
  "reqwest",
  "rp-core",
  "rp-providers",

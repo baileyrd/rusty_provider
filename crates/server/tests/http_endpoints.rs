@@ -9,7 +9,7 @@ use rp_router::{Config, Router as ProviderRouter};
 use rp_server::build_app;
 use rp_server::state::AppState;
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Generates a unique per-test env var name so parallel tests never race on
@@ -295,6 +295,93 @@ async fn chat_completions_rejects_empty_messages_with_400() {
         .as_str()
         .unwrap()
         .contains("messages"));
+}
+
+#[tokio::test]
+async fn chat_completions_blocks_a_request_matching_a_block_guardrail() {
+    let config = r#"
+        providers = {}
+
+        [[guardrails]]
+        name = "no-ssn"
+        pattern = '\d{3}-\d{2}-\d{4}'
+        action = "block"
+        "#;
+    let base_url = spawn_app(config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "my ssn is 123-45-6789"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no-ssn"));
+}
+
+#[tokio::test]
+async fn chat_completions_redacts_a_request_matching_a_redact_guardrail_before_dispatch() {
+    let server = MockServer::start().await;
+    // The mock only matches if the request body's content has already
+    // been redacted -- proves the guardrail ran before the provider ever
+    // saw the original text.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("[redacted]"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "got it"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        })))
+        .mount(&server)
+        .await;
+
+    let key_var = unique_env_var("OPENAI_KEY");
+    std::env::set_var(&key_var, "test-key");
+    let config = format!(
+        r#"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key_env = "{key_var}"
+
+        [[guardrails]]
+        name = "no-ssn"
+        pattern = '\d{{3}}-\d{{2}}-\d{{4}}'
+        action = "redact"
+        "#,
+        server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "my ssn is 123-45-6789"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "got it");
 }
 
 #[tokio::test]

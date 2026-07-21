@@ -252,6 +252,43 @@ pub struct Config {
     pub persistence: Option<PersistenceConfig>,
     #[serde(default)]
     pub webhook: Option<WebhookConfig>,
+    #[serde(default)]
+    pub guardrails: Vec<GuardrailConfig>,
+}
+
+/// A regex-based content guardrail, checked against every request's
+/// message text before dispatch -- OpenRouter's org-level guardrails,
+/// scoped globally here since rusty has no workspace/org concept to
+/// scope these to individually (see the deferred organizations/
+/// workspaces/roles item).
+#[derive(Debug, Deserialize, Clone)]
+pub struct GuardrailConfig {
+    /// Identifies this guardrail in a block error message and log line.
+    pub name: String,
+    /// A regex (the `regex` crate's syntax) checked against each
+    /// message's plain text content.
+    pub pattern: String,
+    pub action: GuardrailAction,
+    /// Replacement text for a `"redact"` guardrail's matches. Ignored
+    /// for `"block"`.
+    #[serde(default = "default_guardrail_replacement")]
+    pub replacement: String,
+}
+
+fn default_guardrail_replacement() -> String {
+    "[redacted]".to_string()
+}
+
+/// What a matching [`GuardrailConfig`] does to the request.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardrailAction {
+    /// Reject the request with `400` if the pattern matches anywhere in
+    /// its message text.
+    Block,
+    /// Replace every matched substring with `replacement` before the
+    /// request is dispatched to any provider.
+    Redact,
 }
 
 /// Outbound webhook fired on budget-exceeded/reset events -- a proactive
@@ -644,6 +681,70 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("budget_period"));
+    }
+
+    // --- guardrails ----------------------------------------------------------------
+
+    #[test]
+    fn guardrails_defaults_to_empty_when_absent() {
+        let config = Config::from_toml_str("providers = {}").unwrap();
+        assert!(config.guardrails.is_empty());
+    }
+
+    #[test]
+    fn guardrail_parses_a_block_entry() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[guardrails]]
+            name = "no-ssn"
+            pattern = '\d{3}-\d{2}-\d{4}'
+            action = "block"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.guardrails.len(), 1);
+        let guardrail = &config.guardrails[0];
+        assert_eq!(guardrail.name, "no-ssn");
+        assert_eq!(guardrail.pattern, r"\d{3}-\d{2}-\d{4}");
+        assert_eq!(guardrail.action, GuardrailAction::Block);
+        assert_eq!(guardrail.replacement, "[redacted]");
+    }
+
+    #[test]
+    fn guardrail_parses_a_redact_entry_with_a_custom_replacement() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[guardrails]]
+            name = "no-email"
+            pattern = '\S+@\S+'
+            action = "redact"
+            replacement = "<email>"
+            "#,
+        )
+        .unwrap();
+        let guardrail = &config.guardrails[0];
+        assert_eq!(guardrail.action, GuardrailAction::Redact);
+        assert_eq!(guardrail.replacement, "<email>");
+    }
+
+    #[test]
+    fn guardrail_rejects_an_unknown_action() {
+        let err = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [[guardrails]]
+            name = "bogus"
+            pattern = "x"
+            action = "quarantine"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("action"));
     }
 
     // --- persistence backend -----------------------------------------------------
