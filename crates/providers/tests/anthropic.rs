@@ -410,6 +410,33 @@ async fn chat_forwards_top_k_but_has_no_field_for_the_rest_of_the_sampling_param
 }
 
 #[tokio::test]
+async fn chat_has_no_wire_field_for_logprobs_and_never_returns_any() {
+    // Anthropic's Messages API has no logprobs equivalent at all -- there's
+    // no field on this adapter's WireRequest to serialize `logprobs`/
+    // `top_logprobs` into (compile-time guarantee, same as the unsupported
+    // sampling params), and the response never populates `logprobs`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(server.uri(), "test-key");
+    let req = common::request_with_logprobs("claude-sonnet-5");
+
+    let resp = provider
+        .chat(&req, "claude-sonnet-5")
+        .await
+        .expect("chat should succeed");
+    assert!(resp.choices[0].logprobs.is_none());
+}
+
+#[tokio::test]
 async fn chat_stream_parses_text_deltas_and_final_usage() {
     let server = MockServer::start().await;
     let sse_body = concat!(

@@ -454,6 +454,53 @@ A request can also constrain and order the resolved fallback chain with a
   balancing across "healthy" candidates — every request still tries the
   sorted chain in order with fallback, the same as any other `sort` value.
 
+### Logprobs
+
+```jsonc
+{
+  "model": "openai/gpt-4o-mini",
+  "logprobs": true,
+  "top_logprobs": 2,
+  "messages": [{"role": "user", "content": "..."}]
+}
+```
+
+`logprobs: true` asks the provider to return the log-probability of each
+generated token alongside the response; `top_logprobs` (0-20) additionally
+asks for the N most likely alternative tokens at each position. When
+present, the response carries a `logprobs` field on each choice:
+
+```jsonc
+{
+  "choices": [{
+    "message": {"role": "assistant", "content": "..."},
+    "logprobs": {
+      "content": [
+        {"token": "Hi", "logprob": -0.02, "bytes": [72, 105], "top_logprobs": [
+          {"token": "Hi", "logprob": -0.02, "bytes": [72, 105]},
+          {"token": "Hello", "logprob": -4.1, "bytes": [72, 101, 108, 108, 111]}
+        ]}
+      ]
+    }
+  }]
+}
+```
+
+This is a diagnostic/eval feature, not a structural contract, so support is
+native-or-nothing rather than translated:
+
+| Provider | Behavior |
+| --- | --- |
+| OpenAI-compatible | native passthrough — `logprobs`/`top_logprobs` forwarded verbatim, response `logprobs` parsed straight from the wire shape |
+| Anthropic | ignored — the Messages API has no logprobs equivalent; response `logprobs` is always `null` |
+| Gemini | ignored — same as Anthropic; response `logprobs` is always `null` |
+
+Mostly useful for evals and fine-tuning tooling rather than general chat
+traffic, so there's no `require_parameters` exemption here: a request that
+sets `logprobs` and also sets `provider.require_parameters: true` will
+correctly drop Anthropic/Gemini candidates from the chain, same as any
+other field they don't support.
+
 ### `GET /v1/models`
 
 Lists configured route aliases, `provider/*` for every provider with a

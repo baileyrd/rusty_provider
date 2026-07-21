@@ -395,6 +395,61 @@ async fn chat_forwards_all_sampling_params_verbatim_in_request_body() {
 }
 
 #[tokio::test]
+async fn chat_forwards_logprobs_request_fields_and_parses_the_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({
+            "logprobs": true,
+            "top_logprobs": 2,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+                "logprobs": {
+                    "content": [{
+                        "token": "ok",
+                        "logprob": -0.1,
+                        "bytes": [111, 107],
+                        "top_logprobs": [
+                            {"token": "ok", "logprob": -0.1, "bytes": [111, 107]},
+                            {"token": "sure", "logprob": -2.3, "bytes": [115, 117, 114, 101]}
+                        ]
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::request_with_logprobs("gpt-4o-mini");
+
+    let resp = provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect("chat should succeed");
+    let logprobs = resp.choices[0]
+        .logprobs
+        .as_ref()
+        .expect("logprobs should be present");
+    let content = logprobs
+        .content
+        .as_ref()
+        .expect("content should be present");
+    assert_eq!(content[0].token, "ok");
+    assert_eq!(content[0].logprob, -0.1);
+    assert_eq!(content[0].top_logprobs.as_ref().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn chat_forwards_image_content_verbatim_in_request_body() {
     // Since this adapter's WireRequest holds `&[ChatMessage]` directly,
     // MessageContent's untagged serialization should pass a parts array

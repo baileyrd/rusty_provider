@@ -345,6 +345,45 @@ pub struct ChatRequest {
     /// same as today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transforms: Option<Vec<String>>,
+    /// Requests per-token log probabilities in the response, per the
+    /// OpenAI convention. Native to OpenAI-compatible only -- Anthropic
+    /// and Gemini's APIs have no equivalent, so this is silently ignored
+    /// there and the response's `logprobs` is simply absent, the same
+    /// reasoning as an unsupported sampling parameter: a nice-to-have for
+    /// evals/fine-tuning tooling, not a correctness requirement, so the
+    /// response is still a valid answer either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    /// How many alternative tokens to return log probabilities for at
+    /// each position (0-20), per the OpenAI convention. Only meaningful
+    /// alongside `logprobs: true`; same OpenAI-compatible-only support as
+    /// `logprobs` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
+}
+
+/// A response's per-token log probabilities, per the OpenAI convention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChoiceLogprobs {
+    pub content: Option<Vec<TokenLogprob>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<Vec<TopLogprob>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// Requests and tunes a model's reasoning/thinking trace. `effort` and
@@ -483,6 +522,8 @@ pub struct Choice {
     pub index: u32,
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,6 +588,8 @@ pub struct ChunkChoice {
     pub index: u32,
     pub delta: ChatMessageDelta,
     pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
