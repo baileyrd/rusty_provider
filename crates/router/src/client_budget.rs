@@ -56,11 +56,16 @@ pub fn now_unix() -> i64 {
 }
 
 /// A value that changes exactly when `period` should reset: always `0`
-/// for `Total` (so it never resets), or `year * 12 + month` for `Monthly`
-/// (so it changes precisely at each calendar-month boundary).
+/// for `Total` (so it never resets); the day-since-epoch count for
+/// `Daily`; that count divided by 7 for `Weekly` (a fixed 7-day cadence
+/// from the epoch, not aligned to a calendar weekday); or
+/// `year * 12 + month` for `Monthly` (so it changes precisely at each
+/// calendar-month boundary).
 pub fn period_key_at(period: BudgetPeriod, now_unix: i64) -> i64 {
     match period {
         BudgetPeriod::Total => 0,
+        BudgetPeriod::Daily => now_unix.div_euclid(86_400),
+        BudgetPeriod::Weekly => now_unix.div_euclid(86_400).div_euclid(7),
         BudgetPeriod::Monthly => {
             let (year, month) = year_month_from_unix(now_unix);
             year as i64 * 12 + month as i64
@@ -176,6 +181,36 @@ mod tests {
         let start = period_key_at(BudgetPeriod::Monthly, 1_704_067_200); // 2024-01-01
         let mid = period_key_at(BudgetPeriod::Monthly, 1_704_067_200 + 15 * 86_400);
         assert_eq!(start, mid);
+    }
+
+    #[test]
+    fn period_key_at_daily_changes_across_a_day_boundary() {
+        let day1 = period_key_at(BudgetPeriod::Daily, 1_704_067_200); // 2024-01-01T00:00:00Z
+        let day1_end = period_key_at(BudgetPeriod::Daily, 1_704_067_200 + 86_399);
+        let day2 = period_key_at(BudgetPeriod::Daily, 1_704_067_200 + 86_400);
+        assert_eq!(day1, day1_end, "must be stable within the same day");
+        assert_ne!(day1, day2, "must change at the day boundary");
+    }
+
+    #[test]
+    fn period_key_at_weekly_changes_after_seven_days_and_not_before() {
+        // Start exactly on a week boundary (a multiple of 7 days since the
+        // epoch) so the 6-days-later/7-days-later offsets land on the
+        // expected side of the boundary -- an arbitrary start wouldn't,
+        // since boundaries are fixed at multiples of 7 days from the
+        // epoch, not 7 days after wherever `start` happens to fall.
+        let start = 0; // 1970-01-01T00:00:00Z -- day 0, a week boundary.
+        let start_key = period_key_at(BudgetPeriod::Weekly, start);
+        let six_days_later = period_key_at(BudgetPeriod::Weekly, start + 6 * 86_400);
+        let seven_days_later = period_key_at(BudgetPeriod::Weekly, start + 7 * 86_400);
+        assert_eq!(
+            start_key, six_days_later,
+            "must be stable for the first 6 days"
+        );
+        assert_ne!(
+            start_key, seven_days_later,
+            "must change once a full 7-day span has elapsed"
+        );
     }
 
     // --- roll_period_if_needed ----------------------------------------------------

@@ -155,9 +155,12 @@ completion_per_million = 0.79
 # tracked cost_usd (the same figure GET /v1/usage reports, computed from
 # [[pricing]]) reaches this many US dollars for the current
 # `budget_period`, further requests get 402 until the period resets.
-# `budget_period` is "total" (a lifetime cap, the default) or "monthly"
-# (resets at the start of each calendar month, UTC). Omit `budget_usd`
-# entirely for an unrestricted client, same as leaving it commented out.
+# `budget_period` is "total" (a lifetime cap, the default), "daily"
+# (resets at each UTC calendar-day boundary), "weekly" (resets every 7
+# days counted from the Unix epoch, not aligned to a calendar weekday), or
+# "monthly" (resets at the start of each calendar month, UTC). Omit
+# `budget_usd` entirely for an unrestricted client, same as leaving it
+# commented out.
 # Like everything else cost-related, this only tracks requests to models
 # with a [[pricing]] entry -- unpriced requests don't count against it.
 
