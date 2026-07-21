@@ -19,6 +19,13 @@ pub struct ChatMessage {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Set on assistant messages that invoke one or more tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Set on `Role::Tool` messages: the id (from the assistant's
+    /// `tool_calls`) of the call this message's `content` answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -27,6 +34,8 @@ impl ChatMessage {
             role: Role::System,
             content: Some(content.into()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -35,6 +44,8 @@ impl ChatMessage {
             role: Role::User,
             content: Some(content.into()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -43,6 +54,61 @@ impl ChatMessage {
             role: Role::Assistant,
             content: Some(content.into()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+}
+
+/// A tool the model may call, in the OpenAI function-calling shape.
+/// `parameters` is a JSON Schema object describing the function's
+/// arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// A single invocation of a tool, as requested by the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    /// JSON-encoded arguments, per the OpenAI convention (a string, not a
+    /// nested object) so it can be streamed as accumulating text.
+    pub arguments: String,
+}
+
+impl ToolCall {
+    pub fn function(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
         }
     }
 }
@@ -66,6 +132,13 @@ pub struct ChatRequest {
     pub stream: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+    /// `"auto"` | `"none"` | `"required"` | `{"type":"function","function":{"name":...}}`,
+    /// per the OpenAI convention. Left as raw JSON since providers each
+    /// have a slightly different vocabulary here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 impl ChatRequest {
@@ -108,6 +181,30 @@ pub struct ChatMessageDelta {
     pub role: Option<Role>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+/// An incremental piece of a tool call, streamed across possibly many
+/// chunks: `id`/`function.name` arrive once, `function.arguments` arrives
+/// as accumulating string fragments to be concatenated by the client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<FunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FunctionCallDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
