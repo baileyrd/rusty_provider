@@ -422,6 +422,18 @@ pub struct ProviderPreferences {
     /// unpriced entry can't be trusted to be under it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_price: Option<f64>,
+    /// If `true`, drop every candidate whose provider adapter doesn't
+    /// actually give an effect to every field this specific request sets
+    /// (`tools`, `response_format`, `top_k`, a message's `cache_control`,
+    /// etc. -- see `GET /v1/models`' `supported_params` for the exact
+    /// per-provider list). Without this, an unsupported field is silently
+    /// dropped or, for a structural field like `response_format`,
+    /// rejected only after a wasted round trip; this filters those
+    /// candidates out before dispatch instead. `stop`/`temperature`/
+    /// `top_p`/`max_tokens` never disqualify a candidate -- every
+    /// provider kind supports all four natively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_parameters: Option<bool>,
 }
 
 impl ChatRequest {

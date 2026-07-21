@@ -120,6 +120,56 @@ fn supported_params(kind: ProviderKind) -> Vec<&'static str> {
     params
 }
 
+/// Which of `supported_params`' names this specific request actually sets
+/// -- i.e. would be silently dropped, or (for a structural field like
+/// `response_format`) rejected, on a provider that doesn't support it.
+/// `temperature`/`top_p`/`max_tokens`/`stop` are never included: every
+/// provider kind supports all four, so they can never disqualify a
+/// candidate.
+fn active_params(req: &ChatRequest) -> Vec<&'static str> {
+    let mut params = Vec::new();
+    if req.tools.is_some() {
+        params.push("tools");
+    }
+    if req.tool_choice.is_some() {
+        params.push("tool_choice");
+    }
+    if req.response_format.is_some() {
+        params.push("response_format");
+    }
+    if req.reasoning.is_some() {
+        params.push("reasoning");
+    }
+    if req.top_k.is_some() {
+        params.push("top_k");
+    }
+    if req.min_p.is_some() {
+        params.push("min_p");
+    }
+    if req.top_a.is_some() {
+        params.push("top_a");
+    }
+    if req.frequency_penalty.is_some() {
+        params.push("frequency_penalty");
+    }
+    if req.presence_penalty.is_some() {
+        params.push("presence_penalty");
+    }
+    if req.repetition_penalty.is_some() {
+        params.push("repetition_penalty");
+    }
+    if req.logit_bias.is_some() {
+        params.push("logit_bias");
+    }
+    if req.seed.is_some() {
+        params.push("seed");
+    }
+    if req.messages.iter().any(|m| m.cache_control.is_some()) {
+        params.push("cache_control");
+    }
+    params
+}
+
 /// Holds every provider adapter that could be built from config (i.e. its
 /// API key env var was set), the named fallback-chain aliases, static
 /// per-model pricing (used for `provider.sort: "price"` and for computing
@@ -802,6 +852,43 @@ impl Router {
         Ok(chain)
     }
 
+    /// When `req.provider.require_parameters` is `true`, drops every
+    /// candidate whose provider kind doesn't actually give an effect to
+    /// every field `req` sets (see `active_params`/`supported_params`) --
+    /// a no-op otherwise, run after `apply_preferences` since it needs
+    /// the request itself, not just `provider.*` prefs, to know what's
+    /// "active." Candidates for a provider this process never resolved a
+    /// `kind` for (already excluded from the chain by this point, since
+    /// only configured providers ever make it into `resolve_chain`) would
+    /// be dropped too, as a defensive default.
+    fn filter_by_required_parameters(
+        &self,
+        model: &str,
+        mut chain: Vec<(String, String)>,
+        req: &ChatRequest,
+    ) -> Result<Vec<(String, String)>, RouterError> {
+        let require = req
+            .provider
+            .as_ref()
+            .and_then(|p| p.require_parameters)
+            .unwrap_or(false);
+        if !require {
+            return Ok(chain);
+        }
+
+        let active = active_params(req);
+        chain.retain(|(provider, _)| {
+            self.provider_kinds.get(provider).is_some_and(|kind| {
+                let supported = supported_params(*kind);
+                active.iter().all(|p| supported.contains(p))
+            })
+        });
+        if chain.is_empty() {
+            return Err(RouterError::NoEligibleProvider(model.to_string()));
+        }
+        Ok(chain)
+    }
+
     fn get_provider(&self, name: &str) -> Result<&Arc<dyn Provider>, RouterError> {
         self.providers
             .get(name)
@@ -868,6 +955,7 @@ impl Router {
     pub async fn dispatch(&self, req: &ChatRequest) -> Result<ChatResponse, RouterError> {
         let chain = self.resolve_chain(&req.model, req.models.as_deref())?;
         let chain = self.apply_preferences(&req.model, chain, req.provider.as_ref())?;
+        let chain = self.filter_by_required_parameters(&req.model, chain, req)?;
         let mut last_err: Option<RouterError> = None;
 
         for (provider_name, model_name) in &chain {
@@ -957,6 +1045,7 @@ impl Router {
     pub async fn dispatch_stream(&self, req: &ChatRequest) -> Result<ChatStream, RouterError> {
         let chain = self.resolve_chain(&req.model, req.models.as_deref())?;
         let chain = self.apply_preferences(&req.model, chain, req.provider.as_ref())?;
+        let chain = self.filter_by_required_parameters(&req.model, chain, req)?;
         let mut last_err: Option<RouterError> = None;
 
         for (provider_name, model_name) in &chain {
@@ -2966,6 +3055,152 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    // --- active_params / filter_by_required_parameters ------------------------
+
+    fn router_with_provider_kinds(kinds: Vec<(&str, ProviderKind)>) -> Router {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        Router {
+            provider_kinds: kinds.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            ..router
+        }
+    }
+
+    #[test]
+    fn active_params_is_empty_for_a_bare_request() {
+        let req = test_request("anthropic/claude-sonnet-5");
+        assert!(active_params(&req).is_empty());
+    }
+
+    #[test]
+    fn active_params_lists_every_set_field() {
+        let mut req = test_request("anthropic/claude-sonnet-5");
+        req.tools = Some(vec![]);
+        req.tool_choice = Some(json!("auto"));
+        req.response_format = Some(rp_core::ResponseFormat::JsonObject);
+        req.top_k = Some(40);
+        req.min_p = Some(0.1);
+        req.top_a = Some(0.1);
+        req.frequency_penalty = Some(0.1);
+        req.presence_penalty = Some(0.1);
+        req.repetition_penalty = Some(1.1);
+        req.logit_bias = Some(HashMap::from([("1".to_string(), -1.0)]));
+        req.seed = Some(1);
+        let params = active_params(&req);
+        for expected in [
+            "tools",
+            "tool_choice",
+            "response_format",
+            "top_k",
+            "min_p",
+            "top_a",
+            "frequency_penalty",
+            "presence_penalty",
+            "repetition_penalty",
+            "logit_bias",
+            "seed",
+        ] {
+            assert!(params.contains(&expected), "missing {expected}");
+        }
+        assert!(!params.contains(&"reasoning"));
+        assert!(!params.contains(&"cache_control"));
+    }
+
+    #[test]
+    fn active_params_detects_cache_control_on_any_message() {
+        let mut req = test_request("anthropic/claude-sonnet-5");
+        req.messages[0].cache_control = Some(rp_core::CacheControl::Ephemeral);
+        assert_eq!(active_params(&req), vec!["cache_control"]);
+    }
+
+    #[test]
+    fn filter_by_required_parameters_is_a_no_op_when_unset() {
+        let router = router_with_provider_kinds(vec![("anthropic", ProviderKind::Anthropic)]);
+        let mut req = test_request("smart");
+        req.response_format = Some(rp_core::ResponseFormat::JsonObject);
+        let result = router
+            .filter_by_required_parameters(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                &req,
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
+    }
+
+    #[test]
+    fn filter_by_required_parameters_drops_a_candidate_missing_an_active_field() {
+        // logit_bias is native only to OpenAI-compatible; Anthropic has no
+        // field for it at all.
+        let router = router_with_provider_kinds(vec![
+            ("anthropic", ProviderKind::Anthropic),
+            ("openai", ProviderKind::Openai),
+        ]);
+        let mut req = test_request("smart");
+        req.logit_bias = Some(HashMap::from([("1".to_string(), -1.0)]));
+        req.provider = Some(ProviderPreferences {
+            require_parameters: Some(true),
+            ..Default::default()
+        });
+        let result = router
+            .filter_by_required_parameters(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2")]),
+                &req,
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2")]));
+    }
+
+    #[test]
+    fn filter_by_required_parameters_keeps_a_candidate_supporting_every_active_field() {
+        let router = router_with_provider_kinds(vec![("gemini", ProviderKind::Gemini)]);
+        let mut req = test_request("smart");
+        req.top_k = Some(40);
+        req.seed = Some(1);
+        req.provider = Some(ProviderPreferences {
+            require_parameters: Some(true),
+            ..Default::default()
+        });
+        let result = router
+            .filter_by_required_parameters("smart", chain(&[("gemini", "m1")]), &req)
+            .unwrap();
+        assert_eq!(result, chain(&[("gemini", "m1")]));
+    }
+
+    #[test]
+    fn filter_by_required_parameters_errors_when_nothing_survives() {
+        let router = router_with_provider_kinds(vec![("anthropic", ProviderKind::Anthropic)]);
+        let mut req = test_request("smart");
+        req.logit_bias = Some(HashMap::from([("1".to_string(), -1.0)]));
+        req.provider = Some(ProviderPreferences {
+            require_parameters: Some(true),
+            ..Default::default()
+        });
+        let err = router
+            .filter_by_required_parameters("smart", chain(&[("anthropic", "m1")]), &req)
+            .unwrap_err();
+        assert!(matches!(err, RouterError::NoEligibleProvider(_)));
+    }
+
+    #[test]
+    fn filter_by_required_parameters_drops_a_candidate_with_no_resolved_kind() {
+        // "anthropic" survived apply_preferences (e.g. from a route alias
+        // config), but this process never actually configured it, so
+        // there's no kind on record -- dropped defensively rather than
+        // assumed compatible.
+        let router = router_with_provider_kinds(vec![]);
+        let mut req = test_request("smart");
+        req.top_k = Some(40);
+        req.provider = Some(ProviderPreferences {
+            require_parameters: Some(true),
+            ..Default::default()
+        });
+        let err = router
+            .filter_by_required_parameters("smart", chain(&[("anthropic", "m1")]), &req)
+            .unwrap_err();
+        assert!(matches!(err, RouterError::NoEligibleProvider(_)));
     }
 
     // --- ewma_record / ewma_lookup --------------------------------------------
