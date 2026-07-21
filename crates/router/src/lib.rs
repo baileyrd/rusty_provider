@@ -1138,8 +1138,9 @@ impl Router {
         };
         self.outbound_limiter
             .check(provider_name, rpm)
-            .map_err(|retry_after_secs| ProviderError::RateLimited {
-                retry_after_secs: Some(retry_after_secs.ceil() as u64),
+            .map(|_| ())
+            .map_err(|status| ProviderError::RateLimited {
+                retry_after_secs: Some(status.retry_after_secs.ceil() as u64),
             })
     }
 

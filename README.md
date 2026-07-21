@@ -696,6 +696,17 @@ set (otherwise uncapped). Only `POST /v1/chat/completions` is rate
 limited — metadata endpoints (`/v1/models`, `/v1/usage`, `/metrics`)
 aren't. Rejections return `429` with a `Retry-After` header.
 
+Every rate-limit-checked response — success or `429` — also carries
+`X-RateLimit-Limit` (the bucket's requests-per-minute capacity),
+`X-RateLimit-Remaining` (tokens left after this request; `0` on a `429`),
+and `X-RateLimit-Reset` (seconds from now until the bucket is back to
+full capacity, same "seconds from now" convention as `Retry-After` rather
+than a Unix timestamp, since this is a continuously-refilling token
+bucket, not a fixed window with a natural epoch boundary). A caller with
+no matching client and no `default_rate_limit_rpm` configured gets none
+of these headers at all, same as it gets no `429` — there's no bucket to
+report on.
+
 The source IP is the raw TCP peer address. Behind a reverse proxy this is
 the proxy's address, not the real client's — this router doesn't parse
 `X-Forwarded-For`, since trusting it without a configured list of trusted

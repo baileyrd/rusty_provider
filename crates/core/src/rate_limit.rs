@@ -28,21 +28,66 @@ impl TokenBucket {
         self.tokens = (self.tokens + elapsed_secs * (self.capacity / 60.0)).min(self.capacity);
     }
 
-    /// Consume one token if available. On failure, returns the number of
-    /// seconds until a token will next be available.
-    fn try_acquire(&mut self) -> Result<(), f64> {
+    /// Seconds from now until this bucket is back to full capacity --
+    /// always computable regardless of whether the most recent
+    /// `try_acquire` succeeded or failed, for `X-RateLimit-Reset`.
+    fn reset_secs(&self) -> f64 {
+        if self.capacity <= 0.0 {
+            0.0
+        } else {
+            (self.capacity - self.tokens) / (self.capacity / 60.0)
+        }
+    }
+
+    /// Consume one token if available. `Ok`/`Err` both carry a
+    /// [`RateLimitStatus`] snapshot -- the only difference is `remaining`
+    /// (`0` on failure) and `retry_after_secs` (`0.0` on success).
+    fn try_acquire(&mut self) -> Result<RateLimitStatus, RateLimitStatus> {
         self.refill();
+        let limit = self.capacity.max(0.0) as u32;
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
-            Ok(())
+            Ok(RateLimitStatus {
+                limit,
+                remaining: self.tokens as u32,
+                reset_secs: self.reset_secs(),
+                retry_after_secs: 0.0,
+            })
         } else if self.capacity <= 0.0 {
             // A zero/negative capacity bucket never refills usefully;
             // report a fixed cooldown rather than an infinite/undefined wait.
-            Err(60.0)
+            Err(RateLimitStatus {
+                limit,
+                remaining: 0,
+                reset_secs: 60.0,
+                retry_after_secs: 60.0,
+            })
         } else {
-            Err((1.0 - self.tokens) / (self.capacity / 60.0))
+            Err(RateLimitStatus {
+                limit,
+                remaining: 0,
+                reset_secs: self.reset_secs(),
+                retry_after_secs: (1.0 - self.tokens) / (self.capacity / 60.0),
+            })
         }
     }
+}
+
+/// A snapshot of one rate-limit bucket's state as of a `RateLimiter::check`
+/// call, carrying everything needed for `X-RateLimit-*` response headers
+/// (and, on failure, `Retry-After`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateLimitStatus {
+    /// The bucket's configured capacity, in requests per minute.
+    pub limit: u32,
+    /// Tokens left in the bucket right after this check -- always `0` on
+    /// a failed check.
+    pub remaining: u32,
+    /// Seconds from now until the bucket is back to full capacity.
+    pub reset_secs: f64,
+    /// Seconds from now until at least one token will be available again
+    /// -- `0.0` on a successful check, since one already was.
+    pub retry_after_secs: f64,
 }
 
 /// A named collection of independent token-bucket rate limiters, keyed by
@@ -63,9 +108,14 @@ impl RateLimiter {
 
     /// Attempt to consume one token from `key`'s bucket, creating it with
     /// `requests_per_minute` capacity if this is the first time `key` has
-    /// been seen. Returns `Err(seconds_until_retry)` if the bucket is
-    /// currently empty.
-    pub fn check(&self, key: &str, requests_per_minute: u32) -> Result<(), f64> {
+    /// been seen. `Err` if the bucket is currently empty; either way, the
+    /// returned [`RateLimitStatus`] carries what a caller needs for
+    /// `X-RateLimit-*` (and, on `Err`, `Retry-After`) response headers.
+    pub fn check(
+        &self,
+        key: &str,
+        requests_per_minute: u32,
+    ) -> Result<RateLimitStatus, RateLimitStatus> {
         let mut buckets = self.buckets.write().unwrap();
         let bucket = buckets
             .entry(key.to_string())
@@ -87,10 +137,13 @@ mod tests {
         assert!(limiter.check("a", 3).is_ok());
         assert!(limiter.check("a", 3).is_ok());
 
-        let retry_after = limiter.check("a", 3).unwrap_err();
+        let status = limiter.check("a", 3).unwrap_err();
+        assert_eq!(status.limit, 3);
+        assert_eq!(status.remaining, 0);
         assert!(
-            retry_after > 0.0 && retry_after <= 60.0,
-            "unexpected retry_after: {retry_after}"
+            status.retry_after_secs > 0.0 && status.retry_after_secs <= 60.0,
+            "unexpected retry_after_secs: {}",
+            status.retry_after_secs
         );
     }
 
@@ -121,7 +174,11 @@ mod tests {
     #[test]
     fn zero_capacity_always_rejects_with_fixed_cooldown() {
         let limiter = RateLimiter::new();
-        assert_eq!(limiter.check("none", 0), Err(60.0));
+        let status = limiter.check("none", 0).unwrap_err();
+        assert_eq!(status.limit, 0);
+        assert_eq!(status.remaining, 0);
+        assert_eq!(status.retry_after_secs, 60.0);
+        assert_eq!(status.reset_secs, 60.0);
         assert!(limiter.check("none", 0).is_err());
     }
 
@@ -131,5 +188,31 @@ mod tests {
         // The very first check for a key should succeed even though no
         // time has passed to "earn" a token -- new buckets start full.
         assert!(limiter.check("fresh", 5).is_ok());
+    }
+
+    #[test]
+    fn successful_check_reports_limit_and_decremented_remaining() {
+        let limiter = RateLimiter::new();
+        let first = limiter.check("a", 5).unwrap();
+        assert_eq!(first.limit, 5);
+        assert_eq!(first.remaining, 4);
+        assert_eq!(first.retry_after_secs, 0.0);
+
+        let second = limiter.check("a", 5).unwrap();
+        assert_eq!(second.remaining, 3);
+    }
+
+    #[test]
+    fn reset_secs_reflects_the_deficit_left_by_this_check() {
+        let limiter = RateLimiter::new();
+        // Capacity 10 => refills at 10/60 tokens/sec. Consuming the first
+        // token from a freshly-seeded full bucket leaves a 1-token
+        // deficit, which takes 1 / (10/60) = 6 seconds to refill.
+        let status = limiter.check("fresh", 10).unwrap();
+        assert!(
+            (status.reset_secs - 6.0).abs() < 0.01,
+            "expected ~6.0, got {}",
+            status.reset_secs
+        );
     }
 }

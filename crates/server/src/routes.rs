@@ -2,12 +2,12 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::{stream, StreamExt};
-use rp_core::{ChatRequest, ModelInfo};
+use rp_core::{ChatRequest, ModelInfo, RateLimitStatus};
 use rp_router::{BudgetPeriod, ClientConfig, ProviderStats, UsageStats};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -89,14 +89,39 @@ fn resolve_rate_limit(
         .map(|rpm| (format!("ip:{}", addr.ip()), rpm))
 }
 
-fn rate_limited_response(state: &AppState, identity: &str, retry_after_secs: f64) -> Response {
+fn rate_limited_response(state: &AppState, identity: &str, status: &RateLimitStatus) -> Response {
     state.router.record_inbound_rate_limit_rejection(identity);
-    let secs = retry_after_secs.ceil().max(1.0) as u64;
-    json_error_with_retry_after(
+    let secs = status.retry_after_secs.ceil().max(1.0) as u64;
+    let mut resp = json_error_with_retry_after(
         429,
         &format!("rate limit exceeded, retry after {secs}s"),
         Some(secs),
-    )
+    );
+    apply_rate_limit_headers(&mut resp, status);
+    resp
+}
+
+/// Sets `X-RateLimit-Limit`/`X-RateLimit-Remaining`/`X-RateLimit-Reset` on
+/// `resp` from `status` -- called on every rate-limit-checked response,
+/// success or failure, so a client can see how close it is to being
+/// throttled without having to wait for a `429` to find out.
+/// `X-RateLimit-Reset` is seconds from now (not a Unix timestamp), same
+/// convention as `Retry-After`, since this is a continuously-refilling
+/// token bucket rather than a fixed window with a natural epoch boundary.
+fn apply_rate_limit_headers(resp: &mut Response, status: &RateLimitStatus) {
+    let headers = resp.headers_mut();
+    for (name, value) in [
+        ("x-ratelimit-limit", status.limit.to_string()),
+        ("x-ratelimit-remaining", status.remaining.to_string()),
+        (
+            "x-ratelimit-reset",
+            status.reset_secs.ceil().max(0.0).to_string(),
+        ),
+    ] {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 /// The configured `[[clients]]` name whose key matches this request's
@@ -231,10 +256,24 @@ mod tests {
 
     // --- rate_limited_response ---------------------------------------------------
 
+    fn status(
+        limit: u32,
+        remaining: u32,
+        retry_after_secs: f64,
+        reset_secs: f64,
+    ) -> RateLimitStatus {
+        RateLimitStatus {
+            limit,
+            remaining,
+            retry_after_secs,
+            reset_secs,
+        }
+    }
+
     #[tokio::test]
     async fn rate_limited_response_returns_429_with_a_rounded_up_retry_after_header() {
         let state = test_state(vec![], None).await;
-        let resp = rate_limited_response(&state, "ip:127.0.0.1", 0.2);
+        let resp = rate_limited_response(&state, "ip:127.0.0.1", &status(60, 0, 0.2, 0.2));
         assert_eq!(resp.status(), 429);
         assert_eq!(
             resp.headers().get("retry-after").unwrap(),
@@ -246,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_response_retry_after_ceils_fractional_seconds() {
         let state = test_state(vec![], None).await;
-        let resp = rate_limited_response(&state, "ip:127.0.0.1", 4.1);
+        let resp = rate_limited_response(&state, "ip:127.0.0.1", &status(60, 0, 4.1, 4.1));
         assert_eq!(
             resp.headers().get("retry-after").unwrap(),
             &HeaderValue::from_static("5")
@@ -254,9 +293,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limited_response_sets_x_ratelimit_headers() {
+        let state = test_state(vec![], None).await;
+        let resp = rate_limited_response(&state, "ip:127.0.0.1", &status(60, 0, 4.1, 4.6));
+        assert_eq!(
+            resp.headers().get("x-ratelimit-limit").unwrap(),
+            &HeaderValue::from_static("60")
+        );
+        assert_eq!(
+            resp.headers().get("x-ratelimit-remaining").unwrap(),
+            &HeaderValue::from_static("0")
+        );
+        assert_eq!(
+            resp.headers().get("x-ratelimit-reset").unwrap(),
+            &HeaderValue::from_static("5"),
+            "reset_secs is ceil'd, same rounding convention as retry-after"
+        );
+    }
+
+    #[tokio::test]
     async fn rate_limited_response_records_the_rejection_under_the_given_identity() {
         let state = test_state(vec![], None).await;
-        rate_limited_response(&state, "client:acme", 1.0);
+        rate_limited_response(&state, "client:acme", &status(60, 0, 1.0, 1.0));
         let metrics = state.router.render_prometheus_metrics();
         assert!(metrics.contains("rusty_provider_inbound_rate_limit_rejections_total"));
         assert!(metrics.contains(r#"identity="client:acme""#));
@@ -265,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_response_body_reports_the_rounded_retry_after_in_the_message() {
         let state = test_state(vec![], None).await;
-        let resp = rate_limited_response(&state, "ip:127.0.0.1", 4.1);
+        let resp = rate_limited_response(&state, "ip:127.0.0.1", &status(60, 0, 4.1, 4.1));
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -842,19 +900,39 @@ pub async fn chat_completions(
     if let Some(resp) = check_auth(&state, &headers) {
         return resp;
     }
+
+    let mut rate_limit_status = None;
     if let Some((identity, rpm)) = resolve_rate_limit(&state, &headers, addr) {
-        if let Err(retry_after_secs) = state.rate_limiter.check(&identity, rpm) {
-            return rate_limited_response(&state, &identity, retry_after_secs);
+        match state.rate_limiter.check(&identity, rpm) {
+            Ok(status) => rate_limit_status = Some(status),
+            Err(status) => return rate_limited_response(&state, &identity, &status),
         }
     }
+
+    let mut resp = chat_completions_dispatch(&state, &headers, req).await;
+    if let Some(status) = &rate_limit_status {
+        apply_rate_limit_headers(&mut resp, status);
+    }
+    resp
+}
+
+/// The part of `chat_completions` downstream of auth/rate-limiting --
+/// split out so that seam is the single place `chat_completions` attaches
+/// `X-RateLimit-*` headers, regardless of which of these branches produced
+/// the response.
+async fn chat_completions_dispatch(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: ChatRequest,
+) -> Response {
     if req.messages.is_empty() {
         return json_error(400, "\"messages\" must not be empty");
     }
 
-    let client_name = matched_client_name(&state, &headers);
+    let client_name = matched_client_name(state, headers);
     if let Some(name) = &client_name {
         if let Err(exceeded) = state.router.check_client_budget(name).await {
-            return budget_exceeded_response(&state, name, exceeded);
+            return budget_exceeded_response(state, name, exceeded);
         }
     }
 
