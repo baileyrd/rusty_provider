@@ -11,8 +11,8 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use rp_core::{
     ChatChunk, ChatMessage, ChatMessageDelta, ChatRequest, ChatResponse, ChatStream, Choice,
-    ChunkChoice, ContentPart, FunctionCallDelta, MessageContent, Provider, ProviderError, Role,
-    Tool, ToolCall, ToolCallDelta, Usage,
+    ChunkChoice, ContentPart, FunctionCallDelta, InputAudio, MessageContent, Provider,
+    ProviderError, Role, Tool, ToolCall, ToolCallDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -167,7 +167,10 @@ fn build_contents(messages: &[ChatMessage]) -> (Option<String>, Vec<Content>) {
 /// Translates a message's content into Gemini `parts`, turning
 /// `image_url` parts into `inlineData` (for a `data:<mime>;base64,<data>`
 /// URI) or `fileData` (for an `https://` URL, whose MIME type is guessed
-/// from the URL's extension since Gemini requires one).
+/// from the URL's extension since Gemini requires one), and `input_audio`
+/// parts into `inlineData` directly -- Gemini accepts audio the same way
+/// it accepts inline images, and OpenAI's `input_audio.data` is already
+/// raw base64 with no URI wrapper to unwrap.
 fn content_to_parts(content: &MessageContent) -> Vec<Value> {
     match content {
         MessageContent::Text(text) => vec![json!({"text": text})],
@@ -176,9 +179,16 @@ fn content_to_parts(content: &MessageContent) -> Vec<Value> {
             .map(|part| match part {
                 ContentPart::Text { text } => json!({"text": text}),
                 ContentPart::ImageUrl { image_url } => image_part(&image_url.url),
+                ContentPart::InputAudio { input_audio } => audio_part(input_audio),
             })
             .collect(),
     }
+}
+
+fn audio_part(audio: &InputAudio) -> Value {
+    json!({
+        "inlineData": {"mimeType": format!("audio/{}", audio.format), "data": audio.data},
+    })
 }
 
 fn image_part(url: &str) -> Value {
@@ -762,6 +772,26 @@ mod tests {
         );
     }
 
+    // --- audio_part ----------------------------------------------------------------
+
+    #[test]
+    fn audio_part_uses_inline_data_with_a_derived_mime_type() {
+        assert_eq!(
+            audio_part(&InputAudio {
+                data: "aGVsbG8=".to_string(),
+                format: "wav".to_string(),
+            }),
+            json!({"inlineData": {"mimeType": "audio/wav", "data": "aGVsbG8="}})
+        );
+        assert_eq!(
+            audio_part(&InputAudio {
+                data: "aGVsbG8=".to_string(),
+                format: "mp3".to_string(),
+            }),
+            json!({"inlineData": {"mimeType": "audio/mp3", "data": "aGVsbG8="}})
+        );
+    }
+
     // --- content_to_parts ---------------------------------------------------------
 
     #[test]
@@ -789,6 +819,20 @@ mod tests {
                 json!({"text": "what's this?"}),
                 json!({"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}}),
             ]
+        );
+    }
+
+    #[test]
+    fn content_to_parts_translates_an_audio_part() {
+        let content = MessageContent::Parts(vec![ContentPart::InputAudio {
+            input_audio: InputAudio {
+                data: "aGVsbG8=".to_string(),
+                format: "wav".to_string(),
+            },
+        }]);
+        assert_eq!(
+            content_to_parts(&content),
+            vec![json!({"inlineData": {"mimeType": "audio/wav", "data": "aGVsbG8="}})]
         );
     }
 
@@ -835,5 +879,26 @@ mod tests {
         let (system, contents) = build_contents(&messages);
         assert_eq!(system, Some("be concise".to_string()));
         assert_eq!(contents[0].parts, vec![json!({"text": "ok"})]);
+    }
+
+    #[test]
+    fn build_contents_translates_a_user_audio_content_part() {
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: Some(MessageContent::Parts(vec![ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "aGVsbG8=".to_string(),
+                    format: "wav".to_string(),
+                },
+            }])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let (_, contents) = build_contents(&messages);
+        assert_eq!(
+            contents[0].parts,
+            vec![json!({"inlineData": {"mimeType": "audio/wav", "data": "aGVsbG8="}})]
+        );
     }
 }

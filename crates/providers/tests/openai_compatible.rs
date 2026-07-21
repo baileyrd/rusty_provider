@@ -315,6 +315,43 @@ async fn chat_forwards_image_content_verbatim_in_request_body() {
 }
 
 #[tokio::test]
+async fn chat_forwards_audio_content_verbatim_in_request_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what's said in this clip?"},
+                    {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "wav"}},
+                ],
+            }],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22}
+        })))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", server.uri(), "test-key");
+    let req = common::request_with_audio("gpt-4o-mini");
+    provider
+        .chat(&req, "gpt-4o-mini")
+        .await
+        .expect("chat should succeed");
+}
+
+#[tokio::test]
 async fn chat_stream_parses_tool_call_deltas() {
     let server = MockServer::start().await;
     let sse_body = concat!(

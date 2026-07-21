@@ -28,6 +28,14 @@ pub enum ProviderError {
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
+    /// This provider adapter has no way to represent some part of the
+    /// request (e.g. audio content sent to a provider whose API has no
+    /// audio-input support). Retryable so a fallback chain moves on to a
+    /// candidate that might support it, rather than failing the whole
+    /// request outright.
+    #[error("unsupported content: {0}")]
+    UnsupportedContent(String),
+
     #[error("provider error: {0}")]
     Other(String),
 }
@@ -45,6 +53,7 @@ impl ProviderError {
             ProviderError::InvalidRequest(_) => false,
             ProviderError::ModelNotFound(_) => false,
             ProviderError::Decode(_) => false,
+            ProviderError::UnsupportedContent(_) => true,
             ProviderError::Other(_) => false,
         }
     }
@@ -61,6 +70,7 @@ impl ProviderError {
             ProviderError::Network(_) => 502,
             ProviderError::Decode(_) => 502,
             ProviderError::ModelNotFound(_) => 404,
+            ProviderError::UnsupportedContent(_) => 400,
             ProviderError::Other(_) => 500,
         }
     }
@@ -157,6 +167,16 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_content_maps_to_400_and_is_retryable() {
+        let err = ProviderError::UnsupportedContent("no audio input support".to_string());
+        assert_eq!(err.status_code(), 400);
+        assert!(
+            err.is_retryable(),
+            "a fallback chain should move on to a candidate that might support this content"
+        );
+    }
+
+    #[test]
     fn every_status_code_falls_in_the_valid_http_status_range() {
         let variants = [
             ProviderError::Auth("x".to_string()),
@@ -172,6 +192,7 @@ mod tests {
             ProviderError::Network("x".to_string()),
             ProviderError::Decode("x".to_string()),
             ProviderError::ModelNotFound("x".to_string()),
+            ProviderError::UnsupportedContent("x".to_string()),
             ProviderError::Other("x".to_string()),
         ];
         for variant in variants {

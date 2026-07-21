@@ -75,7 +75,7 @@ response — both streamed and non-streamed.
 
 A message's `content` can be either a plain string or an array of typed
 parts, matching OpenAI's multimodal shape, so a user turn can attach one
-or more images alongside text:
+or more images or audio clips alongside text:
 
 ```jsonc
 {
@@ -83,26 +83,40 @@ or more images alongside text:
   "messages": [{
     "role": "user",
     "content": [
-      {"type": "text", "text": "What's in this image?"},
-      {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}}
+      {"type": "text", "text": "What's in this image, and what's said in this clip?"},
+      {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}},
       // or a base64-encoded image inline:
       // {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KG..."}}
+      {"type": "input_audio", "input_audio": {"data": "UklGRi4...", "format": "wav"}}
     ]
   }]
 }
 ```
 
-The router translates `image_url` parts into each provider's own image
-format (Anthropic's `image` content block, Gemini's `inlineData`/
-`fileData` parts) for `Role::User` messages. A `data:<mime>;base64,<data>`
-URI is passed through as inline base64; a plain `https://` URL is passed
-through as a remote reference (Gemini additionally needs a MIME type for
-this case, which is guessed from the URL's extension, defaulting to
-`image/jpeg`). System, assistant, and tool messages only ever send their
-plain text to a provider — image parts in a non-user role are silently
-dropped rather than translated, since none of the three providers accept
-images there. Audio content isn't supported yet (see "Not yet
-implemented" below).
+The router translates these into each provider's own format for
+`Role::User` messages:
+
+- `image_url`: Anthropic's `image` content block, Gemini's `inlineData`/
+  `fileData` parts. A `data:<mime>;base64,<data>` URI is passed through as
+  inline base64; a plain `https://` URL is passed through as a remote
+  reference (Gemini additionally needs a MIME type for this case, which
+  is guessed from the URL's extension, defaulting to `image/jpeg`).
+- `input_audio`: Gemini's `inlineData` (its MIME type is `audio/<format>`,
+  e.g. `audio/wav` or `audio/mp3` — Gemini's accepted audio types happen
+  to match the `format` string directly, so no guessing is needed the way
+  image URLs require). **Anthropic's Messages API has no audio-input
+  support at all**, so a user message containing `input_audio` sent to
+  Anthropic fails with a retryable error instead of silently dropping the
+  audio — if it's part of a `[[routes]]` fallback chain, the router moves
+  on to the next candidate rather than failing the whole request; if
+  Anthropic is the only (or last) candidate, the request fails with `400`.
+
+System, assistant, and tool messages only ever send their plain text to a
+provider — image and audio parts in a non-user role are silently dropped
+rather than translated, since none of the three providers accept either
+modality there. `OpenAiCompatibleProvider` needs no translation for
+either content type — both pass straight through, since this router's
+wire shape already matches OpenAI's.
 
 If `[[pricing]]` has an entry for the model that actually served the
 request, the response (and, for streaming, whichever chunk carries the
@@ -382,5 +396,3 @@ rather than fail loudly.
   and `[persistence]`'s `GET /v1/usage` totals are single-process or
   single-SQLite-file, not a networked store multiple machines can share —
   see Spend budgets and Persistence above)
-- Audio content (image content in messages is supported, see `POST
-  /v1/chat/completions` above)
