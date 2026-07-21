@@ -1052,6 +1052,242 @@ mod tests {
         assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
     }
 
+    #[test]
+    fn apply_preferences_latency_sort_orders_three_or_more_entries_correctly() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        {
+            let mut latency = router.latency.write().unwrap();
+            latency.insert("anthropic/m1".to_string(), 2000.0);
+            latency.insert("openai/m2".to_string(), 500.0);
+            latency.insert("gemini/m3".to_string(), 1000.0);
+        }
+        let prefs = ProviderPreferences {
+            sort: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            chain(&[("openai", "m2"), ("gemini", "m3"), ("anthropic", "m1")])
+        );
+    }
+
+    #[test]
+    fn apply_preferences_latency_sort_with_all_unobserved_preserves_original_order() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            sort: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn apply_preferences_latency_sort_is_stable_for_equal_latencies() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        {
+            let mut latency = router.latency.write().unwrap();
+            latency.insert("anthropic/m1".to_string(), 500.0);
+            latency.insert("openai/m2".to_string(), 500.0);
+        }
+        let prefs = ProviderPreferences {
+            sort: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(
+            result, input,
+            "tied latencies should preserve original order"
+        );
+    }
+
+    #[test]
+    fn apply_preferences_latency_sort_applies_after_only_filter() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        {
+            let mut latency = router.latency.write().unwrap();
+            latency.insert("anthropic/m1".to_string(), 2000.0);
+            latency.insert("openai/m2".to_string(), 500.0);
+            // Fastest of all three, but filtered out by `only` below.
+            latency.insert("gemini/m3".to_string(), 10.0);
+        }
+        let prefs = ProviderPreferences {
+            only: Some(vec!["anthropic".to_string(), "openai".to_string()]),
+            sort: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    #[test]
+    fn apply_preferences_throughput_sort_orders_three_or_more_entries_correctly() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        {
+            let mut throughput = router.throughput.write().unwrap();
+            throughput.insert("anthropic/m1".to_string(), 20.0);
+            throughput.insert("openai/m2".to_string(), 80.0);
+            throughput.insert("gemini/m3".to_string(), 50.0);
+        }
+        let prefs = ProviderPreferences {
+            sort: Some("throughput".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            chain(&[("openai", "m2"), ("gemini", "m3"), ("anthropic", "m1")])
+        );
+    }
+
+    #[test]
+    fn apply_preferences_unobserved_throughput_sorts_last() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        router
+            .throughput
+            .write()
+            .unwrap()
+            .insert("anthropic/m1".to_string(), 50.0);
+        // "openai/m2" has no observed throughput -- despite being first in
+        // the chain, it should sort after the entry with real data (missing
+        // treated as 0.0 tokens/sec, worse than any real observation).
+        let prefs = ProviderPreferences {
+            sort: Some("throughput".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("openai", "m2"), ("anthropic", "m1")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("anthropic", "m1"), ("openai", "m2")]));
+    }
+
+    #[test]
+    fn apply_preferences_throughput_sort_with_all_unobserved_preserves_original_order() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let prefs = ProviderPreferences {
+            sort: Some("throughput".to_string()),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn apply_preferences_throughput_sort_is_stable_for_equal_throughput() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        {
+            let mut throughput = router.throughput.write().unwrap();
+            throughput.insert("anthropic/m1".to_string(), 50.0);
+            throughput.insert("openai/m2".to_string(), 50.0);
+        }
+        let prefs = ProviderPreferences {
+            sort: Some("throughput".to_string()),
+            ..Default::default()
+        };
+        let input = chain(&[("anthropic", "m1"), ("openai", "m2")]);
+        let result = router
+            .apply_preferences("smart", input.clone(), Some(&prefs))
+            .unwrap();
+        assert_eq!(
+            result, input,
+            "tied throughput should preserve original order"
+        );
+    }
+
+    #[test]
+    fn apply_preferences_throughput_sort_applies_after_only_filter() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        {
+            let mut throughput = router.throughput.write().unwrap();
+            throughput.insert("anthropic/m1".to_string(), 20.0);
+            throughput.insert("openai/m2".to_string(), 80.0);
+            // Fastest of all three, but filtered out by `only` below.
+            throughput.insert("gemini/m3".to_string(), 500.0);
+        }
+        let prefs = ProviderPreferences {
+            only: Some(vec!["anthropic".to_string(), "openai".to_string()]),
+            sort: Some("throughput".to_string()),
+            ..Default::default()
+        };
+        let result = router
+            .apply_preferences(
+                "smart",
+                chain(&[("anthropic", "m1"), ("openai", "m2"), ("gemini", "m3")]),
+                Some(&prefs),
+            )
+            .unwrap();
+        assert_eq!(result, chain(&[("openai", "m2"), ("anthropic", "m1")]));
+    }
+
+    // --- ewma_record / ewma_lookup --------------------------------------------
+
+    #[test]
+    fn ewma_lookup_returns_the_missing_default_for_an_unrecorded_key() {
+        let map = RwLock::new(HashMap::new());
+        assert_eq!(ewma_lookup(&map, "anthropic", "m1", -1.0), -1.0);
+    }
+
+    #[test]
+    fn ewma_record_seeds_the_average_on_first_observation() {
+        let map = RwLock::new(HashMap::new());
+        ewma_record(&map, "anthropic/m1".to_string(), 1000.0);
+        assert_eq!(ewma_lookup(&map, "anthropic", "m1", -1.0), 1000.0);
+    }
+
+    #[test]
+    fn ewma_record_blends_subsequent_samples_by_the_configured_alpha() {
+        let map = RwLock::new(HashMap::new());
+        ewma_record(&map, "anthropic/m1".to_string(), 1000.0);
+        ewma_record(&map, "anthropic/m1".to_string(), 0.0);
+        // EWMA_ALPHA = 0.3: 0.3 * 0.0 + 0.7 * 1000.0 = 700.0.
+        let observed = ewma_lookup(&map, "anthropic", "m1", -1.0);
+        assert!(
+            (observed - 700.0).abs() < 1e-9,
+            "expected ~700.0, got {observed}"
+        );
+    }
+
+    #[test]
+    fn ewma_record_keys_are_independent_per_provider_model() {
+        let map = RwLock::new(HashMap::new());
+        ewma_record(&map, "anthropic/m1".to_string(), 100.0);
+        ewma_record(&map, "openai/m2".to_string(), 900.0);
+        assert_eq!(ewma_lookup(&map, "anthropic", "m1", -1.0), 100.0);
+        assert_eq!(ewma_lookup(&map, "openai", "m2", -1.0), 900.0);
+    }
+
     // --- dispatch ------------------------------------------------------------
 
     #[tokio::test]
