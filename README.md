@@ -854,6 +854,53 @@ globally (every request, regardless of which client sent it), since
 rusty has no workspace/org concept to scope guardrails to individually
 the way OpenRouter's org-level guardrails can be.
 
+## Presets
+
+`[[presets]]` saves a named `(model, provider prefs, system prompt,
+sampling params)` bundle, referenced from a request by slug:
+
+```toml
+[[presets]]
+name = "support-bot"
+model = "smart"                                          # can be a [[routes]] alias
+system_prompt = "You are a helpful, concise support agent."
+temperature = 0.2
+max_tokens = 500
+
+[presets.provider]
+only = ["anthropic", "openai"]
+```
+
+```jsonc
+{
+  "preset": "support-bot",
+  "messages": [{"role": "user", "content": "..."}]
+}
+```
+
+Every field a preset supplies is a per-field *default* — whatever the
+request itself already sets always wins — with one exception: `model`
+overrides the request's `model` outright when set, since centralizing
+model selection is the point of a preset. That means the wire schema's
+`model` field is still required (the OpenAI-compatible schema doesn't
+make it optional), but a preset's `model` takes over regardless of what
+value the request sent — a client using a preset doesn't need to think
+about `model` at all, and if it does set one, a preset with its own
+`model` still wins. `system_prompt` is prepended as a new `role:
+"system"` message, but only if the request has no system message of its
+own — never appended alongside or merged with one the caller already
+provided. `provider`, if the request's own `provider` is unset, becomes
+the request's provider preferences wholesale (no per-field merge between
+the two — the request's own `provider`, if set at all, wins entirely,
+same all-or-nothing rule route `only`/`ignore`/etc. already follow
+elsewhere). Every sampling-param field (`temperature`, `top_p`,
+`max_tokens`, `stop`, and the fuller set from
+[Sampling parameters](#sampling-parameters)) fills in only where the
+request left that specific field unset. An unknown `preset` name is a
+`400`, same as any other invalid request field. Presets apply before
+[Guardrails](#guardrails), so a preset's own `system_prompt` is still
+scanned by whatever guardrails are configured.
+
 ## Admin API
 
 Setting `server.admin_key_env` unlocks a small admin API for inspecting

@@ -17,6 +17,9 @@ pub enum RouterError {
     #[error("request blocked by guardrail \"{0}\"")]
     GuardrailBlocked(String),
 
+    #[error("no preset named \"{0}\"")]
+    UnknownPreset(String),
+
     #[error(transparent)]
     Provider(#[from] ProviderError),
 }
@@ -28,6 +31,7 @@ impl RouterError {
             RouterError::ProviderNotConfigured(_) => 424,
             RouterError::NoEligibleProvider(_) => 400,
             RouterError::GuardrailBlocked(_) => 400,
+            RouterError::UnknownPreset(_) => 400,
             RouterError::Provider(e) => e.status_code(),
         }
     }
@@ -77,6 +81,14 @@ mod tests {
     fn guardrail_blocked_maps_to_400() {
         assert_eq!(
             RouterError::GuardrailBlocked("no-ssn".to_string()).status_code(),
+            400
+        );
+    }
+
+    #[test]
+    fn unknown_preset_maps_to_400() {
+        assert_eq!(
+            RouterError::UnknownPreset("support-bot".to_string()).status_code(),
             400
         );
     }

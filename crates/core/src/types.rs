@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// The unified request/response schema follows the OpenAI chat completions
 /// shape, since that's also what the HTTP server exposes to clients. Every
 /// provider adapter translates to/from this type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
@@ -243,6 +243,15 @@ pub struct ChatRequest {
     /// before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<String>>,
+    /// References a configured `[[presets]]` entry by name -- a saved
+    /// `(model, provider prefs, system prompt, sampling params)` bundle.
+    /// Every field it supplies is a *default*: whatever this request
+    /// already sets always wins, per field, except the preset's own
+    /// `model`, which overrides this request's `model` outright when
+    /// set. Unknown preset names are a `400`, same as any other invalid
+    /// request field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     pub messages: Vec<ChatMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,

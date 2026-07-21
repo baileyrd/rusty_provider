@@ -894,6 +894,7 @@ mod tests {
         ChatRequest {
             model: "anthropic/claude-sonnet-5".to_string(),
             models: None,
+            preset: None,
             messages: vec![ChatMessage::user("hi")],
             temperature: None,
             top_p: None,
@@ -1345,6 +1346,7 @@ mod tests {
         let req = ChatRequest {
             model: "anthropic/claude-sonnet-5".to_string(),
             models: None,
+            preset: None,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: Some(MessageContent::Parts(vec![ContentPart::InputAudio {

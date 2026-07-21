@@ -298,6 +298,82 @@ async fn chat_completions_rejects_empty_messages_with_400() {
 }
 
 #[tokio::test]
+async fn chat_completions_applies_a_preset_model_override_and_system_prompt() {
+    let server = MockServer::start().await;
+    // The mock only matches a request whose model is the preset's
+    // "anthropic/claude-sonnet-5" (not the caller's own "openai/gpt-4o-mini")
+    // and whose first message is the preset's system prompt -- proves both
+    // preset fields actually reached the outgoing request.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_string_contains("claude-sonnet-5"))
+        .and(body_string_contains("You are a support agent."))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "hi there"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })))
+        .mount(&server)
+        .await;
+
+    let key_var = unique_env_var("ANTHROPIC_KEY");
+    std::env::set_var(&key_var, "test-key");
+    let config = format!(
+        r#"
+        [providers.anthropic]
+        kind = "anthropic"
+        base_url = "{}"
+        api_key_env = "{key_var}"
+
+        [[presets]]
+        name = "support-bot"
+        model = "anthropic/claude-sonnet-5"
+        system_prompt = "You are a support agent."
+        "#,
+        server.uri()
+    );
+    let base_url = spawn_app(&config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "openai/gpt-4o-mini",
+            "preset": "support-bot",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["model"], "anthropic/claude-sonnet-5");
+}
+
+#[tokio::test]
+async fn chat_completions_rejects_an_unknown_preset_name_with_400() {
+    let base_url = spawn_app("providers = {}").await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "openai/gpt-4o-mini",
+            "preset": "does-not-exist",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("does-not-exist"));
+}
+
+#[tokio::test]
 async fn chat_completions_blocks_a_request_matching_a_block_guardrail() {
     let config = r#"
         providers = {}
