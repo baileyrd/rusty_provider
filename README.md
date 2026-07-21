@@ -1,5 +1,7 @@
 # rusty_provider
 
+[![CI](https://github.com/baileyrd/rusty_provider/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_provider/actions/workflows/ci.yml)
+
 A Rust AI provider router: one OpenAI-compatible HTTP API in front of
 OpenAI, Anthropic, Gemini, Groq, Together AI, and Fireworks, with
 config-driven fallback chains across providers. Point any existing OpenAI
