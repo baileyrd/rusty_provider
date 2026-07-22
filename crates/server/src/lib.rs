@@ -17,6 +17,7 @@ pub fn build_app(state: AppState) -> AxumRouter {
     let max_body_bytes = state.max_body_bytes;
     AxumRouter::new()
         .route("/health", get(routes::health))
+        .route("/ready", get(routes::ready))
         .route("/v1/models", get(routes::list_models))
         .route("/v1/usage", get(routes::usage_stats))
         .route("/v1/providers/stats", get(routes::provider_stats))

@@ -161,6 +161,17 @@ impl Persistence {
             Backend::Postgres(b) => b.reset_client_spend(client_name, period_key),
         }
     }
+
+    /// A trivial round trip (`SELECT 1`) confirming the backend is
+    /// actually reachable right now, for `GET /ready`. Deliberately
+    /// cheaper than `snapshot`/`load_all` -- readiness only needs to know
+    /// the connection works, not read back any real data.
+    pub async fn ping(&self) -> Result<(), PersistenceError> {
+        match &self.backend {
+            Backend::Sqlite(b) => b.ping().await,
+            Backend::Postgres(b) => b.ping().await,
+        }
+    }
 }
 
 fn read_usage_rows<E>(
@@ -365,6 +376,17 @@ impl SqliteBackend {
         .expect("persistence client_spend task panicked")
         .map_err(PersistenceError::from)
     }
+
+    async fn ping(&self) -> Result<(), PersistenceError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path)?;
+            conn.query_row("SELECT 1", [], |_| Ok(()))
+        })
+        .await
+        .expect("persistence ping task panicked")
+        .map_err(PersistenceError::from)
+    }
 }
 
 // --- Postgres backend -------------------------------------------------------------
@@ -565,6 +587,11 @@ impl PostgresBackend {
             .await?;
         Ok(row.map(|row| (row.get::<_, i64>(0), row.get::<_, f64>(1))))
     }
+
+    async fn ping(&self) -> Result<(), PersistenceError> {
+        self.client.execute("SELECT 1", &[]).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -619,6 +646,13 @@ mod tests {
         let persistence = open_sqlite(&path).await;
         assert!(path.exists());
         assert!(persistence.load_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ping_succeeds_against_a_reachable_sqlite_file() {
+        let path = unique_temp_path("ping");
+        let persistence = open_sqlite(&path).await;
+        persistence.ping().await.unwrap();
     }
 
     #[tokio::test]
@@ -921,6 +955,15 @@ mod tests {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    #[tokio::test]
+    async fn postgres_ping_succeeds_against_a_reachable_database() {
+        let Some(persistence) = open_postgres_for_test("ping").await else {
+            eprintln!("skipping: TEST_POSTGRES_URL not set");
+            return;
+        };
+        persistence.ping().await.unwrap();
     }
 
     #[tokio::test]
