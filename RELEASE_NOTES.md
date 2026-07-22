@@ -24,6 +24,24 @@ entries are tracked by PR rather than by release.
 
 ---
 
+## PR #96 — Add cargo-audit CI job; drop prometheus's unused protobuf feature
+**2026-07-22** · [#96](https://github.com/baileyrd/rusty_provider/pull/96)
+
+- **Added:** `.github/workflows/audit.yml` runs `cargo audit` against
+  `Cargo.lock` on every push/PR touching a `Cargo.toml`/`Cargo.lock`,
+  plus daily on a schedule — a newly published advisory against an
+  already-pinned dependency can't go unnoticed between pushes.
+- **Fixed:** a real, live advisory —
+  [RUSTSEC-2024-0437](https://rustsec.org/advisories/RUSTSEC-2024-0437)
+  (uncontrolled recursion, crash) in `protobuf` 2.28.0, pulled in
+  transitively via `prometheus`'s default `protobuf` feature. Only
+  `TextEncoder` (Prometheus text-exposition format) is ever used here,
+  never the protobuf wire format, so `prometheus` now builds with
+  `default-features = false` — drops the dependency (and the advisory)
+  entirely, no functional change.
+
+---
+
 ## PR #94 — Add MIT LICENSE file
 **2026-07-22** · [#94](https://github.com/baileyrd/rusty_provider/pull/94)
 
