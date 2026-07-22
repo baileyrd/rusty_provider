@@ -762,6 +762,25 @@ up in `GET /metrics` (`rusty_provider_dispatch_attempts_total` with
 the same in-memory, per-process, resets-on-restart token buckets as
 everything else this router tracks itself.
 
+## Request body size limit
+
+`server.max_body_bytes` caps an inbound request body, in bytes, rejected
+with `413 Payload Too Large` before a handler ever parses it:
+
+```toml
+[server]
+max_body_bytes = 20971520  # 20 MiB, this is the default
+```
+
+axum's `Json`/`Bytes` extractors already refuse anything over 2 MB even
+without this section present — `max_body_bytes` replaces that built-in
+ceiling rather than adding a second one on top of it. The default is
+raised well past 2 MB because a legitimate multimodal request (an image,
+audio clip, or PDF passed inline) is base64-encoded, which alone adds
+~33% over the original file's size — 2 MB is tight enough to reject
+ordinary attachments, not just abuse. Applies to every route, not only
+`/v1/chat/completions`.
+
 ## Spend budgets
 
 Rate limits cap how *often* a client can call this router; `budget_usd` on

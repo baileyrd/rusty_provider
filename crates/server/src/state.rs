@@ -40,4 +40,8 @@ pub struct AppState {
     /// was set in config and the env var resolved. `None` disables the
     /// admin API entirely, independent of `api_key`/`client_keys` above.
     pub admin_key: Option<String>,
+    /// Ceiling on an inbound request body, in bytes -- `server.max_body_bytes`,
+    /// applied as a `DefaultBodyLimit` layer over the whole router in
+    /// `build_app`.
+    pub max_body_bytes: usize,
 }
