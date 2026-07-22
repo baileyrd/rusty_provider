@@ -4,6 +4,12 @@
 [server]
 host = "0.0.0.0"
 port = 8080
+# Ceiling on an inbound request body, in bytes, enforced before a handler
+# ever parses it. axum's Json/Bytes extractors already refuse anything
+# over 2 MB even with this left at its default, but 2 MB is tight for a
+# legitimate multimodal request -- an inline base64-encoded image/PDF
+# alone adds ~33% overhead over its raw size.
+# max_body_bytes = 20971520  # 20 MiB, this is the default
 # Uncomment to require clients to send `Authorization: Bearer <token>`
 # where <token> is the value of the named env var. Any key from
 # `[[clients]]` below also authenticates, independent of this field.

@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter: Arc::new(RateLimiter::new()),
         clients: Arc::new(RwLock::new(config.clients.clone())),
         admin_key,
+        max_body_bytes: config.server.max_body_bytes,
     };
 
     let app = build_app(state);

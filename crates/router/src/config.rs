@@ -11,12 +11,24 @@ fn default_port() -> u16 {
     8080
 }
 
+fn default_max_body_bytes() -> usize {
+    20 * 1024 * 1024
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Ceiling on an inbound request body, in bytes, enforced before a
+    /// handler ever parses it. axum's `Json`/`Bytes` extractors already
+    /// refuse anything over 2 MB even with this section absent, but 2 MB
+    /// is tight for a legitimate multimodal request (an image or PDF
+    /// input is base64-encoded inline, which alone adds ~33% overhead) --
+    /// this makes that ceiling both explicit and operator-configurable.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
     /// If set, the env var holding a bearer token clients must present to
     /// this router. Leave unset to run with no auth (e.g. behind your own
     /// gateway). Any key from `[[clients]]` below also authenticates,
@@ -45,6 +57,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            max_body_bytes: default_max_body_bytes(),
             api_key_env: None,
             default_rate_limit_rpm: None,
             admin_key_env: None,
@@ -586,6 +599,7 @@ mod tests {
         assert_eq!(config.server.api_key_env, None);
         assert_eq!(config.server.default_rate_limit_rpm, None);
         assert_eq!(config.server.admin_key_env, None);
+        assert_eq!(config.server.max_body_bytes, 20 * 1024 * 1024);
     }
 
     #[test]
@@ -600,6 +614,7 @@ mod tests {
             api_key_env = "RP_API_KEY"
             default_rate_limit_rpm = 60
             admin_key_env = "RP_ADMIN_KEY"
+            max_body_bytes = 1048576
             "#,
         )
         .unwrap();
@@ -608,6 +623,7 @@ mod tests {
         assert_eq!(config.server.api_key_env.as_deref(), Some("RP_API_KEY"));
         assert_eq!(config.server.default_rate_limit_rpm, Some(60));
         assert_eq!(config.server.admin_key_env.as_deref(), Some("RP_ADMIN_KEY"));
+        assert_eq!(config.server.max_body_bytes, 1048576);
     }
 
     // --- providers -------------------------------------------------------------

@@ -59,6 +59,7 @@ async fn spawn_app(config_toml: &str) -> String {
         rate_limiter: Arc::new(RateLimiter::new()),
         clients: Arc::new(RwLock::new(config.clients.clone())),
         admin_key,
+        max_body_bytes: config.server.max_body_bytes,
     };
 
     let app = build_app(state);
@@ -295,6 +296,32 @@ async fn chat_completions_rejects_empty_messages_with_400() {
         .as_str()
         .unwrap()
         .contains("messages"));
+}
+
+#[tokio::test]
+async fn chat_completions_rejects_a_body_over_the_configured_max_body_bytes_with_413() {
+    let base_url = spawn_app(
+        r#"
+        providers = {}
+
+        [server]
+        max_body_bytes = 64
+        "#,
+    )
+    .await;
+
+    let oversized_content = "x".repeat(500);
+    let resp = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": oversized_content}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 413);
 }
 
 #[tokio::test]

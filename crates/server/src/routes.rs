@@ -250,6 +250,7 @@ mod tests {
             rate_limiter: Arc::new(RateLimiter::new()),
             clients: Arc::new(std::sync::RwLock::new(vec![])),
             admin_key: None,
+            max_body_bytes: 20 * 1024 * 1024,
         }
     }
 

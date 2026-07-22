@@ -2,6 +2,7 @@ pub mod errors;
 pub mod routes;
 pub mod state;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, patch, post};
 use axum::Router as AxumRouter;
 use tower_http::cors::CorsLayer;
@@ -13,6 +14,7 @@ use crate::state::AppState;
 /// Shared by `main` (serving on a real listener) and integration tests
 /// (serving on an ephemeral port via the same `axum::serve` path).
 pub fn build_app(state: AppState) -> AxumRouter {
+    let max_body_bytes = state.max_body_bytes;
     AxumRouter::new()
         .route("/health", get(routes::health))
         .route("/v1/models", get(routes::list_models))
@@ -40,5 +42,6 @@ pub fn build_app(state: AppState) -> AxumRouter {
         )
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
