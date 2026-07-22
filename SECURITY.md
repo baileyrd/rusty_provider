@@ -18,3 +18,9 @@ impact as you understand it.
 | ------- | --------- |
 | latest  | ✅        |
 | older   | ❌        |
+
+## Dependency scanning
+`cargo audit` runs against `Cargo.lock` on every push/PR that touches a
+`Cargo.toml`/`Cargo.lock`, plus daily on a schedule (so a newly published
+advisory against an already-pinned dependency doesn't go unnoticed
+between pushes) — see `.github/workflows/audit.yml`.
