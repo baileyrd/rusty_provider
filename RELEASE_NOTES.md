@@ -24,6 +24,17 @@ entries are tracked by PR rather than by release.
 
 ---
 
+## PR #94 — Add MIT LICENSE file
+**2026-07-22** · [#94](https://github.com/baileyrd/rusty_provider/pull/94)
+
+- **Fixed:** `Cargo.toml` has declared `license = "MIT"` since the
+  workspace's first commit, but the license text itself was never
+  reproduced anywhere in the repo — a real compliance gap for anyone
+  consuming the crate or repo. Adds a standard MIT `LICENSE` file and a
+  README "License" section linking to it.
+
+---
+
 ## PR #92 — Add multi-stage Dockerfile for container deployment
 **2026-07-22** · [#92](https://github.com/baileyrd/rusty_provider/pull/92)
 
