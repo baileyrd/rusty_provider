@@ -24,6 +24,23 @@ entries are tracked by PR rather than by release.
 
 ---
 
+## PR #88 — Add configurable request body size limit
+**2026-07-22** · [#88](https://github.com/baileyrd/rusty_provider/pull/88)
+
+- **Added:** `server.max_body_bytes`, applied as a `DefaultBodyLimit`
+  layer over the whole router, defaulting to 20 MiB. Rejected requests
+  get `413 Payload Too Large` before a handler ever parses the body.
+- **Fixed:** axum's `Json`/`Bytes` extractors already enforced an
+  implicit 2 MB body limit even without this config, but that ceiling
+  was neither explicit nor operator-configurable, and was tight enough
+  to reject a legitimate multimodal request — an inline
+  base64-encoded image, audio clip, or PDF adds ~33% overhead over the
+  original file's size. `max_body_bytes` replaces that implicit
+  ceiling rather than adding a second one on top of it.
+- Applies globally, not only to `/v1/chat/completions`.
+
+---
+
 ## PR #86 — Add opt-in response cache for identical requests
 **2026-07-22** · [#86](https://github.com/baileyrd/rusty_provider/pull/86)
 
