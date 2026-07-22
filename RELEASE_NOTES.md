@@ -24,6 +24,37 @@ entries are tracked by PR rather than by release.
 
 ---
 
+## PR #86 — Add opt-in response cache for identical requests
+**2026-07-22** · [#86](https://github.com/baileyrd/rusty_provider/pull/86)
+
+- **Added:** `[cache]`, an opt-in, in-memory, exact-match cache of
+  non-streaming `/v1/chat/completions` responses, keyed by a hash of the
+  entire incoming request. Fully off (no overhead) unless `[cache]` is
+  configured. Entries expire after `ttl_secs` (default 300) and the
+  cache holds at most `max_entries` (default 1000), evicting the
+  oldest entry once over capacity — the same eviction strategy
+  `GET /v1/generation?id=` already uses.
+- **Known limitation:** exact-match only, no semantic/fuzzy matching —
+  any difference in the request (model, messages, sampling parameters,
+  provider preferences) is a cache miss.
+- **Known limitation:** streaming requests always bypass the cache in
+  both directions; caching a replayed SSE chunk sequence is left for a
+  future version.
+- A cache hit skips dispatch to the provider and skips re-recording
+  usage/cost/latency/throughput/generation-cache bookkeeping for that
+  request, since it already ran once when the response was first
+  computed — this keeps `/v1/usage` and `/metrics` from double-counting
+  a single real generation. New `rusty_provider_cache_lookups_total`
+  Prometheus counter, labeled `hit`/`miss`.
+- Not the same thing as `cache_read_per_million`/`cache_write_per_million`
+  or `cache_control` (see [Prompt caching](README.md#prompt-caching)),
+  which price a provider's own prompt-cache discount rather than a
+  router-side response cache.
+- 18 new unit tests across `rp-router` (`cache.rs`, `config.rs`,
+  `metrics.rs`, and `dispatch`-level cache hit/miss/bypass behavior).
+
+---
+
 ## PR #84 — Add POST /v1/embeddings endpoint
 **2026-07-21** · [#84](https://github.com/baileyrd/rusty_provider/pull/84)
 
