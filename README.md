@@ -1452,3 +1452,7 @@ actually supports tool use, and that your `[[routes]]` fallback chain (if
 you use one) only includes models that do — a chain that silently falls
 back to a model without tool support will make the agent behave oddly
 rather than fail loudly.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
