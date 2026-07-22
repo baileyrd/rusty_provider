@@ -38,6 +38,28 @@ The server listens on `server.host:server.port` from `config.toml`
 (default `0.0.0.0:8080`). Set `server.api_key_env` in the config to require
 clients to send `Authorization: Bearer <token>`.
 
+### Docker
+
+```sh
+docker build -t rusty_provider .
+docker run -p 8080:8080 \
+  -v "$(pwd)/config.toml:/app/config.toml:ro" \
+  -e OPENAI_API_KEY=sk-... \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  rusty_provider
+```
+
+The image is a multi-stage build (`cargo-chef` for dependency-layer
+caching, so a source-only change doesn't force every dependency to
+recompile) producing a slim `debian:bookworm-slim` runtime image running
+as a non-root user. Nothing secret is baked in — mount your own
+`config.toml` (or point `CONFIG_PATH` elsewhere) and pass provider API
+keys as env vars, same as running it directly with `cargo run`. Point an
+orchestrator's liveness/readiness probes at [`/health` and
+`/ready`](#get-health) respectively; a `HEALTHCHECK` hitting `/health` is
+also baked into the image for Compose/Fly/Railway-style deployments that
+check container health directly rather than via an external prober.
+
 ## API
 
 ### `POST /v1/chat/completions`

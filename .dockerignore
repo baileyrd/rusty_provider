@@ -1,0 +1,7 @@
+target
+.git
+config.toml
+.env
+*.db
+*.db-wal
+*.db-shm
