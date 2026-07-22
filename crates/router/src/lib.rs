@@ -1,4 +1,5 @@
 mod auto_routing;
+mod cache;
 mod client_budget;
 mod config;
 mod error;
@@ -14,12 +15,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use cache::ResponseCache;
 use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
-    AutoRoutingConfig, BudgetPeriod, ClientConfig, ClientRole, Config, GuardrailAction,
-    GuardrailConfig, ModerationConfig, PersistenceBackend, PersistenceConfig, PostgresTlsMode,
-    PresetConfig, PricingEntry, ProviderConfig, ProviderKind, RouteAlias, ServerConfig,
-    WebSearchConfig, WebhookConfig,
+    AutoRoutingConfig, BudgetPeriod, CacheConfig, ClientConfig, ClientRole, Config,
+    GuardrailAction, GuardrailConfig, ModerationConfig, PersistenceBackend, PersistenceConfig,
+    PostgresTlsMode, PresetConfig, PricingEntry, ProviderConfig, ProviderKind, RouteAlias,
+    ServerConfig, WebSearchConfig, WebhookConfig,
 };
 pub use error::RouterError;
 use guardrails::Guardrail;
@@ -426,6 +428,11 @@ pub struct Router {
     /// resolved. `None` means `"web_search": true` on a request is a
     /// no-op -- the same as before this field existed.
     web_search: Option<Arc<WebSearchClient>>,
+    /// `[cache]`, if configured -- an exact-match cache of non-streaming
+    /// `dispatch` responses (see `cache::ResponseCache`). `None` means
+    /// every request always reaches a provider, same as before this
+    /// field existed.
+    cache: Option<Arc<RwLock<ResponseCache>>>,
 }
 
 /// Record a new EWMA sample under `key`, seeding the average on first
@@ -702,6 +709,14 @@ impl Router {
             }
         });
 
+        // No external credential to resolve, unlike moderation/web_search
+        // above -- this is purely an in-process cache, so there's nothing
+        // to skip-with-a-warning over.
+        let cache = config
+            .cache
+            .as_ref()
+            .map(|cfg| Arc::new(RwLock::new(ResponseCache::new(cfg))));
+
         Self {
             providers,
             provider_kinds,
@@ -726,6 +741,7 @@ impl Router {
             auto_routing,
             moderation,
             web_search,
+            cache,
         }
     }
 
@@ -1410,7 +1426,45 @@ impl Router {
             .map(|s| s.as_str())
     }
 
+    /// `req`'s `[cache]` key, if caching is configured and this isn't a
+    /// streaming request -- response caching only wraps `dispatch`, not
+    /// `dispatch_stream` (see `cache` module docs). `None` from either
+    /// condition means the caller should skip the cache entirely, same
+    /// as if `[cache]` were never configured.
+    fn cache_key_for(&self, req: &ChatRequest) -> Option<u64> {
+        if req.is_streaming() {
+            return None;
+        }
+        self.cache.as_ref().map(|_| ResponseCache::key_for(req))
+    }
+
+    /// Looks up `key` and records a `cache_lookups_total` hit/miss --
+    /// always called through `cache_key_for` first, so `self.cache` is
+    /// known to be `Some` whenever this runs with a real `key`, but it's
+    /// still guarded here for safety against a future call site that
+    /// forgets to check.
+    fn cache_get(&self, key: u64) -> Option<ChatResponse> {
+        let cache = self.cache.as_ref()?;
+        let resp = cache.write().unwrap().get(key);
+        self.metrics
+            .record_cache_lookup(if resp.is_some() { "hit" } else { "miss" });
+        resp
+    }
+
+    fn cache_insert(&self, key: u64, resp: ChatResponse) {
+        if let Some(cache) = &self.cache {
+            cache.write().unwrap().insert(key, resp);
+        }
+    }
+
     pub async fn dispatch(&self, req: &ChatRequest) -> Result<ChatResponse, RouterError> {
+        let cache_key = self.cache_key_for(req);
+        if let Some(key) = cache_key {
+            if let Some(resp) = self.cache_get(key) {
+                return Ok(resp);
+            }
+        }
+
         let target_model = self.resolve_target_model(req);
         let chain = self.resolve_chain(&target_model, req.models.as_deref())?;
         let chain = self.apply_preferences(&target_model, chain, req.provider.as_ref())?;
@@ -1500,6 +1554,9 @@ impl Router {
                         });
                     }
 
+                    if let Some(key) = cache_key {
+                        self.cache_insert(key, resp.clone());
+                    }
                     return Ok(resp);
                 }
                 Err(e) if e.is_retryable() => {
@@ -1736,6 +1793,7 @@ mod tests {
             auto_routing: None,
             moderation: None,
             web_search: None,
+            cache: None,
         }
     }
 
@@ -5193,6 +5251,134 @@ mod tests {
         assert_eq!(stats.requests, 3);
         assert_eq!(stats.prompt_tokens, 3);
         assert_eq!(stats.completion_tokens, 3);
+    }
+
+    // --- cache ---------------------------------------------------------------
+
+    fn router_with_cache(
+        providers: Vec<(&str, Arc<dyn Provider>)>,
+        ttl_secs: u64,
+        max_entries: usize,
+    ) -> Router {
+        let router = test_router(providers, vec![], vec![], vec![], vec![]);
+        Router {
+            cache: Some(Arc::new(RwLock::new(ResponseCache::new(&CacheConfig {
+                ttl_secs,
+                max_entries,
+            })))),
+            ..router
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_a_second_identical_request_is_served_from_cache() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = router_with_cache(vec![("anthropic", mock)], 60, 10);
+        let req = test_request("anthropic/m1");
+
+        let first = router.dispatch(&req).await.expect("should succeed");
+        let second = router.dispatch(&req).await.expect("should succeed");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the provider should only be called once -- the second dispatch should hit cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_a_different_request_is_not_served_from_cache() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = router_with_cache(vec![("anthropic", mock)], 60, 10);
+
+        router
+            .dispatch(&test_request("anthropic/m1"))
+            .await
+            .unwrap();
+        router
+            .dispatch(&test_request("anthropic/m2"))
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_without_cache_configured_always_calls_the_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        // test_router's default -- no [cache] configured at all.
+        let router = test_router(vec![("anthropic", mock)], vec![], vec![], vec![], vec![]);
+        let req = test_request("anthropic/m1");
+
+        router.dispatch(&req).await.unwrap();
+        router.dispatch(&req).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_bypasses_cache_for_a_streaming_request() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls: calls.clone(),
+        });
+        let router = router_with_cache(vec![("anthropic", mock)], 60, 10);
+        let mut req = test_request("anthropic/m1");
+        req.stream = Some(true);
+
+        // dispatch (not dispatch_stream) still runs to completion even
+        // for a `stream: true` request -- this only proves cache_key_for
+        // itself returns None for one, not that dispatch refuses it.
+        router.dispatch(&req).await.unwrap();
+        router.dispatch(&req).await.unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a streaming request should never be served from or written to cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_a_cache_hit_does_not_double_count_usage_snapshot() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockProvider {
+            name: "anthropic".to_string(),
+            behavior: MockBehavior::Succeed,
+            calls,
+        });
+        let router = router_with_cache(vec![("anthropic", mock)], 60, 10);
+        let req = test_request("anthropic/m1");
+
+        router.dispatch(&req).await.unwrap();
+        router.dispatch(&req).await.unwrap();
+        router.dispatch(&req).await.unwrap();
+
+        // Only the first (cache-miss) dispatch actually recorded usage --
+        // a cache hit replays the stored response without re-running any
+        // of dispatch's usage/cost/latency/throughput bookkeeping, so
+        // this doesn't triple-count a single generation's tokens/cost.
+        let snapshot = router.usage_snapshot().await;
+        let stats = &snapshot["anthropic/m1"];
+        assert_eq!(stats.requests, 1);
     }
 
     #[tokio::test]

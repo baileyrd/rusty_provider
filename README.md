@@ -1107,6 +1107,44 @@ so an operator can tell a quiet backend from a genuinely idle feature.
 `web_search.api_key_env` set but unresolvable at startup disables web
 search the same way a misconfigured provider is skipped, with a warning.
 
+## Response cache
+
+`[cache]` turns on an in-memory, exact-match cache of non-streaming chat
+completions, so identical requests within a short window are served
+without ever reaching a provider:
+
+```toml
+[cache]
+ttl_secs = 300        # optional, this is the default
+max_entries = 1000    # optional, this is the default
+```
+
+Not to be confused with [Prompt caching](#prompt-caching) above —
+`cache_control` and `cache_read_per_million`/`cache_write_per_million`
+price a *provider's own* prompt-cache discount (Anthropic, OpenAI, Gemini),
+whereas `[cache]` is a router-side cache that skips the provider entirely
+on a hit.
+
+The cache key is a hash of the entire incoming request — model, messages,
+every sampling parameter, `provider` preference, and so on — so this is
+exact-match only, not semantic/fuzzy matching: any difference at all is a
+miss. Only [non-streaming](#post-v1chatcompletions) requests are
+cacheable; a request with `"stream": true` always bypasses the cache in
+both directions (it's neither served from it nor written to it). Entries
+expire after `ttl_secs` (checked lazily, on lookup) and the cache holds at
+most `max_entries`, evicting the oldest entry once over capacity — the
+same fixed-capacity, insertion-order eviction [`GET
+/v1/generation?id=`](#get-v1generationid) already uses.
+
+A cache hit returns the stored response as-is and skips *all* of that
+request's usual bookkeeping — usage/cost accounting, latency and
+throughput histograms, the `/v1/generation?id=` record — since all of it
+was already recorded once, when the response was first computed. Re-running
+it on every hit would inflate [`/v1/usage`](#get-v1usage) with generations
+that never actually happened. Every lookup increments the
+`rusty_provider_cache_lookups_total` Prometheus counter, labeled `hit` or
+`miss`. `[cache]` absent leaves caching fully off, with no overhead.
+
 ## Admin API
 
 Setting `server.admin_key_env` unlocks a small admin API for inspecting

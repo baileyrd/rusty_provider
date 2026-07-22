@@ -317,6 +317,21 @@ completion_per_million = 0.79
 # max_results = 5                                                # optional, this is the default
 # timeout_secs = 10                                              # optional, this is the default
 
+# --- Response cache (optional) -----------------------------------------------------
+# An in-memory, exact-match cache of non-streaming chat completions, keyed by a
+# hash of the entire incoming request -- any difference at all (a different
+# message, a different sampling parameter, a different `provider` preference)
+# is a cache miss. No semantic/fuzzy matching. Only [cache] presence turns this
+# on; it's fully disabled (and costs nothing) when this section is absent.
+# Streaming requests always bypass the cache. A cache hit skips dispatch to the
+# provider entirely -- and skips re-recording usage/cost/latency metrics for
+# that request, since they were already recorded once when the response was
+# first computed.
+
+# [cache]
+# ttl_secs = 300        # optional, this is the default -- how long an entry stays fresh
+# max_entries = 1000    # optional, this is the default -- oldest entry evicted once over capacity
+
 # --- Presets (optional) ----------------------------------------------------------
 # A named, reusable bundle of request defaults, referenced from a request via
 # `"preset": "<name>"`. Every field here is a per-field default -- whatever the
