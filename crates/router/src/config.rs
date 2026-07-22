@@ -310,6 +310,8 @@ pub struct Config {
     pub moderation: Option<ModerationConfig>,
     #[serde(default)]
     pub web_search: Option<WebSearchConfig>,
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
 }
 
 /// Configures `model: "auto"` -- a heuristic (not ML) complexity-based
@@ -517,6 +519,33 @@ pub struct WebSearchConfig {
     /// request, so there's no reason to wait long for it.
     #[serde(default = "default_auxiliary_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    300
+}
+
+fn default_cache_max_entries() -> usize {
+    1000
+}
+
+/// An opt-in, in-memory, exact-match cache of `Router::dispatch`
+/// responses (non-streaming only -- see `Router::cache_key_for`), keyed
+/// by a hash of the entire request. Absent means caching is off
+/// entirely, same convention as every other optional subsystem here.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CacheConfig {
+    /// How long a cached response stays eligible to be served, in
+    /// seconds, before it's treated as a miss and evicted on next
+    /// lookup.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Maximum number of distinct requests to keep cached at once.
+    /// Oldest-inserted evicted first once full, same fixed-capacity
+    /// FIFO eviction `GenerationCache` already uses for `GET
+    /// /v1/generation?id=` lookups.
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
 }
 
 impl Config {
@@ -1299,6 +1328,46 @@ mod tests {
         assert_eq!(web_search.base_url, "http://localhost:9999/search");
         assert_eq!(web_search.max_results, 3);
         assert_eq!(web_search.timeout_secs, 3);
+    }
+
+    // --- cache -------------------------------------------------------------------
+
+    #[test]
+    fn cache_defaults_to_absent() {
+        let config = Config::from_toml_str("providers = {}").unwrap();
+        assert!(config.cache.is_none());
+    }
+
+    #[test]
+    fn cache_parses_default_ttl_and_max_entries() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [cache]
+            "#,
+        )
+        .unwrap();
+        let cache = config.cache.unwrap();
+        assert_eq!(cache.ttl_secs, 300);
+        assert_eq!(cache.max_entries, 1000);
+    }
+
+    #[test]
+    fn cache_honors_explicit_ttl_and_max_entries() {
+        let config = Config::from_toml_str(
+            r#"
+            providers = {}
+
+            [cache]
+            ttl_secs = 60
+            max_entries = 50
+            "#,
+        )
+        .unwrap();
+        let cache = config.cache.unwrap();
+        assert_eq!(cache.ttl_secs, 60);
+        assert_eq!(cache.max_entries, 50);
     }
 
     // --- persistence backend -----------------------------------------------------

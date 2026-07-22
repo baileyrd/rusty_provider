@@ -33,6 +33,7 @@ pub struct Metrics {
     client_budget_rejections_total: IntCounterVec,
     moderation_blocked_total: IntCounterVec,
     web_search_total: IntCounterVec,
+    cache_lookups_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -177,6 +178,19 @@ impl Metrics {
             .register(Box::new(web_search_total.clone()))
             .expect("metric name is unique");
 
+        let cache_lookups_total = IntCounterVec::new(
+            Opts::new(
+                "rusty_provider_cache_lookups_total",
+                "Non-streaming dispatch requests checked against [cache], labeled by outcome (\"hit\", \"miss\").",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric definition");
+
+        registry
+            .register(Box::new(cache_lookups_total.clone()))
+            .expect("metric name is unique");
+
         Self {
             registry,
             dispatch_attempts_total,
@@ -190,6 +204,7 @@ impl Metrics {
             client_budget_rejections_total,
             moderation_blocked_total,
             web_search_total,
+            cache_lookups_total,
         }
     }
 
@@ -258,6 +273,10 @@ impl Metrics {
 
     pub fn record_web_search(&self, outcome: &str) {
         self.web_search_total.with_label_values(&[outcome]).inc();
+    }
+
+    pub fn record_cache_lookup(&self, outcome: &str) {
+        self.cache_lookups_total.with_label_values(&[outcome]).inc();
     }
 
     /// Render every registered metric in the Prometheus text exposition
@@ -571,6 +590,32 @@ mod tests {
                 &rendered,
                 "rusty_provider_web_search_total",
                 &["outcome=\"error\""],
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn record_cache_lookup_increments_by_outcome() {
+        let metrics = Metrics::new();
+        metrics.record_cache_lookup("hit");
+        metrics.record_cache_lookup("hit");
+        metrics.record_cache_lookup("miss");
+
+        let rendered = metrics.render();
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_cache_lookups_total",
+                &["outcome=\"hit\""],
+            ),
+            2.0
+        );
+        assert_eq!(
+            metric_value(
+                &rendered,
+                "rusty_provider_cache_lookups_total",
+                &["outcome=\"miss\""],
             ),
             1.0
         );
