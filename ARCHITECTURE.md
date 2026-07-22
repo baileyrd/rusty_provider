@@ -42,9 +42,9 @@ before it:
   provider chain, applies fallback/retry on retryable errors, and hosts
   every cross-cutting policy (pricing/cost tracking, rate limiting,
   budgets, guardrails, moderation, web search, presets, auto-routing,
-  persistence). This is the largest and most stateful crate — it holds
-  the process's in-memory routing/uptime/spend state alongside whatever
-  persistence backend is configured.
+  an opt-in response cache, persistence). This is the largest and most
+  stateful crate — it holds the process's in-memory routing/uptime/spend
+  state alongside whatever persistence backend is configured.
 - `rp-server` — the axum HTTP layer: route registration, request
   extraction/auth, and translating `Router` results to HTTP responses.
   Deliberately thin — almost no policy logic lives here, so the same
@@ -72,12 +72,17 @@ A `POST /v1/chat/completions` request, in order:
    (guardrail-redacted) text; a flagged request is rejected with `400`.
 6. Budget check (`Router::check_client_budget`) — rejects with `402` if
    the caller's tracked spend already crosses its configured budget.
-7. `Router::dispatch`/`dispatch_stream` — resolves `model` to a
-   provider chain and tries each candidate in order, via that
-   provider's `Provider` implementation, falling back on a retryable
-   error (rate limit, timeout, 5xx). Usage/cost is recorded and
-   persisted after a successful attempt; a budget-crossing event fires
-   the configured webhook.
+7. `Router::dispatch`/`dispatch_stream` — for a non-streaming request
+   with `[cache]` configured, checks the response cache first; a hit
+   returns the stored response immediately, skipping everything below
+   (chain resolution, dispatch, and usage/cost recording — that
+   bookkeeping already ran once when the response was first computed).
+   On a miss, resolves `model` to a provider chain and tries each
+   candidate in order, via that provider's `Provider` implementation,
+   falling back on a retryable error (rate limit, timeout, 5xx). Usage/
+   cost is recorded and persisted after a successful attempt (and the
+   response cached, if configured); a budget-crossing event fires the
+   configured webhook.
 
 ## Key decisions
 See [docs/adr/](./docs/adr/) for the record of individual decisions and their tradeoffs.
@@ -93,5 +98,7 @@ See [docs/adr/](./docs/adr/) for the record of individual decisions and their tr
   self-serve; there's no signup flow, billing integration, or per-tenant
   database — everything lives in one process's config and one shared
   (optionally persistent) usage store.
-- **Not a caching layer.** Every request that isn't rejected upstream of
-  dispatch goes to the provider; there's no response cache today.
+- **Not a semantic/fuzzy cache.** `[cache]` (opt-in) is exact-match only —
+  a hash of the entire request — with a TTL and fixed-capacity eviction;
+  there's no embedding-based or near-duplicate matching, and streaming
+  requests always bypass it.
