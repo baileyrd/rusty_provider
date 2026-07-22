@@ -838,6 +838,18 @@ impl Router {
         self.usage.read().unwrap().clone()
     }
 
+    /// `Ok(())` if this router can actually serve traffic right now, for
+    /// `GET /ready`. Without `[persistence]` configured there's nothing
+    /// external to check, so this is always `Ok`; with it configured, a
+    /// trivial round trip confirms the database is actually reachable
+    /// rather than just having been reachable at startup.
+    pub async fn check_readiness(&self) -> Result<(), String> {
+        match &self.persistence {
+            Some(persistence) => persistence.ping().await.map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
     /// Records one completed request's token/cost breakdown for later
     /// `GET /v1/generation?id=` lookup.
     fn record_generation(&self, record: GenerationRecord) {
@@ -2607,6 +2619,30 @@ mod tests {
         assert_eq!(stats.prompt_tokens, 1);
         assert_eq!(stats.completion_tokens, 1);
         assert!((stats.cost_usd - 6.0 / 1_000_000.0).abs() < 1e-12);
+    }
+
+    // --- check_readiness -------------------------------------------------------
+
+    #[tokio::test]
+    async fn check_readiness_is_ok_when_no_persistence_is_configured() {
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        assert!(router.check_readiness().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_readiness_is_ok_against_a_reachable_persistence_file() {
+        let path = unique_temp_db_path("readiness_ok");
+        let router = test_router(vec![], vec![], vec![], vec![], vec![]);
+        let router = Router {
+            persistence: Some(Arc::new(
+                Persistence::open(PersistenceTarget::Sqlite(path))
+                    .await
+                    .expect("persistence should open"),
+            )),
+            ..router
+        };
+
+        assert!(router.check_readiness().await.is_ok());
     }
 
     // --- supported_params ----------------------------------------------------

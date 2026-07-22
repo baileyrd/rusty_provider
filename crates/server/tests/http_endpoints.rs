@@ -93,6 +93,22 @@ async fn health_endpoint_returns_ok_with_no_config() {
 }
 
 #[tokio::test]
+async fn ready_endpoint_returns_200_when_no_persistence_is_configured() {
+    // Without [persistence] there's nothing external to check, so
+    // readiness always passes -- distinct from /health only in principle,
+    // not in observed behavior, until [persistence] is configured.
+    let base_url = spawn_app("providers = {}").await;
+
+    let resp = reqwest::get(format!("{base_url}/ready"))
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ready");
+}
+
+#[tokio::test]
 async fn list_models_includes_route_aliases_and_provider_wildcards() {
     let server = MockServer::start().await;
     let key_var = unique_env_var("OPENAI_KEY");

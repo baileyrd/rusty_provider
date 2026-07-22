@@ -708,7 +708,27 @@ scrape_configs:
 
 ### `GET /health`
 
-Liveness check.
+Liveness check — "the process is up," nothing more. Always `200 "ok"`,
+unauthenticated, and never touches a database or provider. Distinct from
+`/ready` below, which actually checks whether the router can serve
+traffic right now.
+
+### `GET /ready`
+
+Readiness check. `200 {"status": "ready"}` when this router can actually
+serve traffic; `503 {"status": "not ready", "reason": "..."}` when it
+can't. Today the only thing checked is `[persistence]`, if configured —
+a trivial round trip confirming the database is actually reachable right
+now, not just that it was reachable at startup. Without `[persistence]`
+there's nothing external to check, so `/ready` and `/health` behave
+identically (both always `200`).
+
+Point an orchestrator's readiness probe (e.g. Kubernetes) at `/ready` and
+its liveness probe at `/health` — a `503` from `/ready` should pull this
+instance out of a load balancer's rotation without restarting it (the
+process itself is fine, it just can't serve traffic right now, most
+likely because `[persistence]`'s database is down); a failing `/health`
+means the process itself needs restarting.
 
 ## Rate limiting
 

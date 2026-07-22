@@ -594,6 +594,23 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
+/// Readiness check, distinct from `health` above: `health` only confirms
+/// the process is up, while this confirms it can actually serve traffic
+/// right now -- currently just "is `[persistence]`, if configured,
+/// actually reachable." `200 {"status": "ready"}` when it is (or nothing
+/// external is configured to check); `503` with the failure reason when
+/// it isn't.
+pub async fn ready(State(state): State<AppState>) -> Response {
+    match state.router.check_readiness().await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "status": "ready" }))).into_response(),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "not ready", "reason": reason })),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(resp) = check_auth(&state, &headers) {
         return resp;
