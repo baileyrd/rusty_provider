@@ -24,6 +24,19 @@ entries are tracked by PR rather than by release.
 
 ---
 
+## PR #98 — Update ARCHITECTURE.md's stale caching claims
+**2026-07-22** · [#98](https://github.com/baileyrd/rusty_provider/pull/98)
+
+- **Fixed:** `ARCHITECTURE.md` (added by an earlier repo-config pass)
+  predated the opt-in response cache from #65/#86 and still listed *"no
+  response cache today"* as a non-goal. Now documents the cache in the
+  `rp-router` structure bullet and the dispatch data-flow step (a hit
+  is checked first and skips chain resolution/dispatch/usage-recording
+  entirely), and narrows the non-goal to what's still true: exact-match
+  only, no semantic/fuzzy matching.
+
+---
+
 ## PR #96 — Add cargo-audit CI job; drop prometheus's unused protobuf feature
 **2026-07-22** · [#96](https://github.com/baileyrd/rusty_provider/pull/96)
 
