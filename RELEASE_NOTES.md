@@ -24,6 +24,27 @@ entries are tracked by PR rather than by release.
 
 ---
 
+## PR #92 — Add multi-stage Dockerfile for container deployment
+**2026-07-22** · [#92](https://github.com/baileyrd/rusty_provider/pull/92)
+
+- **Added:** a multi-stage `Dockerfile` (+ `.dockerignore`) producing a
+  slim `debian:bookworm-slim` runtime image for `rp-server`. Uses
+  `cargo-chef`, built from the official `rust:1-bookworm` image, to split
+  dependency compilation from the workspace's own source, so a
+  source-only edit doesn't force `ring`/`rusqlite`/`tokio-postgres` and
+  the rest of the dependency graph to recompile.
+- Runtime installs `ca-certificates` explicitly, since
+  `rustls-native-certs` (outbound provider TLS, and an optional
+  TLS-enabled `[persistence]` Postgres connection) reads the OS trust
+  store at runtime, not just at build time. Runs as a non-root user;
+  ships a `HEALTHCHECK` against `/health`.
+- Nothing secret is baked in — `config.toml` and provider API keys are
+  supplied at `docker run` time (bind-mount + env vars), documented in a
+  new README "Docker" section.
+- Added a `docker build` CI job for ongoing verification.
+
+---
+
 ## PR #90 — Add GET /ready readiness check, distinct from /health
 **2026-07-22** · [#90](https://github.com/baileyrd/rusty_provider/pull/90)
 
