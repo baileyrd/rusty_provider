@@ -24,6 +24,23 @@ entries are tracked by PR rather than by release.
 
 ---
 
+## PR #90 — Add GET /ready readiness check, distinct from /health
+**2026-07-22** · [#90](https://github.com/baileyrd/rusty_provider/pull/90)
+
+- **Added:** `GET /ready`, distinct from the existing `GET /health`.
+  `/health` stays a cheap, unauthenticated liveness check that never
+  touches anything external. `/ready` actually confirms the router can
+  serve traffic: when `[persistence]` is configured, a trivial round
+  trip against its database, returning `503` with a reason if that
+  fails. Without `[persistence]` there's nothing external to check, so
+  `/ready` is always `200`, same as `/health`.
+- Point an orchestrator's readiness probe at `/ready` and its liveness
+  probe at `/health` — a `503` from `/ready` should pull an instance out
+  of rotation without restarting it, since the process itself is fine.
+- No new config knobs; reuses the existing `[persistence]` section.
+
+---
+
 ## PR #88 — Add configurable request body size limit
 **2026-07-22** · [#88](https://github.com/baileyrd/rusty_provider/pull/88)
 
