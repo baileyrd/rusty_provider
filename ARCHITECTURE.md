@@ -2,17 +2,22 @@
 
 ## Overview
 
-rusty_provider is a single Rust binary (`rp-server`) that exposes one
-OpenAI-compatible HTTP API (`/v1/chat/completions` and friends) in front
-of several upstream LLM providers (OpenAI, Anthropic, Gemini, and any
-OpenAI-compatible backend — Groq, Together, Fireworks). It resolves a
-request's `model` string to a provider (or a config-defined fallback
-chain), applies policy in front of dispatch (guardrails, moderation, web
-search, budgets, rate limits), and forwards to whichever adapter that
-provider needs. It is not a model host — it holds no weights and does no
-inference itself, only routing, policy, and protocol translation. It is
-not multi-tenant SaaS — there's no signup flow or per-tenant database;
-"clients" are config-defined API keys sharing one process.
+rusty_provider exposes one OpenAI-compatible HTTP API
+(`/v1/chat/completions` and friends) in front of several upstream LLM
+providers (OpenAI, Anthropic, Gemini, and any OpenAI-compatible backend —
+Groq, Together, Fireworks). It resolves a request's `model` string to a
+provider (or a config-defined fallback chain), applies policy in front of
+dispatch (guardrails, moderation, web search, budgets, rate limits), and
+forwards to whichever adapter that provider needs. It is not a model
+host — it holds no weights and does no inference itself, only routing,
+policy, and protocol translation. It is not multi-tenant SaaS — there's
+no signup flow or per-tenant database; "clients" are config-defined API
+keys sharing one process.
+
+There are two binaries over the same `Router`: `rp-server` (the HTTP API)
+and `rusty-provider-acp` (an Agent Client Protocol coding agent an editor
+spawns over stdio). They are alternative front ends, not layers — neither
+calls the other, and all policy lives below both.
 
 ## Boundaries
 
@@ -25,10 +30,11 @@ fallback logic is written once and never branches on provider identity.
 | `Provider` (`rp-core`) | `AnthropicProvider`, `GeminiProvider`, `OpenAiCompatibleProvider` (`rp-providers`) | `OpenAiCompatibleProvider` covers OpenAI, Groq, Together, and Fireworks — same wire format, different `base_url`/key, so one adapter serves all four. `chat`/`chat_stream` both take an optional per-request `api_key_override` for BYOK. |
 | Usage/budget persistence (`rp-router::persistence`) | in-memory only, SQLite (`rusqlite`), Postgres (`tokio-postgres`, optional TLS) | Selected by `[persistence].backend` in config. A misconfigured or unreachable backend is a soft failure — the router still starts and runs in-memory-only, logged as a warning, same as a misconfigured provider. |
 | Auxiliary HTTP backends (moderation, web search, budget webhook) | `ModerationClient` (OpenAI `/moderations`-shaped), `WebSearchClient` (Brave-shaped), `WebhookNotifier` | Not behind a shared trait — each is a thin, independently swappable `reqwest`-based client, since there's exactly one implementation of each today. All three fail open: their own unavailability never blocks or fails the request that triggered them. |
+| Workspace access for the ACP agent (`rp-acp::tools`) | the connected ACP client, via `fs/*` and `terminal/*` | Inverted on purpose: the agent has no filesystem or process adapter of its own, so the *editor* is the implementation. Which tools exist at all is derived from the capabilities that editor advertised at `initialize`. |
 
 ## Structure
 
-A 4-crate Cargo workspace, layered so each crate only depends on the ones
+A 5-crate Cargo workspace, layered so each crate only depends on the ones
 before it:
 
 - `rp-core` — the shared request/response types (OpenAI chat-completions
@@ -49,6 +55,12 @@ before it:
   extraction/auth, and translating `Router` results to HTTP responses.
   Deliberately thin — almost no policy logic lives here, so the same
   `Router` could in principle be driven by a different transport.
+- `rp-acp` — the second transport that "in principle" anticipated: an
+  Agent Client Protocol agent over JSON-RPC on stdio. Owns the ACP wire
+  types, the transport, session state, and the tool-calling loop; owns no
+  policy, and reaches upstream models only through the same `Router`
+  methods `rp-server` calls. A sibling of `rp-server`, not a layer above
+  it — they never interact.
 
 This is a modular monolith by design, not a stepping stone to
 microservices — one process, one deploy artifact. The crate boundaries
@@ -84,6 +96,28 @@ A `POST /v1/chat/completions` request, in order:
    response cached, if configured); a budget-crossing event fires the
    configured webhook.
 
+An ACP `session/prompt` turn, in order:
+
+1. `rp-acp::agent` resolves the session (created earlier by `session/new`,
+   which fixed the workspace `cwd` and captured the client's capabilities
+   at `initialize`) and checks the configured client's budget once.
+2. `rp-acp::turn` appends the prompt's content blocks to the session's
+   conversation and enters a loop bounded by `[acp].max_turn_requests`.
+3. Each iteration builds a `ChatRequest` — the tool list derived from the
+   client's capabilities — and runs steps 2–5 of the HTTP flow above
+   (preset, web search, guardrails, moderation) against the same `Router`
+   methods, then `Router::dispatch_stream`.
+4. Streamed text and reasoning go out as `session/update` notifications
+   while tool-call fragments accumulate. A guardrail or moderation block
+   ends the turn as `refusal` rather than an error.
+5. Each requested tool call is reported, permission-gated if it mutates
+   anything, executed by calling *back* to the client (`fs/*`,
+   `terminal/*`), reported again with its result, and appended to the
+   conversation. Then back to step 3.
+6. The loop ends when the model stops calling tools (`end_turn`), the cap
+   is hit (`max_turn_requests`), or `session/cancel` arrives —
+   which is observed mid-stream and mid-command, not just between steps.
+
 ## Key decisions
 See [docs/adr/](./docs/adr/) for the record of individual decisions and their tradeoffs.
 
@@ -98,6 +132,12 @@ See [docs/adr/](./docs/adr/) for the record of individual decisions and their tr
   self-serve; there's no signup flow, billing integration, or per-tenant
   database — everything lives in one process's config and one shared
   (optionally persistent) usage store.
+- **Not a complete ACP implementation.** `rp-acp` implements protocol
+  version 1's agent side and advertises only what it actually does.
+  Session persistence (`session/load`), client-supplied MCP servers,
+  session modes, elicitation, and authentication are deliberately absent
+  rather than stubbed — sessions are process-scoped, and provider
+  credentials come from the environment the agent was launched in.
 - **Not a semantic/fuzzy cache.** `[cache]` (opt-in) is exact-match only —
   a hash of the entire request — with a TTL and fixed-capacity eviction;
   there's no embedding-based or near-duplicate matching, and streaming

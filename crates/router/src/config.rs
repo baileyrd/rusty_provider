@@ -325,6 +325,44 @@ pub struct Config {
     pub web_search: Option<WebSearchConfig>,
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+    #[serde(default)]
+    pub acp: Option<AcpConfig>,
+}
+
+/// Configures the ACP agent binary (`rusty-provider-acp`), which serves
+/// the Agent Client Protocol over stdio so a code editor can drive this
+/// router as a coding agent. Absent means the binary has nothing to run
+/// on and exits with an error; the HTTP server is unaffected either way.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AcpConfig {
+    /// The model the agent drives, as a "provider/model" string or a
+    /// `[[routes]]` alias -- so an ACP session can sit on a whole
+    /// fallback chain, exactly like an HTTP request can. It should be a
+    /// tool-calling model: without tool support the agent can still chat,
+    /// but can't read or change anything.
+    pub model: String,
+    /// Ceiling on model requests within a single prompt turn. Reaching it
+    /// ends the turn with `stopReason: "max_turn_requests"` rather than
+    /// letting a model loop on tools indefinitely.
+    #[serde(default = "default_max_turn_requests")]
+    pub max_turn_requests: u32,
+    /// Replaces the built-in coding-agent system prompt outright.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Attributes the session's spend to a configured `[[clients]]` entry,
+    /// so ACP usage counts against the same budget as that client's HTTP
+    /// traffic. Unset means the session is unattributed, same as an
+    /// anonymous HTTP request.
+    #[serde(default)]
+    pub client_name: Option<String>,
+}
+
+fn default_max_turn_requests() -> u32 {
+    24
 }
 
 /// Configures `model: "auto"` -- a heuristic (not ML) complexity-based

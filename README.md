@@ -22,6 +22,11 @@ SDK/client at it.
   and 5xx errors.
 - `crates/server` (`rp-server`) — the axum HTTP server exposing the
   OpenAI-compatible API.
+- `crates/acp` (`rp-acp`) — an [Agent Client
+  Protocol](https://agentclientprotocol.com/) coding agent
+  (`rusty-provider-acp`), so an editor can drive the router as an agent
+  over stdio rather than as an HTTP endpoint. See [ACP coding
+  agent](#acp-coding-agent-rusty-provider-acp).
 
 ## Running
 
@@ -1428,6 +1433,81 @@ config file itself. `[[pricing]]` entries are optional and only affect
 requests that opt into `"provider": {"sort": "price"}`; a provider's `zdr`
 flag is optional and only affects requests that opt into
 `"provider": {"zdr": true}`.
+
+## ACP coding agent (`rusty-provider-acp`)
+
+Alongside the HTTP server, this repo ships a second binary that speaks the
+[Agent Client Protocol](https://agentclientprotocol.com/) — the JSON-RPC
+protocol code editors use to drive coding agents. Instead of pointing an
+editor's *model provider* setting at this router (see the section below),
+ACP lets the editor run rusty_provider **as the agent itself**: it spawns
+`rusty-provider-acp` as a subprocess and talks to it over stdin/stdout.
+
+```sh
+cargo build --release -p rp-acp
+# the editor launches this; it isn't a server you run yourself
+./target/release/rusty-provider-acp
+```
+
+Configure it with an `[acp]` section (see `config.example.toml`):
+
+```toml
+[acp]
+model = "anthropic/claude-sonnet-5"   # or a [[routes]] alias
+max_turn_requests = 24
+```
+
+`CONFIG_PATH` selects the config file, same as `rp-server`. Because
+stdout carries the protocol, **all logging goes to stderr**.
+
+### What the agent can do
+
+Each `session/prompt` runs a tool-calling loop until the model stops
+calling tools. The tools are:
+
+| Tool | ACP client method | Permission |
+| --- | --- | --- |
+| `read_file` | `fs/read_text_file` | — |
+| `write_file` | `fs/write_text_file` | asked |
+| `edit_file` | `fs/read_text_file` + `fs/write_text_file` | asked |
+| `execute_command` | `terminal/create`/`wait_for_exit`/`output`/`release` | asked |
+| `update_plan` | `session/update` (`plan`) | — |
+
+The agent never touches your filesystem or spawns processes itself —
+every one of those goes back to the editor over the protocol. That's what
+lets the editor show unsaved buffer state, render real diffs, and stream
+a command's output while it runs. It also means **the tool list is built
+from what your editor advertises**: an editor without
+`fs.writeTextFile` never sees `write_file` offered to the model, so it
+can't propose an edit that could only ever fail.
+
+Writes and commands send `session/request_permission` first. Choosing
+"always allow"/"always reject" is remembered for the rest of the session.
+
+### What it inherits from the router
+
+An ACP turn is dispatched through the same `Router` as an HTTP request,
+so it gets fallback chains, `[[presets]]`, `[guardrails]`, `[moderation]`,
+`[web_search]`, `[cache]`, spend budgets and Prometheus metrics without
+any of that being reimplemented. Set `client_name` to attribute a
+session's spend to a `[[clients]]` entry.
+
+Turns end with an ACP stop reason: `end_turn` normally, `max_tokens` when
+the model hits its length cap, `max_turn_requests` when it exceeds
+`[acp].max_turn_requests`, `refusal` when a guardrail or moderation blocks
+the request (the reason is streamed to the user first), and `cancelled`
+when the editor sends `session/cancel` — which is honoured mid-stream and
+mid-command, killing a running terminal rather than waiting it out.
+
+### Scope
+
+Implements ACP **protocol version 1**. Deliberately not implemented, and
+therefore not advertised as a capability: session persistence
+(`session/load`), MCP servers passed in at `session/new`, session modes,
+elicitation, and authentication — the router's provider credentials come
+from the environment the agent was launched in, so there's nothing for an
+editor to log into. Sessions are process-scoped and disappear when the
+editor closes the connection.
 
 ## Using with local agent tools (Hermes, OpenClaw, etc.)
 

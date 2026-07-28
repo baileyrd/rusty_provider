@@ -18,7 +18,7 @@ use std::time::Instant;
 use cache::ResponseCache;
 use client_budget::{ClientBudgetSetting, SpendState};
 pub use config::{
-    AutoRoutingConfig, BudgetPeriod, CacheConfig, ClientConfig, ClientRole, Config,
+    AcpConfig, AutoRoutingConfig, BudgetPeriod, CacheConfig, ClientConfig, ClientRole, Config,
     GuardrailAction, GuardrailConfig, ModerationConfig, PersistenceBackend, PersistenceConfig,
     PostgresTlsMode, PresetConfig, PricingEntry, ProviderConfig, ProviderKind, RouteAlias,
     ServerConfig, WebSearchConfig, WebhookConfig,

@@ -1447,6 +1447,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rp-acp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "futures-util",
+ "rp-core",
+ "rp-router",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
 name = "rp-core"
 version = "0.1.0"
 dependencies = [

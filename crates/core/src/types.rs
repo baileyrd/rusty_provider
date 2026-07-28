@@ -230,7 +230,11 @@ impl ToolCall {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Default` is derived so callers that build a request programmatically
+/// (rather than deserializing a client's JSON) can set the handful of
+/// fields they care about and leave the ~30 optional ones alone. Every
+/// field's default is the same "unset" the wire format uses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatRequest {
     /// Either "provider/model" (e.g. "anthropic/claude-sonnet-5") to target
     /// one provider directly, or a router alias defined in the config's

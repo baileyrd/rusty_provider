@@ -380,3 +380,30 @@ completion_per_million = 0.79
 # complex_model = "anthropic/claude-opus-4-8"
 # simple_max_score = 200
 # medium_max_score = 800
+
+# --- ACP coding agent (optional) --------------------------------------------------
+# Configures `rusty-provider-acp`, the Agent Client Protocol binary: a coding
+# agent that speaks JSON-RPC over stdio so an editor (Zed and other ACP clients)
+# can drive this router directly. Absent means only the HTTP server runs -- the
+# ACP binary exits with an error explaining what's missing.
+#
+# `model` is a "provider/model" string or a [[routes]] alias, exactly like
+# `model` anywhere else, so an ACP session can sit on a whole fallback chain. It
+# should be a tool-calling model: without tool support the agent still chats, but
+# can't read or change anything. Every prompt turn runs through the same
+# preset/web-search/guardrail/moderation pipeline and the same usage accounting
+# as POST /v1/chat/completions.
+#
+# The agent never touches the filesystem itself -- reads, writes and commands all
+# go back to the editor over the protocol, and which tools the model is offered
+# depends on what the connected editor advertises it can do. Writes and commands
+# additionally ask the user for permission before they run.
+
+# [acp]
+# model = "anthropic/claude-sonnet-5"
+# max_turn_requests = 24    # optional, this is the default -- model requests per turn
+#                           # before the turn ends with stopReason "max_turn_requests"
+# max_tokens = 8192         # optional
+# temperature = 0.0         # optional
+# system_prompt = "..."     # optional -- replaces the built-in coding-agent prompt
+# client_name = "editor"    # optional -- attributes spend to a [[clients]] entry

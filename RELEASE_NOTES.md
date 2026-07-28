@@ -24,6 +24,41 @@ entries are tracked by PR rather than by release.
 
 ---
 
+## Add an ACP coding agent (`rusty-provider-acp`)
+**2026-07-28**
+
+- **Added:** a second binary, `rusty-provider-acp`, implementing the
+  [Agent Client Protocol](https://agentclientprotocol.com/) (protocol
+  version 1) over JSON-RPC on stdio, so an editor can drive this router
+  as a coding agent rather than only as an OpenAI-compatible endpoint.
+  New `crates/acp` (`rp-acp`) holds the wire types, transport, session
+  state, and tool loop.
+- **Added:** a `[acp]` config section — `model` (a `"provider/model"`
+  string or a `[[routes]]` alias), `max_turn_requests` (default 24),
+  and optional `system_prompt`/`max_tokens`/`temperature`/`client_name`.
+  Absent means only the HTTP server runs.
+- **Added:** five tools, each mapped to an ACP client method rather than
+  to local I/O — `read_file`, `write_file`, `edit_file` (`fs/*`),
+  `execute_command` (`terminal/*`), and `update_plan`. The tool list is
+  built from the capabilities the connected editor advertises, and the
+  three mutating tools ask for permission via
+  `session/request_permission` first, remembering "always" answers for
+  the session.
+- **Changed:** `rp-core`'s `ChatRequest` now derives `Default`, so code
+  building a request programmatically can set a few fields instead of all
+  ~30. No wire-format or behaviour change.
+- **Known limitations, deliberate:** ACP sessions are process-scoped, so
+  `session/load` is not supported and isn't advertised; client-supplied
+  MCP servers, session modes, elicitation, and authentication are also
+  not implemented. `session/update`'s `usage_update` is only sent for
+  models with a `[[pricing]]` entry carrying `context_length`, since the
+  protocol requires a context-window size and guessing it would
+  mis-render the client's gauge. The `Dockerfile` still builds only
+  `rp-server` — the ACP agent is launched by an editor as a subprocess,
+  not deployed as a container workload.
+
+---
+
 ## PR #98 — Update ARCHITECTURE.md's stale caching claims
 **2026-07-22** · [#98](https://github.com/baileyrd/rusty_provider/pull/98)
 
