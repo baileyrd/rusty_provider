@@ -28,8 +28,12 @@ fallback logic is written once and never branches on provider identity.
 
 ## Structure
 
-A 5-crate Cargo workspace, layered so each crate only depends on the ones
-before it:
+A 6-crate Cargo workspace, layered so each crate only depends on ones
+earlier in this list. `rp-mcp` and `rp-cli` are independent leaves that
+both sit on top of `rp-router`, not on each other; `rp-server` depends on
+`rp-core`/`rp-providers`/`rp-router`/`rp-mcp` (mounting its MCP handler
+alongside the HTTP API) but not on `rp-cli`, which is a separate binary
+entirely, never linked into `rp-server`.
 
 - `rp-core` — the shared request/response types (OpenAI chat-completions
   shape), the `Provider` trait, and error types. No I/O, no `reqwest` in
@@ -45,15 +49,25 @@ before it:
   an opt-in response cache, persistence). This is the largest and most
   stateful crate — it holds the process's in-memory routing/uptime/spend
   state alongside whatever persistence backend is configured.
+- `rp-mcp` — optional MCP (Model Context Protocol) support, both
+  directions: exposes `Router::dispatch`/`embeddings` as MCP tools
+  (`chat_completion`/`list_models`/`embeddings`), and a gateway proxying
+  configured `[[mcp.upstreams]]` (stdio subprocess or Streamable HTTP)
+  under `"{upstream}/{tool}"` names into the same merged `tools/list`.
+  Depends only on `rp-core`/`rp-router` — no `rp-providers` dependency,
+  since it talks to `Router`, never to an upstream LLM provider directly.
+  See [docs/MCP.md](./docs/MCP.md).
 - `rp-server` — the axum HTTP layer: route registration, request
-  extraction/auth, and translating `Router` results to HTTP responses.
+  extraction/auth, mounting `rp-mcp`'s handler behind the same auth as
+  every other route, and translating `Router` results to HTTP responses.
   Deliberately thin — almost no policy logic lives here, so the same
   `Router` could in principle be driven by a different transport.
 - `rp-cli` — a small, synchronous, read-only operator tool (`config
-  check`/`providers list`/`keys check`) built on `rp-router::Config`
-  directly, so it can never drift from the schema `rp-server` actually
-  loads. Not part of the request-serving path at all, and not built into
-  the Docker image.
+  check`/`providers list`/`keys check`, plus `setup` for rewriting a
+  known third-party CLI tool's own config file) built on
+  `rp-router::Config` directly, so it can never drift from the schema
+  `rp-server` actually loads. Not part of the request-serving path at
+  all, and not built into the Docker image.
 
 This is a modular monolith by design, not a stepping stone to
 microservices — one process, one deploy artifact. The crate boundaries
@@ -121,7 +135,12 @@ See [docs/adr/](./docs/adr/) for the record of individual decisions and their tr
   (SQLite/Postgres) lets multiple *trusted* processes share one usage/spend
   store, but that's operator-run shared infrastructure, not a hosted
   product with per-tenant isolation.
-- **Not a semantic/fuzzy cache.** `[cache]` (opt-in) is exact-match only —
-  a hash of the entire request — with a TTL and fixed-capacity eviction;
-  there's no embedding-based or near-duplicate matching, and streaming
-  requests always bypass it.
+- **No streaming response cache.** `[cache]` (opt-in) covers only
+  non-streaming `/v1/chat/completions` responses, in either of two
+  mutually exclusive modes: exact-match (a hash of the entire request) or
+  `mode = "semantic"` (embedding-cosine-similarity matching on message
+  text via this router's own `/v1/embeddings` dispatch, every other field
+  still matched exactly). Both share the same TTL/fixed-capacity eviction
+  shape. Streaming requests always bypass caching entirely — replaying a
+  cached SSE chunk sequence is left for a future version, not a design
+  decision to never support it.

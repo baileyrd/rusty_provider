@@ -30,6 +30,10 @@ port = 8080
 # not the total in-flight count. A request past this cap gets 503
 # immediately rather than queuing. Unset (the default) means no cap.
 # max_concurrent_requests = 200
+# Restricts CORS to an explicit browser-origin allowlist. Unset (the
+# default) preserves the original any-origin behavior
+# (Access-Control-Allow-Origin: *).
+# cors_allowed_origins = ["https://my-dashboard.example"]
 
 # --- JWT/OIDC auth (optional) ------------------------------------------------
 # An additional way to authenticate, alongside (never instead of) api_key_env/
@@ -65,6 +69,13 @@ port = 8080
 # [mcp]
 # enabled = true
 # path = "/mcp"   # optional, this is the default
+# A dropped upstream connection (subprocess crash, HTTP network blip) is
+# redialed automatically with doubling backoff -- only applies once an
+# upstream has connected at least once; a startup failure stays absent
+# until restart. All three below are optional, defaults shown.
+# reconnect_backoff_secs = 1
+# reconnect_backoff_max_secs = 60
+# max_reconnect_attempts = 10   # unset (the default) retries forever
 #
 # [[mcp.upstreams]]
 # name = "filesystem"
@@ -280,6 +291,18 @@ chain = [
     "fireworks/accounts/fireworks/models/llama-v3p3-70b-instruct",
 ]
 
+# strategy = "fusion" dispatches every chain entry (the "panel") in
+# parallel instead of trying them in order, then a judge model
+# synthesizes one final answer from whichever candidates responded within
+# fusion_timeout_secs. Requires judge to actually engage -- without it,
+# this alias just falls back to ordinary sequential-chain dispatch.
+# [[routes]]
+# alias = "panel"
+# chain = ["anthropic/claude-sonnet-5", "openai/gpt-4o", "gemini/gemini-2.0-flash"]
+# strategy = "fusion"
+# judge = "anthropic/claude-opus-4-8"
+# fusion_timeout_secs = 30   # optional, this is the default
+
 # --- Pricing (optional) ------------------------------------------------------
 # Static, operator-maintained prompt-token pricing (USD per million tokens),
 # keyed by "provider/model" to match `[[routes]]` chain entries. This is only
@@ -371,6 +394,10 @@ completion_per_million = 0.79
 # requests_per_minute = 60
 # budget_usd = 50.0
 # budget_period = "monthly"
+# A budget_warning [webhook] event fires once spend crosses this fraction
+# of budget_usd (e.g. 0.8 = 80%), ahead of the hard budget_exceeded
+# cutoff at 100%. Optional; requires budget_usd to also be set.
+# budget_warning_threshold = 0.8
 #
 # [[clients]]
 # name = "openclaw"
@@ -439,16 +466,30 @@ completion_per_million = 0.79
 # Without this, a client crossing its budget_usd only surfaces as a 402 on its
 # next request and the client_budget_rejections_total Prometheus counter -- no
 # push notification an operator can wire up proactively. Uncomment to have this
-# router POST a JSON event to `url` whenever a client's spend crosses its budget
-# ("budget_exceeded") or an operator manually resets a client's spend via the
-# admin API ("budget_reset"). Delivery is fire-and-forget: a slow or
+# router POST a JSON event to `url` whenever a client's spend crosses its
+# budget_warning_threshold ("budget_warning"), crosses its hard budget_usd
+# limit ("budget_exceeded"), or an operator manually resets a client's spend
+# via the admin API ("budget_reset"). Delivery is fire-and-forget: a slow or
 # unreachable receiver never adds latency to the request that triggered the
-# event, and a delivery failure is only logged, never surfaced to the client.
+# event, and a delivery failure (after retries) is only logged, never
+# surfaced to the client.
 
 # [webhook]
 # url = "https://hooks.example.com/rusty-provider"
 # auth_header_env = "WEBHOOK_AUTH_HEADER"  # e.g. set to "Bearer <token>"
 # timeout_secs = 10  # optional, this is the default
+# Name of an env var holding an HMAC-SHA256 signing secret -- when set,
+# every POST carries an `X-RP-Signature: sha256=<hex>` header over the
+# exact JSON body, so the receiver can verify it actually came from this
+# router. Unset (the default) sends no signature header.
+# signing_secret_env = "WEBHOOK_SIGNING_SECRET"
+# A 5xx response or network error retries with doubling backoff
+# (retry_backoff_secs -> retry_backoff_max_secs) up to max_retries times;
+# any other status (e.g. a 4xx) is treated as permanent and not retried.
+# All three optional, defaults shown.
+# retry_backoff_secs = 1
+# retry_backoff_max_secs = 30
+# max_retries = 3   # 0 disables retry (single-attempt behavior)
 
 # --- Guardrails (optional) ------------------------------------------------------
 # Regex-based content guardrails, checked against every request's message text

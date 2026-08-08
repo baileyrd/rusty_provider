@@ -205,3 +205,44 @@ TS-core→native-sidecar split — not applicable, rusty_provider already
 (Electron-spawn-capable-route and OAuth-CLI-scraping concerns with no
 rusty_provider analog), the 43-language i18n rows in OmniRoute's own
 comparison table.
+
+## Follow-up pass — 2026-08-08
+
+All 7 issues from the 2026-08-07 pass shipped and merged (#135-#141:
+CORS allowlist, webhook HMAC signing + retry, budget warning threshold,
+reasoning replay cache, `strategy = "fusion"` routing, per-request budget
+cap, routing-decision trace headers). Re-ran the comparison against
+OmniRoute's current docs (`diegosouzapw/omniroute`, `release/v3.8.50`,
+commit `caf768e`, up from `6c22f8d` on 2026-08-07).
+
+Doc delta since the last pass is small — 91 lines across 4 files
+(`docs/compression/COMPRESSION_ENGINES.md`,
+`docs/compression/COMPRESSION_GUIDE.md`, `docs/guides/TROUBLESHOOTING.md`,
+`docs/reference/ENVIRONMENT.md`) — and almost entirely not applicable:
+a Next.js standalone-build packaging fix for the LLMLingua compression
+worker (build tooling, no router-level analog), clarifying prose about
+RTK/Caveman's real-world savings range (docs-only, no behavior change),
+and a cron-driven Claude-OAuth warmup scheduler (`OMNIROUTE_WARMUP_*` —
+depends on the declined multi-account/OAuth-connection model, no
+rusty_provider analog).
+
+One item is a plausible small gap, flagged rather than auto-filed since
+it's arguably already covered by existing issue #64 (global
+`server.max_concurrent_requests`) under a different mechanism, not
+obviously missing:
+
+- **Heavyweight-request admission control** (`docs/guides/TROUBLESHOOTING.md`
+  "chat_admission_busy") — OmniRoute reserves a small, separately-capped
+  pool of *heavyweight* request slots (`OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT`,
+  default `1`), where "heavyweight" is judged by structural size (≥200
+  messages, ≥64 tools, ≥32k estimated tokens, or exhausting bounded
+  structure-estimation) rather than raw byte count, and rejects with a
+  retryable `503`/`chat_admission_busy` + `Retry-After` when the pool is
+  full — protecting host memory from a handful of oversized requests
+  specifically, distinct from #64's overall in-flight cap (which caps
+  *every* request the same way regardless of size). Not filed
+  automatically pending a scope call on whether this distinction is worth
+  a second admission-control axis.
+
+No other new gaps found. Nothing else in this pass rises to "worth a new
+parity-gap issue" — the current batch (#135-#141) is complete.
