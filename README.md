@@ -924,8 +924,10 @@ for scraping:
 - `rusty_provider_dispatch_attempts_total{provider,model,outcome}` —
   counter, one increment per candidate tried in a fallback chain.
   `outcome` is `success`, `retryable_error` (fell through to the next
-  candidate), `error` (fatal, chain aborted), or `not_configured`
-  (candidate skipped, no resolved API key).
+  candidate), `error` (fatal, chain aborted), `not_configured` (candidate
+  skipped, no resolved API key), or `rate_limited` (candidate skipped,
+  this router's own outbound self-throttle — see
+  `[providers.X].requests_per_minute`).
 - `rusty_provider_prompt_tokens_total{provider,model}` /
   `rusty_provider_completion_tokens_total{provider,model}` — counters.
 - `rusty_provider_cost_usd_total{provider,model}` — counter; same
@@ -1097,9 +1099,10 @@ limit. Presenting a client's key both authenticates the request (in
 addition to `server.api_key_env`, if set) and buckets its rate limit under
 that client's name. A caller with no matching client key falls back to a
 bucket keyed by source IP, limited by `server.default_rate_limit_rpm` if
-set (otherwise uncapped). Only `POST /v1/chat/completions` is rate
-limited — metadata endpoints (`/v1/models`, `/v1/usage`, `/metrics`)
-aren't. Rejections return `429` with a `Retry-After` header.
+set (otherwise uncapped). `POST /v1/chat/completions` and
+`POST /v1/embeddings` are both rate limited this way — metadata endpoints
+(`/v1/models`, `/v1/usage`, `/metrics`) aren't. Rejections return `429`
+with a `Retry-After` header.
 
 Every rate-limit-checked response — success or `429` — also carries
 `X-RateLimit-Limit` (the bucket's requests-per-minute capacity),

@@ -28,5 +28,7 @@
 - CI must be green before merge.
 - At least one approval required (see CODEOWNERS if present).
 - Reviewers: check for scope creep, missing tests, and unexplained non-obvious decisions.
-- Merge via **squash** — one commit per PR keeps `main`'s history linear and
-  each entry in [RELEASE_NOTES.md](./RELEASE_NOTES.md) mapped to exactly one commit.
+- Merge via a **merge commit** (GitHub's "Create a merge commit") — never
+  squash- or rebase-merge. Full branch history is preserved deliberately;
+  each entry in [RELEASE_NOTES.md](./RELEASE_NOTES.md) maps to one PR, not
+  one commit.
