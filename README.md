@@ -1,5 +1,7 @@
 # rusty_provider
 
+> **Archived — merged into [Rusty Mill](https://github.com/Rusty-Mill/rusty_mill).** This crate now lives at [`crates/rusty_provider`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_provider) in the Rusty Mill monorepo, which is where active development, issues, and pull requests happen now. This standalone repo is kept for historical reference only.
+
 [![CI](https://github.com/baileyrd/rusty_provider/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_provider/actions/workflows/ci.yml)
 
 A Rust AI provider router: one OpenAI-compatible HTTP API in front of
